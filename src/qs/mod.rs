@@ -387,86 +387,280 @@ pub struct SieveScratch {
     pub(crate) scores: Vec<u8>,
     pub(crate) candidates: Vec<u32>,
     pub(crate) factor_scratch: Vec<(u32, u16)>,
+    /// `ceil_sqrt(working_n) mod p` per factor-base prime, precomputed per job.
+    pub(crate) roots_mod_p: Vec<u32>,
 }
+
+/// Portable deterministic Miller–Rabin for `u64` (exact for all `n < 2^64`).
+fn is_prime_u64(n: u64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    for &p in &[2u64, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
+        if n == p {
+            return true;
+        }
+        if n.is_multiple_of(p) {
+            return false;
+        }
+    }
+    let mulmod = |a: u64, b: u64| ((a as u128 * b as u128) % n as u128) as u64;
+    let powmod = |mut a: u64, mut e: u64| {
+        let mut r = 1u64;
+        while e != 0 {
+            if e & 1 == 1 {
+                r = mulmod(r, a);
+            }
+            a = mulmod(a, a);
+            e >>= 1;
+        }
+        r
+    };
+    let mut d = n - 1;
+    let mut s = 0u32;
+    while d & 1 == 0 {
+        d >>= 1;
+        s += 1;
+    }
+    'witness: for &a in &[2u64, 325, 9375, 28178, 450775, 9780504, 1795265022] {
+        let a = a % n;
+        if a == 0 {
+            continue;
+        }
+        let mut x = powmod(a, d);
+        if x == 1 || x == n - 1 {
+            continue;
+        }
+        for _ in 1..s {
+            x = mulmod(x, x);
+            if x == n - 1 {
+                continue 'witness;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// Portable logarithmic quadratic sieve (SPEC §12.6).
+///
+/// Each job sieves `polynomial_count` contiguous segments of the `Q(x) = x² - N`
+/// line (`x = ceil_sqrt(N) + offset`, `N = working_n`). For every factor-base
+/// prime `p`, `log(p)` is added to the byte score array at the two roots
+/// `x ≡ ±sqrt_n (mod p)`; only positions whose accumulated score clears a
+/// per-segment threshold (`≈ log|Q| − large-prime allowance − slack`) are
+/// trial-divided and classified. This replaces the previous approach of
+/// trial-dividing every candidate.
 pub fn sieve_job<const P: usize>(
     ctx: &SieveContext<P>,
     job: &crate::work::SieveJob,
     scratch: &mut SieveScratch,
 ) -> crate::work::SieveResult<P> {
-    scratch.scores.clear();
-    scratch.candidates.clear();
-    scratch.factor_scratch.clear();
-    let mut relations = Vec::new();
+    let SieveScratch {
+        scores,
+        candidates,
+        factor_scratch,
+        roots_mod_p,
+    } = scratch;
+    factor_scratch.clear();
+    let fb = &ctx.factor_base.entries;
     let root = ctx.working_n.ceil_sqrt();
+    let mut relations = Vec::new();
     let mut metrics = crate::work::SieveJobMetrics {
         polynomial_families: 1,
         polynomials: job.polynomial_count as u64,
         ..Default::default()
     };
+
+    let seg = match ctx.config.sieve_half_width {
+        AutoOr::Value(v) => v.max(64) as usize,
+        AutoOr::Auto => parameters::sieve_half_width(ctx.n.bit_len()) as usize,
+    };
+    // Log scale must match `FactorBaseEntry::log_prime`, which is `round(ln(p) * 8)`.
+    const LOG_SCALE: f64 = 8.0;
+    let last_prime = fb.last().map(|e| e.prime as u64).unwrap_or(2);
+    let lp_limit = match ctx.config.large_primes.single_limit {
+        AutoOr::Value(v) => v,
+        AutoOr::Auto => last_prime.saturating_mul(last_prime),
+    };
+    let lp_bits = 64 - lp_limit.max(1).leading_zeros();
+    let lp_allow = (lp_bits as f64 * core::f64::consts::LN_2 * LOG_SCALE) as i32;
+    let slack = ctx.config.candidate_slack as i32;
+
+    // ceil_sqrt(working_n) mod p is invariant across all segments of this job.
+    roots_mod_p.clear();
+    roots_mod_p.reserve(fb.len());
+    for e in fb.iter() {
+        roots_mod_p.push(root.mod_u64(e.prime as u64) as u32);
+    }
+
     for k in 0..job.polynomial_count {
-        let offset = job.first_polynomial as u64
+        let seg_index = job.first_polynomial as u64
             + k as u64
             + job.family.saturating_mul(job.polynomial_count as u64);
-        let Some(x) = root.checked_add(&Natural::from_u64(offset)) else {
+        let seg_start = seg_index.saturating_mul(seg as u64);
+        let Some(x0) = root.checked_add(&Natural::from_u64(seg_start)) else {
             continue;
         };
-        let Some(xx) = x.checked_mul(&x) else {
+        let Some(x0sq) = x0.checked_mul(&x0) else {
             continue;
         };
-        let Some(mut q) = xx.checked_sub(&ctx.working_n) else {
+        let Some(q0) = x0sq.checked_sub(&ctx.working_n) else {
             continue;
         };
-        if q.is_zero() {
-            continue;
+        metrics.sieve_positions += seg as u64;
+        // Threshold from the smallest |Q| in the segment (its start), so smooth
+        // low-offset positions are never scored out.
+        let target = (q0.bit_len() as f64 * core::f64::consts::LN_2 * LOG_SCALE) as i32;
+        let threshold = (target - lp_allow - slack).clamp(1, 255) as u8;
+
+        scores.clear();
+        scores.resize(seg, 0);
+        for (i, e) in fb.iter().enumerate() {
+            let p = e.prime;
+            let lg = e.log_prime;
+            let rp = roots_mod_p[i];
+            let ss = (seg_start % p as u64) as u32;
+            // Solution offsets: offset ≡ ±sqrt_n − root (mod p).
+            let off1 = (e.sqrt_n + p - rp) % p;
+            let neg = if e.sqrt_n == 0 { 0 } else { p - e.sqrt_n };
+            let off2 = (neg + p - rp) % p;
+            let step = p as usize;
+            let mut j = ((off1 + p - ss) % p) as usize;
+            while j < seg {
+                scores[j] = scores[j].saturating_add(lg);
+                j += step;
+            }
+            if off2 != off1 {
+                let mut j = ((off2 + p - ss) % p) as usize;
+                while j < seg {
+                    scores[j] = scores[j].saturating_add(lg);
+                    j += step;
+                }
+            }
         }
-        let mut powers = Vec::new();
-        for (index, e) in ctx.factor_base.entries.iter().enumerate() {
-            let mut count = 0;
-            loop {
-                let (d, r) = q.div_rem_u64(e.prime as u64).unwrap();
-                if r != 0 {
+
+        // Scan survivors above threshold, then trial-divide only those.
+        candidates.clear();
+        for (j, &score) in scores.iter().enumerate() {
+            if score >= threshold {
+                candidates.push(j as u32);
+            }
+        }
+        for &j in candidates.iter() {
+            let offset = seg_start + j as u64;
+            let Some(x) = root.checked_add(&Natural::from_u64(offset)) else {
+                continue;
+            };
+            let Some(xx) = x.checked_mul(&x) else {
+                continue;
+            };
+            let Some(mut q) = xx.checked_sub(&ctx.working_n) else {
+                continue;
+            };
+            if q.is_zero() {
+                continue;
+            }
+            metrics.candidates_tested += 1;
+            let mut powers = Vec::new();
+            for (index, e) in fb.iter().enumerate() {
+                if q.is_one() {
                     break;
                 }
-                q = d;
-                count += 1
+                let mut count = 0u16;
+                loop {
+                    let (d, r) = q.div_rem_u64(e.prime as u64).unwrap();
+                    if r != 0 {
+                        break;
+                    }
+                    q = d;
+                    count += 1
+                }
+                if count != 0 {
+                    powers.push(PrimePower {
+                        factor_base_index: index as u32,
+                        exponent: count,
+                    })
+                }
             }
-            if count != 0 {
-                powers.push(PrimePower {
-                    factor_base_index: index as u32,
-                    exponent: count,
-                })
+            let lp = if q.is_one() {
+                metrics.full_relations += 1;
+                LargePrimePart::None
+            } else if q.bit_len() <= 64 {
+                let v = q.as_parts()[0];
+                if v <= lp_limit && is_prime_u64(v) {
+                    metrics.single_large_prime_relations += 1;
+                    LargePrimePart::One(v)
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+            let rel = RawRelation {
+                square_root: x.div_rem(&ctx.n).unwrap().1,
+                sign: false,
+                factors: powers.into_boxed_slice(),
+                large_primes: lp,
+                source: RelationSource {
+                    family: job.family,
+                    polynomial: seg_index as u32,
+                    position: offset as i32,
+                },
+            };
+            if verify_relation(ctx, &rel) {
+                relations.push(rel)
             }
-        }
-        metrics.candidates_tested += 1;
-        let lp = if q.is_one() {
-            metrics.full_relations += 1;
-            LargePrimePart::None
-        } else if q.bit_len() <= 64 {
-            let v = q.as_parts()[0];
-            metrics.single_large_prime_relations += 1;
-            LargePrimePart::One(v)
-        } else {
-            continue;
-        };
-        let rel = RawRelation {
-            square_root: x.div_rem(&ctx.n).unwrap().1,
-            sign: false,
-            factors: powers.into_boxed_slice(),
-            large_primes: lp,
-            source: RelationSource {
-                family: job.family,
-                polynomial: job.first_polynomial + k,
-                position: offset as i32,
-            },
-        };
-        if verify_relation(ctx, &rel) {
-            relations.push(rel)
         }
     }
-    metrics.sieve_positions = job.polynomial_count as u64;
     crate::work::SieveResult {
         header: job.header,
         relations,
         metrics,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sieve_job_logarithmic_sieve() {
+        // A real log-sieve must (a) emit only verified relations and (b) trial-divide
+        // far fewer positions than it sieves — not every candidate like the old kernel.
+        let n = Natural::<2>::from_u64(1_000_003 * 1_000_033);
+        let cfg = QsConfig {
+            factor_base_bound: AutoOr::Value(500),
+            ..QsConfig::default()
+        };
+        let ctx = prepare_siqs(&n, &cfg).unwrap();
+        let mut scratch = SieveScratch::default();
+        let job = crate::work::SieveJob {
+            header: crate::work::JobHeader {
+                job_id: 0,
+                generation: 0,
+                context_id: ctx.context_id(),
+            },
+            family: 0,
+            first_polynomial: 0,
+            polynomial_count: 16,
+        };
+        let result = sieve_job(&ctx, &job, &mut scratch);
+        assert!(result.metrics.sieve_positions >= 16 * 64);
+        // The sieve filtered: only a small fraction of positions were trial-divided.
+        assert!(
+            result.metrics.candidates_tested < result.metrics.sieve_positions,
+            "candidates {} !< positions {}",
+            result.metrics.candidates_tested,
+            result.metrics.sieve_positions
+        );
+        // Some relations were found, and every emitted relation satisfies the invariant.
+        assert!(!result.relations.is_empty(), "no relations found");
+        for r in &result.relations {
+            assert!(verify_relation(&ctx, r), "relation failed verification");
+        }
+        // Determinism: the same job yields the same relation count.
+        let again = sieve_job(&ctx, &job, &mut scratch);
+        assert_eq!(again.relations.len(), result.relations.len());
     }
 }

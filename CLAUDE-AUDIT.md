@@ -51,7 +51,7 @@ limbs regardless of magnitude. Combined with the bad kernels below, small inputs
   (~2^24 ≈ 16.7M steps), so 96-bit inputs exhaust pollard and fall to the reference QS.
 - `factor::primes_to` recomputes the prime list by trial division **on every recursion node**.
 
-### D. `qs/mod.rs::sieve_job` is not a sieve
+### D. `qs/mod.rs::sieve_job` is not a sieve  *(FIXED — now a §12.6 log-sieve)*
 The portable low-level kernel `sieve_job` (used by `FactorSession`/`reference_qs_factor`)
 computes `q = (ceil_sqrt(n)+k)^2 - n` and **trial-divides every candidate by the entire
 factor base** — Fermat differences + trial division, O(candidates·|FB|). It ignores the
@@ -134,10 +134,13 @@ is rare):
 - **Real sparse linear algebra**: `f2::BlockLanczos` is currently a stub delegating to dense
   Gauss–Jordan (`dense_dependencies`, ~O(n³/64)); a genuine block-Lanczos recurrence (SPEC §15)
   would remove the dense-elimination cost that grows with factor-base size.
-- **Pre-existing (not introduced here):** the low-level portable kernel `qs::sieve_job` is
-  trial-division of `x²−n` candidates, not the log-sieve SPEC §12.6 requires. It is off the
-  native/CLI hot path (the `engine` is the real log-sieve), so it was left as-is; flag if you
-  want it brought into spec conformance.
+- **Done:** the low-level portable kernel `qs::sieve_job` — previously trial-division of every
+  `x²−n` candidate — is now a genuine logarithmic sieve (SPEC §12.6): it adds `log(p)` at the
+  two roots `x ≡ ±√n (mod p)` across byte-score segments and trial-divides only threshold
+  survivors, with single-large-prime classification (primality-checked). Guarded by a new unit
+  test (`qs::tests::sieve_job_logarithmic_sieve`) asserting filtering + relation validity +
+  determinism. (Double-large-prime classification, §12.6 step 8, remains a follow-up consistent
+  with the engine.)
 
 ## Constraints honored
 - SIQS stays the main algorithm; log-sieve preserved/extended (not replaced by trial division).
