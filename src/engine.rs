@@ -101,11 +101,18 @@ struct FamilyResult {
 /// Per-worker reusable buffers (SPEC §21.1 — reuse sieve/candidate scratch).
 #[derive(Default)]
 struct EngineScratch {
-    scores: Vec<u16>,
-    /// `a^{-1} mod p` per factor-base prime, precomputed once per polynomial
-    /// family (the self-initialization invariant is shared by all b-variants).
-    /// `u32::MAX` marks primes dividing `a` (handled by the linear fallback).
-    ainv: Vec<u32>,
+    scores: Vec<u8>,
+    /// The two sieve roots per factor-base prime for the current polynomial.
+    /// `root1[i] == u32::MAX` marks a prime that is not directly sieved (2, or a
+    /// prime dividing `a`, handled by the per-polynomial linear fallback).
+    root1: Vec<u32>,
+    root2: Vec<u32>,
+    /// `2·Bⱼ·a⁻¹ mod p` for each varying B-value `j` and factor-base prime `p`
+    /// (row-major `[j*nfb + i]`). Adding/subtracting this advances the roots to
+    /// the next self-initializing polynomial in O(1) per prime (SPEC §12.5).
+    bainv: Vec<u32>,
+    /// Positions surviving the score threshold, reused across polynomials.
+    candidates: Vec<u32>,
 }
 
 /// Immutable portable SIQS worker context.
@@ -518,39 +525,126 @@ fn find_factor(
 }
 
 fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> FamilyResult {
-    let Some((a, aidx)) = choose_a(ctx, family) else {
-        return FamilyResult {
-            family,
-            polynomials: 0,
-            relations: Vec::new(),
-        };
+    let empty = |family| FamilyResult {
+        family,
+        polynomials: 0,
+        relations: Vec::new(),
     };
-    // Self-initialization: `a^{-1} mod p` is invariant across every b-variant of
-    // this family, so compute it once here instead of once per polynomial.
-    scratch.ainv.clear();
-    scratch.ainv.reserve(ctx.base.len());
-    for e in ctx.base.iter() {
-        let p = e.prime;
-        let ap = if p == 2 { 0 } else { a.mod_u64(p as u64) as u32 };
-        scratch
-            .ainv
-            .push(if ap == 0 { u32::MAX } else { inv_u32(ap, p).unwrap_or(u32::MAX) });
+    let Some((a, aidx)) = choose_a(ctx, family) else {
+        return empty(family);
+    };
+    let base = &ctx.base;
+    let nfb = base.len();
+    let s = aidx.len();
+    let nvar = (s - 1).min(6); // number of sign bits varied per family
+    let variants = 1u64 << nvar;
+
+    // SIQS B-values: b = Σ ±Bⱼ (mod a), with Bⱼ ≡ sqrt(n) (mod qⱼ), 0 (mod other q).
+    let mut bvals: Vec<Natural<16>> = Vec::with_capacity(s);
+    for &i in &aidx {
+        let q = base[i as usize].prime;
+        let Some((ap, _)) = a.div_rem_u64(q as u64) else {
+            return empty(family);
+        };
+        let Some(apinv) = inv_u32(ap.mod_u64(q as u64) as u32, q) else {
+            return empty(family);
+        };
+        let coeff = (base[i as usize].sqrt_n as u64 * apinv as u64) % q as u64;
+        bvals.push(ap.mul_mod(&Natural::from_u64(coeff), &a));
     }
-    let variants = 1u64 << aidx.len().saturating_sub(1).min(6);
-    let mut relations = Vec::new();
-    for variant in 0..variants {
-        let Some(b) = crt_root(ctx, &a, &aidx, variant) else {
+    let mut b = Natural::ZERO;
+    for bj in &bvals {
+        b = b.add_mod(bj, &a);
+    }
+    // True (unreduced) 2·Bⱼ, each < 2a. Kept unreduced so the O(1) root advance can
+    // account for the mod-a wrap uniformly.
+    let two_full: Vec<Natural<16>> = bvals[..nvar].iter().map(|bj| bj.wrapping_add(bj)).collect();
+
+    // Per-prime precompute for the initial polynomial: both roots and, for each
+    // varying B-value, the O(1) root advance `2·Bⱼ·a⁻¹ mod p`.
+    scratch.root1.clear();
+    scratch.root1.resize(nfb, u32::MAX);
+    scratch.root2.clear();
+    scratch.root2.resize(nfb, 0);
+    scratch.bainv.clear();
+    scratch.bainv.resize(nvar * nfb, 0);
+    for (idx, e) in base.iter().enumerate() {
+        let p = e.prime;
+        if p == 2 {
+            continue;
+        }
+        let ap = a.mod_u64(p as u64) as u32;
+        if ap == 0 {
+            continue; // p | a: linear fallback per polynomial (root1 stays MAX)
+        }
+        let Some(ainvp) = inv_u32(ap, p) else {
             continue;
         };
-        sieve_polynomial(
+        let bp = b.mod_u64(p as u64) as u32;
+        scratch.root1[idx] = mulmod_u32((e.sqrt_n + p - bp) % p, ainvp, p);
+        scratch.root2[idx] = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, ainvp, p);
+        for (j, bj) in bvals.iter().take(nvar).enumerate() {
+            let bjp = bj.mod_u64(p as u64) as u32;
+            let two_bjp = (2 * bjp as u64 % p as u64) as u32;
+            scratch.bainv[j * nfb + idx] = mulmod_u32(two_bjp, ainvp, p);
+        }
+    }
+
+    // Sieve every polynomial in Gray-code order, advancing the roots in O(1) per
+    // prime between consecutive polynomials instead of recomputing them.
+    let mut relations = Vec::new();
+    for v in 0..variants {
+        sieve_one_poly(
             ctx,
             &a,
             &b,
             &aidx,
-            &scratch.ainv,
+            &scratch.root1,
+            &scratch.root2,
             &mut scratch.scores,
+            &mut scratch.candidates,
             &mut relations,
-        )
+        );
+        if v + 1 >= variants {
+            break;
+        }
+        let j = (v + 1).trailing_zeros() as usize;
+        let gray = v ^ (v >> 1);
+        let flip_to_one = (gray >> j) & 1 == 0;
+        // Advance b to the next polynomial (kept reduced in [0, a)) and record the
+        // number of a-wraps: because a·a⁻¹ ≡ 1 (mod p), each wrap shifts every
+        // prime's root by the same amount, so `shift` is applied uniformly below.
+        let (add_bainv, shift): (bool, i64) = if flip_to_one {
+            // b_new = (b - 2Bⱼ) mod a; raw = b + 2a - 2Bⱼ ∈ (0, 3a).
+            let mut raw = b.wrapping_add(&a).wrapping_add(&a).wrapping_sub(&two_full[j]);
+            let mut kp = 0i64;
+            while raw >= a {
+                raw = raw.wrapping_sub(&a);
+                kp += 1;
+            }
+            b = raw;
+            (true, -(2 - kp))
+        } else {
+            let mut raw = b.wrapping_add(&two_full[j]);
+            let mut k = 0i64;
+            while raw >= a {
+                raw = raw.wrapping_sub(&a);
+                k += 1;
+            }
+            b = raw;
+            (false, k)
+        };
+        let off = j * nfb;
+        for idx in 0..nfb {
+            if scratch.root1[idx] == u32::MAX {
+                continue;
+            }
+            let p = base[idx].prime as i64;
+            let d = scratch.bainv[off + idx] as i64;
+            let delta = (if add_bainv { d } else { -d } + shift).rem_euclid(p);
+            scratch.root1[idx] = ((scratch.root1[idx] as i64 + delta) % p) as u32;
+            scratch.root2[idx] = ((scratch.root2[idx] as i64 + delta) % p) as u32;
+        }
     }
     FamilyResult {
         family,
@@ -586,33 +680,19 @@ fn choose_a(ctx: &Context, family: u64) -> Option<(Natural<16>, Vec<u32>)> {
     (idx.len() >= 3).then_some((a, idx))
 }
 
-fn crt_root(ctx: &Context, a: &Natural<16>, idx: &[u32], variant: u64) -> Option<Natural<16>> {
-    let mut b = Natural::ZERO;
-    for (j, &i) in idx.iter().enumerate() {
-        let e = ctx.base[i as usize];
-        let ap = a.div_rem_u64(e.prime as u64)?.0;
-        let inv = inv_u32(ap.mod_u64(e.prime as u64) as u32, e.prime)?;
-        let root = if j + 1 == idx.len() || variant >> (j.min(63)) & 1 == 0 {
-            e.sqrt_n
-        } else {
-            if e.sqrt_n == 0 { 0 } else { e.prime - e.sqrt_n }
-        };
-        let coeff = (root as u64 * inv as u64) % e.prime as u64;
-        let term = ap.mul_mod(&Natural::from_u64(coeff), a);
-        b = b.add_mod(&term, a)
-    }
-    Some(b)
-}
-
-fn sieve_polynomial(
+#[allow(clippy::too_many_arguments)]
+fn sieve_one_poly(
     ctx: &Context,
     a: &Natural<16>,
     b: &Natural<16>,
     aidx: &[u32],
-    ainv: &[u32],
-    scores: &mut Vec<u16>,
+    root1: &[u32],
+    root2: &[u32],
+    scores: &mut Vec<u8>,
+    candidates: &mut Vec<u32>,
     out: &mut Vec<Relation>,
 ) {
+    let base = &ctx.base;
     let len = (ctx.interval as usize) * 2;
     scores.clear();
     scores.resize(len, 0);
@@ -622,45 +702,57 @@ fn sieve_polynomial(
     } else {
         (ctx.n.wrapping_sub(&bb).div_rem(a).unwrap().0, true)
     };
-    for (index, e) in ctx.base.iter().enumerate() {
+    let neg_interval = -(ctx.interval as i64);
+    // Logarithmic sieve using the self-initialized roots. Byte scores keep the
+    // whole array resident in cache (SPEC §12.6).
+    for (idx, e) in base.iter().enumerate() {
         let p = e.prime;
         if p == 2 {
             continue;
         }
-        let bp = b.mod_u64(p as u64) as u32;
-        let mut roots = [0u32; 2];
-        let inv = ainv[index];
-        let count = if inv != u32::MAX {
-            roots[0] = mulmod_u32((e.sqrt_n + p - bp) % p, inv, p);
-            roots[1] = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, inv, p);
-            if roots[0] == roots[1] { 1 } else { 2 }
+        let pu = p as usize;
+        let weight = (32 - p.leading_zeros()) as u8;
+        if root1[idx] != u32::MAX {
+            for &root in &[root1[idx], root2[idx]] {
+                let start = (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64) as usize;
+                let mut pos = start;
+                while pos < len {
+                    scores[pos] = scores[pos].saturating_add(weight);
+                    pos += pu;
+                }
+            }
         } else {
+            // p | a: the polynomial is linear (2bx + c) mod p — one root, per poly.
+            let bp = b.mod_u64(p as u64) as u32;
             let denom = (2 * bp as u64 % p as u64) as u32;
             let Some(inv) = inv_u32(denom, p) else {
                 continue;
             };
             let cm = c.mod_u64(p as u64) as u32;
             let signed_c = if csign && cm != 0 { p - cm } else { cm };
-            roots[0] = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
-            1
-        };
-        let weight = ((32 - p.leading_zeros()) * 2) as u16;
-        for &root in &roots[..count] {
-            let start = (root as i64 - (-(ctx.interval as i64)).rem_euclid(p as i64))
-                .rem_euclid(p as i64) as usize;
-            for pos in (start..len).step_by(p as usize) {
-                scores[pos] = scores[pos].saturating_add(weight)
+            let root = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
+            let start = (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64) as usize;
+            let mut pos = start;
+            while pos < len {
+                scores[pos] = scores[pos].saturating_add(weight);
+                pos += pu;
             }
         }
     }
     let g_bits = ctx.n.bit_len().saturating_sub(a.bit_len());
-    let threshold = (g_bits.saturating_sub(ctx.lp_allowance) * 2).clamp(20, 400) as u16;
+    let threshold = g_bits.saturating_sub(ctx.lp_allowance).clamp(1, 255) as u8;
+    candidates.clear();
     for (pos, &score) in scores.iter().enumerate() {
-        if score < threshold {
-            continue;
+        if score >= threshold {
+            candidates.push(pos as u32);
         }
+    }
+    for &posu in candidates.iter() {
+        let pos = posu as usize;
         let x = pos as i64 - ctx.interval as i64;
-        let ax = a.checked_mul(&Natural::from_u64(x.unsigned_abs())).unwrap();
+        let xabs = x.unsigned_abs();
+        let ax = a.checked_mul(&Natural::from_u64(xabs)).unwrap();
+        // t = a·x + b, needed for the relation's square root.
         let (t, tneg) = if x >= 0 {
             (ax.checked_add(b).unwrap(), false)
         } else if ax >= *b {
@@ -668,17 +760,28 @@ fn sieve_polynomial(
         } else {
             (b.wrapping_sub(&ax), false)
         };
-        let tt = t.checked_mul(&t).unwrap();
-        let (mut q, sign) = if tt >= ctx.n {
-            (tt.wrapping_sub(&ctx.n), false)
+        // Value to factor: g(x) = Q(x)/a = a·x² + 2b·x + c, computed directly with
+        // signs (c_math = ∓c per csign). This avoids the wide t² squaring and the
+        // division by a — a is guaranteed to divide Q since b² ≡ n (mod a).
+        let ax2 = ax.checked_mul(&Natural::from_u64(xabs)).unwrap();
+        let two_bx = b.wrapping_add(b).checked_mul(&Natural::from_u64(xabs)).unwrap();
+        let mut pos_sum = ax2;
+        let mut neg_sum = Natural::ZERO;
+        if x >= 0 {
+            pos_sum = pos_sum.checked_add(&two_bx).unwrap();
         } else {
-            (ctx.n.wrapping_sub(&tt), true)
-        };
-        let (qdiv, rem) = q.div_rem(a).unwrap();
-        if !rem.is_zero() {
-            continue;
+            neg_sum = two_bx;
         }
-        q = qdiv;
+        if csign {
+            neg_sum = neg_sum.checked_add(&c).unwrap();
+        } else {
+            pos_sum = pos_sum.checked_add(&c).unwrap();
+        }
+        let (mut q, sign) = if pos_sum >= neg_sum {
+            (pos_sum.wrapping_sub(&neg_sum), false)
+        } else {
+            (neg_sum.wrapping_sub(&pos_sum), true)
+        };
         if q.is_zero() {
             continue;
         }

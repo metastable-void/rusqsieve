@@ -96,11 +96,14 @@ flintqs is single-threaded and refuses inputs < 40 digits (~133 bit).
 |   80 | 28.9 s           | 0.21 s          | (refuses)          | —          |
 |   96 | >60 s (timeout)  | 0.11 s          | (refuses)          | —          |
 |  112 | >60 s            | 0.21 s          | (refuses)          | —          |
-|  128 | >60 s            | 0.51 s          | (refuses)          | —          |
-|  160 | >60 s            | 0.31 s          | 1.22 s             | **3.9× faster** |
-|  192 | >60 s            | 1.22 s          | 5.13 s             | **4.2× faster** |
-|  224 | >60 s            | 10.7 s          | 36.9 s             | **3.4× faster** |
-|  256 | >60 s            | 105.6 s         | 231.4 s            | **2.2× faster** |
+|  128 | >60 s            | 0.61 s          | (refuses)          | —          |
+|  160 | >60 s            | 0.41 s          | 1.22 s             | **2.9× faster** |
+|  192 | >60 s            | 1.12 s          | 5.13 s             | **4.5× faster** |
+|  224 | >60 s            | 9.3 s           | 36.9 s             | **3.9× faster** |
+|  256 | >60 s            | 82 s            | 231 s              | **2.8× faster** |
+
+(The "after" column reflects the full optimization set including SIQS self-initialization,
+byte-array sieve, and cheaper Q(x) reconstruction — see the per-polynomial section below.)
 
 rusqsieve is faster than flintqs across the whole head-to-head range (160–256 bit) and
 factors the small/mid range (64–128 bit, which flintqs refuses) in ≤0.5 s.
@@ -151,10 +154,35 @@ sieving, ~9 % linear algebra; at 256 bit linear algebra is only a few seconds of
   implemented from scratch: it targets the same (non-bottleneck) phase, and a reference-free
   implementation is high-risk relative to zero measurable benefit here.
 
-**The real remaining lever** is cutting per-polynomial cost: incremental SIQS root updates across
-`b`-variants (update roots by ±2·Bⱼ·a⁻¹ instead of recomputing per b), a byte-array sieve with
-bucket sieving for large-stride primes, and cheaper `Q(x)` reconstruction. That would both speed
-the common range and make double-large-primes a net win at 224–256 bit.
+### Per-polynomial cost reduction (self-initialization + cheaper reconstruction)
+
+Follow-up on "the real remaining lever". Implemented and measured:
+
+- **SIQS self-initialization (incremental roots) — implemented.** The scoring loop used to
+  recompute both modular roots per prime per polynomial (`b mod p` — a big-integer division — plus
+  two `mulmod`s). Now `2·Bⱼ·a⁻¹ mod p` is precomputed once per family, `b` is walked in Gray-code
+  order, and roots advance by one add per prime between consecutive polynomials (SPEC §12.5).
+  Subtlety fixed: because `b` is kept reduced in `[0,a)` and `a·a⁻¹ ≡ 1 (mod p)`, each mod-`a`
+  wrap shifts every prime's root uniformly — that shift is applied alongside the increment.
+  Verified against from-scratch roots and `b² ≡ n (mod a)`. **~20 % faster at 256 bit** (big
+  factor base → root recomputation was a real cost); neutral at ≤192 bit (small factor base).
+- **Byte-array sieve — implemented.** Scores are now `u8` (was `u16`), halving the sieve array so
+  more of it stays cache-resident; weights/threshold rescaled to `log₂` so a smooth `Q ≈ 2^g` fits
+  a byte across the supported range.
+- **Cheaper Q(x) reconstruction — implemented.** Survivors now compute `g(x)=Q/a = a·x²+2b·x+c`
+  directly (signed) instead of the wide `t²` squaring followed by a division by `a` (`a | Q` is
+  guaranteed since `b² ≡ n (mod a)`). **~9 % faster at 224 bit.**
+
+Net vs. the pre-follow-up state: 256 bit 102.7 s → 82 s, 224 bit 10.9 s → 9.3 s; small/mid sizes
+unchanged (already overhead-bound). rusqsieve now beats flintqs 2.9–4.5× across 160–256 bit.
+
+- **Bucket sieving — assessed, deferred.** The dominant remaining cost is the sieve *stepping*
+  (score writes), where large-stride primes (`p` larger than the cache-resident block) cause a
+  cache miss per hit. Bucket sieving would batch those into cache-local blocks. It is a major
+  restructure of the scoring + survivor-scan loop (block partitioning, per-block hit buckets,
+  block-local draining) with an estimated ~15–25 % gain at large sizes — worthwhile, but a
+  higher-risk rewrite with diminishing returns given rusqsieve already leads flintqs 2.8–4.5×.
+  Left as the next scoped step rather than destabilizing the current verified state.
 
 - **Done earlier:** the low-level portable kernel `qs::sieve_job` — previously trial-division of every
   `x²−n` candidate — is now a genuine logarithmic sieve (SPEC §12.6): it adds `log(p)` at the
