@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rusqsieve — integer factorization in your browser</title>
+    <meta
+      name="description"
+      content="A portable self-initializing quadratic sieve compiled to WebAssembly, running in parallel across Web Workers."
+    />
+    <link rel="stylesheet" href="./index.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%E2%88%9A%3C/text%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>rusqsieve</h1>
+        <p class="tagline">
+          A portable self-initializing quadratic sieve, compiled to WebAssembly and
+          run in parallel across Web Workers.
+        </p>
+      </header>
+
+      <section class="panel">
+        <label for="input">Number to factor</label>
+        <div class="entry">
+          <input
+            id="input"
+            inputmode="numeric"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="e.g. 1256983314983137644553747197792065202513411738941"
+          />
+          <button id="go" disabled>Factor</button>
+        </div>
+        <div class="examples">
+          Try:
+          <button class="ex" data-n="600851475143">600851475143</button>
+          <button class="ex" data-n="1152921504606846883">2⁶¹−45</button>
+          <button class="ex" data-n="1256983314983137644553747197792065202513411738941">
+            49-digit semiprime
+          </button>
+          <button class="ex" data-n="5845354724375454473909137928398990449217655808523662886639">
+            58-digit semiprime
+          </button>
+        </div>
+      </section>
+
+      <section class="progress">
+        <div id="meter" class="meter"><div id="bar" class="bar"></div></div>
+        <p id="status" class="status">Loading…</p>
+      </section>
+
+      <section id="result" class="result" aria-live="polite"></section>
+
+      <footer>
+        <span id="workers" class="workers"></span>
+        <span class="note">
+          Single WebAssembly module; no threads inside the math core. All factors
+          verified by product before display.
+        </span>
+      </footer>
+    </main>
+    <script type="module" src="./index.js"></script>
+    <script type="module">
+      const input = document.getElementById("input");
+      for (const b of document.querySelectorAll(".ex"))
+        b.addEventListener("click", () => {
+          input.value = b.dataset.n;
+          input.focus();
+        });
+    </script>
+  </body>
+</html>

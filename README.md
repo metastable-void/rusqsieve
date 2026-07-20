@@ -19,4 +19,12 @@ Custom schedulers, including Web Workers, can use `engine::prepare`,
 The portable job kernel never creates threads; the native blocking API schedules
 the same deterministic polynomial-family work across persistent workers.
 
+## Browser demo
+
+`make docs` builds a self-contained WebAssembly demo into `docs/` for GitHub Pages
+(enable Pages on the `docs/` folder). It factors a number you type using the same
+crate compiled to `wasm32-unknown-unknown`, sieving in parallel across a pool of Web
+Workers sized to `navigator.hardwareConcurrency`, and renders the result in power
+notation. `make serve` previews it locally at <http://localhost:8000/>.
+
 Licensed under `Apache-2.0 OR MPL-2.0`; see `LICENSE-APACHE` and `LICENSE-MPL`.

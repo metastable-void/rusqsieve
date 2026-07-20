@@ -1,4 +1,5 @@
 //! Raw, versioned C ABI for `wasm32-unknown-unknown`.
+use crate::engine::{self, EngineContext, EngineJob, EngineSession};
 use crate::{FactorConfig, FactorSession, LocalWorkBudget, Natural};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
@@ -68,7 +69,10 @@ impl<T> Registry<T> {
         }
     }
 }
-thread_local! {static SESSIONS:RefCell<Registry<FactorSession<16>>>=const{RefCell::new(Registry::new())};static BUFFERS:RefCell<Registry<Box<[u8]>>>=const{RefCell::new(Registry::new())};}
+thread_local! {static SESSIONS:RefCell<Registry<FactorSession<16>>>=const{RefCell::new(Registry::new())};static BUFFERS:RefCell<Registry<Box<[u8]>>>=const{RefCell::new(Registry::new())};
+    static COORDS: RefCell<Registry<EngineSession>> = const { RefCell::new(Registry::new()) };
+    static WORKERS: RefCell<Registry<EngineContext>> = const { RefCell::new(Registry::new()) };
+}
 fn memory_bytes() -> usize {
     core::arch::wasm32::memory_size(0) * 65536
 }
@@ -245,4 +249,135 @@ pub extern "C" fn qs_worker_context_free(_context: u32) {}
 #[unsafe(no_mangle)]
 pub extern "C" fn qs_worker_execute(_context: u32, _pointer: u32, _length: u32) -> u32 {
     0
+}
+
+// ---------------------------------------------------------------------------
+// Parallel SIQS protocol (engine-based) for the Web-Worker demo.
+//
+// A worker rebuilds the *deterministic* sieve context with `qs_worker_prepare`
+// (same input → same factor base, so no context needs to be serialized) and
+// sieves a stripe of polynomial families with `qs_worker_sieve`. The coordinator
+// (`qs_coord_*`) accumulates the serialized relations and runs the linear algebra.
+// ---------------------------------------------------------------------------
+
+fn parse_decimal(pointer: u32, length: u32) -> Option<WasmNatural> {
+    let bytes = input(pointer, length)?;
+    let text = core::str::from_utf8(bytes).ok()?;
+    WasmNatural::from_decimal(text).ok()
+}
+
+/// Prepare a deterministic worker sieve context for the composite `n`.
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_worker_prepare(n_pointer: u32, n_length: u32) -> u32 {
+    let Some(n) = parse_decimal(n_pointer, n_length) else {
+        return 0;
+    };
+    let Ok(ctx) = engine::prepare(n) else {
+        return 0;
+    };
+    WORKERS.with(|r| r.borrow_mut().insert(ctx))
+}
+/// Sieve polynomial families `[family_first, family_first + count)`; returns a buffer
+/// handle to `count` concatenated serialized family results (`[count:u32][len:u32,bytes]…`).
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_worker_sieve(context: u32, family_first: u32, count: u32) -> u32 {
+    WORKERS.with(|r| {
+        let reg = r.borrow();
+        let Some(ctx) = reg.get(context) else {
+            return 0;
+        };
+        let count = count.min(4096);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&count.to_le_bytes());
+        for k in 0..count {
+            let job = EngineJob {
+                family: (family_first + k) as u64,
+            };
+            let bytes = engine::execute(ctx, job).to_bytes();
+            payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&bytes);
+        }
+        packet(10, &payload)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_worker_free(context: u32) {
+    WORKERS.with(|r| r.borrow_mut().remove(context))
+}
+
+/// Create a coordinator collecting relations for the composite `n`.
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_coord_new(n_pointer: u32, n_length: u32) -> u32 {
+    let Some(n) = parse_decimal(n_pointer, n_length) else {
+        return 0;
+    };
+    let Ok(ctx) = engine::prepare(n) else {
+        return 0;
+    };
+    COORDS.with(|r| r.borrow_mut().insert(EngineSession::new(ctx)))
+}
+/// Relation target needed before the coordinator can extract a factor.
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_coord_target(session: u32) -> u32 {
+    COORDS.with(|r| r.borrow().get(session).map_or(0, |s| s.target() as u32))
+}
+/// Relations collected so far.
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_coord_relations(session: u32) -> u32 {
+    COORDS.with(|r| r.borrow().get(session).map_or(0, |s| s.relations() as u32))
+}
+/// Ingest a worker's `qs_worker_sieve` payload; returns the new relation count.
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_coord_submit(session: u32, pointer: u32, length: u32) -> u32 {
+    let Some(bytes) = input(pointer, length) else {
+        return 0;
+    };
+    COORDS.with(|r| {
+        let mut reg = r.borrow_mut();
+        let Some(s) = reg.get_mut(session) else {
+            return 0;
+        };
+        if bytes.len() >= 4 {
+            let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            let mut o = 4usize;
+            for _ in 0..count {
+                if o + 4 > bytes.len() {
+                    break;
+                }
+                let len = u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+                o += 4;
+                if o + len > bytes.len() {
+                    break;
+                }
+                s.submit_bytes(&bytes[o..o + len]);
+                o += len;
+            }
+        }
+        s.relations() as u32
+    })
+}
+/// Run the linear algebra and return a nontrivial factor as a 128-byte little-endian
+/// `Natural<16>` payload, or 0 if extraction failed (needs more relations).
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_coord_extract(session: u32) -> u32 {
+    COORDS.with(|r| {
+        let reg = r.borrow();
+        let Some(s) = reg.get(session) else {
+            return 0;
+        };
+        match s.extract_factor() {
+            Ok(d) => {
+                let mut payload = Vec::with_capacity(128);
+                for limb in d.as_parts() {
+                    payload.extend_from_slice(&limb.to_le_bytes());
+                }
+                packet(11, &payload)
+            }
+            Err(_) => 0,
+        }
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_coord_free(session: u32) {
+    COORDS.with(|r| r.borrow_mut().remove(session))
 }
