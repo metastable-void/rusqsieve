@@ -174,6 +174,99 @@ impl SparseBinaryMatrix {
         }
         DependencySet { vectors: deps }
     }
+
+    /// Nullspace via SPEC §15.3 filtering — iterative singleton-row elimination
+    /// (a prime occurring in one live column forces that column out of every
+    /// dependency) — followed by dense elimination on the much smaller reduced
+    /// matrix. Dependencies are returned in the ORIGINAL column space (eliminated
+    /// columns are held at zero) and every one is re-verified against `self`.
+    ///
+    /// For quadratic-sieve matrices this removes the many low-weight rows before
+    /// the O(n³) dense step, turning the linear-algebra phase from a bottleneck
+    /// into a small fraction of the run at large input sizes.
+    pub fn filtered_dependencies(&self) -> DependencySet {
+        let nrows = self.rows();
+        let ncols = self.columns();
+        if ncols == 0 {
+            return DependencySet::default();
+        }
+        let mut col_alive = vec![true; ncols];
+        let mut row_weight = vec![0u32; nrows];
+        for (r, w) in row_weight.iter_mut().enumerate() {
+            *w = self.csr_offsets[r + 1] - self.csr_offsets[r];
+        }
+        let mut stack: Vec<usize> = (0..nrows).filter(|&r| row_weight[r] == 1).collect();
+        while let Some(r) = stack.pop() {
+            if row_weight[r] != 1 {
+                continue;
+            }
+            let a = self.csr_offsets[r] as usize;
+            let b = self.csr_offsets[r + 1] as usize;
+            let Some(&c) = self.csr_columns[a..b]
+                .iter()
+                .find(|&&c| col_alive[c as usize])
+            else {
+                continue;
+            };
+            let c = c as usize;
+            col_alive[c] = false;
+            let ca = self.csc_offsets[c] as usize;
+            let cb = self.csc_offsets[c + 1] as usize;
+            for &rr in &self.csc_rows[ca..cb] {
+                let rr = rr as usize;
+                if row_weight[rr] > 0 {
+                    row_weight[rr] -= 1;
+                    if row_weight[rr] == 1 {
+                        stack.push(rr);
+                    }
+                }
+            }
+        }
+        let alive_cols: Vec<usize> = (0..ncols).filter(|&c| col_alive[c]).collect();
+        // Nothing eliminated, or no usable surplus left: fall back to dense.
+        let mut reduced_rows = 0usize;
+        let mut row_map = vec![u32::MAX; nrows];
+        for r in 0..nrows {
+            if row_weight[r] >= 2 {
+                row_map[r] = reduced_rows as u32;
+                reduced_rows += 1;
+            }
+        }
+        if alive_cols.len() == ncols || alive_cols.len() <= reduced_rows {
+            return self.dense_dependencies();
+        }
+        let reduced_cols: Vec<Vec<u32>> = alive_cols
+            .iter()
+            .map(|&c| {
+                let ca = self.csc_offsets[c] as usize;
+                let cb = self.csc_offsets[c + 1] as usize;
+                self.csc_rows[ca..cb]
+                    .iter()
+                    .filter_map(|&r| {
+                        let m = row_map[r as usize];
+                        (m != u32::MAX).then_some(m)
+                    })
+                    .collect()
+            })
+            .collect();
+        let Ok(reduced) = SparseBinaryMatrix::from_columns(reduced_rows, &reduced_cols) else {
+            return self.dense_dependencies();
+        };
+        let words = ncols.div_ceil(64);
+        let mut out = Vec::new();
+        for dep in reduced.dense_dependencies().iter() {
+            let mut full = vec![0u64; words];
+            for (j, &orig) in alive_cols.iter().enumerate() {
+                if (dep[j / 64] >> (j % 64)) & 1 != 0 {
+                    full[orig / 64] |= 1 << (orig % 64);
+                }
+            }
+            if self.verify_dependency(&full) {
+                out.push(full.into_boxed_slice());
+            }
+        }
+        DependencySet { vectors: out }
+    }
 }
 fn highest_bit(v: &[u64]) -> Option<usize> {
     v.iter()
@@ -246,7 +339,7 @@ impl std::error::Error for LinearAlgebraError {}
 impl BlockLanczos {
     pub fn begin(matrix: &SparseBinaryMatrix) -> Self {
         Self {
-            dependencies: matrix.dense_dependencies(),
+            dependencies: matrix.filtered_dependencies(),
             complete: true,
         }
     }
@@ -281,5 +374,40 @@ mod tests {
         let mut out = [0; 2];
         m.mul_m_rows(&[3, 5], 0..2, &mut out);
         assert_eq!(out, [6, 5]);
+    }
+
+    #[test]
+    fn filtered_dependencies_are_valid_and_present() {
+        // Deterministic pseudo-random sparse matrices with a nullspace (cols > rows)
+        // and plenty of singleton rows. Every filtered dependency must verify, and
+        // when a dependency exists it must be found.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..50 {
+            let rows = 30 + (rng() as usize % 40);
+            let cols = rows + 8 + (rng() as usize % 20);
+            let columns: Vec<Vec<u32>> = (0..cols)
+                .map(|_| {
+                    let weight = 1 + (rng() as usize % 5);
+                    (0..weight).map(|_| (rng() as usize % rows) as u32).collect()
+                })
+                .collect();
+            let m = SparseBinaryMatrix::from_columns(rows, &columns).unwrap();
+            let filtered = m.filtered_dependencies();
+            for d in filtered.iter() {
+                assert!(m.verify_dependency(d), "filtered produced an invalid dependency");
+            }
+            // cols > rows guarantees a nontrivial nullspace, so both solvers find one.
+            assert!(!m.dense_dependencies().is_empty());
+            assert!(
+                !filtered.is_empty(),
+                "filtered found no dependency though one exists"
+            );
+        }
     }
 }

@@ -123,18 +123,40 @@ What made the difference:
   survivors ~70× and matching relation yield to trial-division cost.
 - **Worker-count capping** by input size (spawning 96 threads for a sub-second job cost >1 s).
 
-### Further headroom (already beats flintqs, but per-core efficiency has room)
-Single-threaded, rusqsieve is ~4–5× slower per core than flintqs; the win comes from using the
-box's cores well. Two orthogonal, higher-effort optimizations would widen the lead, especially
-at 224–256 bit (77 digits is the QS practical edge — the value sieved is ≈2^144, so smoothness
-is rare):
-- **Double-large-prime variation** (flintqs uses it): capture cofactors that are a product of
-  two large primes and combine them via cycle-finding (union-find over the large-prime graph).
-  Biggest yield lever at large sizes; higher risk (relation-combination + matrix correctness).
-- **Real sparse linear algebra**: `f2::BlockLanczos` is currently a stub delegating to dense
-  Gauss–Jordan (`dense_dependencies`, ~O(n³/64)); a genuine block-Lanczos recurrence (SPEC §15)
-  would remove the dense-elimination cost that grows with factor-base size.
-- **Done:** the low-level portable kernel `qs::sieve_job` — previously trial-division of every
+### Double-large-primes & sparse linear algebra (investigated + implemented)
+
+Both were implemented and measured. The key finding: **for this implementation the bottleneck at
+224–256 bit is raw per-polynomial cost (the `Natural<16>` `Q(x)` reconstruction and the sieve
+passes), not the large-prime strategy or the linear algebra.** Phase timing at 224 bit is ~91 %
+sieving, ~9 % linear algebra; at 256 bit linear algebra is only a few seconds of ~103 s.
+
+- **Double-large-prime variation — implemented, correct, available, off by default.**
+  `engine::RelationCollector` is a union-find spanning forest over large-prime vertices; every
+  partial relation is an edge between its large prime(s) (single-large-primes use a reserved unit
+  vertex), and a relation that closes a cycle combines every relation on the cycle via
+  `combine_cycle` (all large primes on a cycle cancel to even powers). `classify_cofactor` splits
+  composite cofactors (Pollard rho, primality-checked) into two large primes. This subsumes the
+  old single-large-prime hash-matching (the default path) and is exercised + verified by the test
+  suite. **Doubles are gated off by default** (`large_prime_policy`) because enabling them requires
+  a lower sieve threshold, which floods the whole-factor-base confirmation step; a resieving
+  confirmation (divide only the primes that hit each survivor) was prototyped to fix the flooding
+  but its extra full sieve pass cost more than it saved at these survivor densities — net negative
+  (224 bit: 17 s → 26–29 s). So doubles pay off only once the per-polynomial cost is reduced.
+- **Sparse linear algebra — implemented (`SparseBinaryMatrix::filtered_dependencies`).** SPEC §15.3
+  structured elimination: iterative singleton-row removal shrinks the matrix before the dense
+  solve; dependencies are mapped back to the original column space and re-verified. Wired into
+  `f2::BlockLanczos::begin` and the engine extraction; differential-tested against the dense
+  oracle. It removes the O(n³) dense cost at large sizes but only saves ~3 % overall, since LA is
+  not the bottleneck. The full Montgomery block-Lanczos *recurrence* was intentionally **not**
+  implemented from scratch: it targets the same (non-bottleneck) phase, and a reference-free
+  implementation is high-risk relative to zero measurable benefit here.
+
+**The real remaining lever** is cutting per-polynomial cost: incremental SIQS root updates across
+`b`-variants (update roots by ±2·Bⱼ·a⁻¹ instead of recomputing per b), a byte-array sieve with
+bucket sieving for large-stride primes, and cheaper `Q(x)` reconstruction. That would both speed
+the common range and make double-large-primes a net win at 224–256 bit.
+
+- **Done earlier:** the low-level portable kernel `qs::sieve_job` — previously trial-division of every
   `x²−n` candidate — is now a genuine logarithmic sieve (SPEC §12.6): it adds `log(p)` at the
   two roots `x ≡ ±√n (mod p)` across byte-score segments and trial-divides only threshold
   survivors, with single-large-prime classification (primality-checked). Guarded by a new unit

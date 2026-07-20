@@ -49,8 +49,29 @@ struct Context {
     base: Arc<[FactorBaseEntry]>,
     interval: i32,
     target_a_bits: usize,
-    large_limit: u64,
     lp_allowance: usize,
+    /// Maximum accepted single large prime (and maximum factor of a double).
+    single_limit: u64,
+    /// Whether double-large-prime cofactors are captured and combined.
+    double_enabled: bool,
+}
+
+/// Large-prime cofactor content of a relation.
+#[derive(Clone, Copy)]
+enum LargePrime {
+    None,
+    One(u64),
+    Two(u64, u64),
+}
+impl LargePrime {
+    #[inline]
+    fn primes(self) -> ([u64; 2], usize) {
+        match self {
+            LargePrime::None => ([0, 0], 0),
+            LargePrime::One(a) => ([a, 0], 1),
+            LargePrime::Two(a, b) => ([a, b], 2),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -58,7 +79,7 @@ struct Relation {
     root: Natural<16>,
     sign: bool,
     powers: Vec<(u32, u16)>,
-    large: Option<u64>,
+    large: LargePrime,
 }
 
 #[derive(Clone)]
@@ -66,7 +87,9 @@ struct Column {
     root: Natural<16>,
     sign: bool,
     powers: Vec<(u32, u32)>,
-    extra_sqrt: u64,
+    /// Large primes that were squared out when combining partials; each
+    /// contributes once to the reconstructed square root `y`.
+    extra_sqrt: Vec<u64>,
 }
 
 struct FamilyResult {
@@ -113,14 +136,26 @@ pub fn prepare(n: Natural<16>) -> Result<EngineContext, EngineError> {
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let target_a = n.floor_sqrt().div_rem_u64(p.sieve_half_width as u64).unwrap().0;
+    let (single_limit, double_enabled) = large_prime_policy(p.factor_base_bound, p.lp_allowance);
     Ok(EngineContext(Arc::new(Context {
         n,
         base,
         interval: p.sieve_half_width as i32,
         target_a_bits: target_a.bit_len(),
-        large_limit: (p.factor_base_bound as u64).saturating_mul(p.factor_base_bound as u64),
         lp_allowance: p.lp_allowance,
+        single_limit,
+        double_enabled,
     })))
+}
+
+/// Large-prime acceptance policy derived from the cofactor budget `lp_allowance`
+/// (bits) and the factor-base bound. Doubles are only enabled when the budget can
+/// hold two primes each above the factor base.
+fn large_prime_policy(bound: u32, lp_allowance: usize) -> (u64, bool) {
+    let single_limit = 1u64 << lp_allowance.min(62);
+    let bound_bits = 64 - (bound as u64).max(1).leading_zeros();
+    let double_enabled = lp_allowance as u32 >= 2 * bound_bits + 2;
+    (single_limit, double_enabled)
 }
 
 /// Execute a job using only the caller's thread and owned scratch memory.
@@ -143,8 +178,7 @@ pub struct EngineSession {
     next_job: u64,
     next_merge: u64,
     polynomials: u64,
-    pending: HashMap<u64, Relation>,
-    columns: Vec<Column>,
+    collector: RelationCollector,
     buffered: BTreeMap<u64, FamilyResult>,
 }
 impl EngineSession {
@@ -156,8 +190,7 @@ impl EngineSession {
             next_job: 0,
             next_merge: 0,
             polynomials: 0,
-            pending: HashMap::new(),
-            columns: Vec::new(),
+            collector: RelationCollector::new(),
             buffered: BTreeMap::new(),
         }
     }
@@ -180,25 +213,17 @@ impl EngineSession {
         while let Some(r) = self.buffered.remove(&self.next_merge) {
             self.next_merge += 1;
             self.polynomials += r.polynomials;
+            let n = &self.context.0.n;
             for rel in r.relations {
-                if let Some(lp) = rel.large {
-                    if let Some(first) = self.pending.remove(&lp) {
-                        self.columns
-                            .push(combine(first, rel, lp, &self.context.0.n))
-                    } else {
-                        self.pending.insert(lp, rel);
-                    }
-                } else {
-                    self.columns.push(to_column(rel))
-                }
+                self.collector.ingest(rel, n);
             }
         }
     }
     pub fn is_ready(&self) -> bool {
-        self.columns.len() >= self.target
+        self.collector.columns.len() >= self.target
     }
     pub fn relations(&self) -> usize {
-        self.columns.len()
+        self.collector.columns.len()
     }
     pub fn target(&self) -> usize {
         self.target
@@ -207,7 +232,7 @@ impl EngineSession {
         self.polynomials
     }
     pub fn extract_factor(&self) -> Result<Natural<16>, EngineError> {
-        extract(&self.context.0, &self.columns)
+        extract(&self.context.0, &self.collector.columns)
     }
 }
 
@@ -232,7 +257,7 @@ fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural<16>, EngineError
         .collect();
     let matrix = SparseBinaryMatrix::from_columns(ctx.base.len() + 1, &matrix_cols)
         .map_err(|_| EngineError::InvalidDependency)?;
-    for dep in matrix.dense_dependencies().iter() {
+    for dep in matrix.filtered_dependencies().iter() {
         if !matrix.verify_dependency(dep) {
             return Err(EngineError::InvalidDependency);
         }
@@ -244,7 +269,9 @@ fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural<16>, EngineError
                 continue;
             }
             x = x.mul_mod(&c.root, &ctx.n);
-            y = y.mul_mod(&Natural::from_u64(c.extra_sqrt), &ctx.n);
+            for &lp in &c.extra_sqrt {
+                y = y.mul_mod(&Natural::from_u64(lp), &ctx.n);
+            }
             for &(i, e) in &c.powers {
                 sums[i as usize] += e
             }
@@ -384,13 +411,15 @@ fn find_factor(
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let target = base.len() + 64;
     let target_a = n.floor_sqrt().div_rem_u64(interval as u64).unwrap().0;
+    let (single_limit, double_enabled) = large_prime_policy(bound, p.lp_allowance);
     let ctx = Arc::new(Context {
         n: n.clone(),
         base: base.clone(),
         interval,
         target_a_bits: target_a.bit_len(),
-        large_limit: (bound as u64).saturating_mul(bound as u64),
         lp_allowance: p.lp_allowance,
+        single_limit,
+        double_enabled,
     });
     let (job_tx, job_rx) = mpsc::channel::<Option<u64>>();
     let job_rx = Arc::new(Mutex::new(job_rx));
@@ -427,11 +456,10 @@ fn find_factor(
         outstanding += 1
     }
     let mut buffered = BTreeMap::new();
-    let mut pending = HashMap::<u64, Relation>::new();
-    let mut columns = Vec::new();
+    let mut collector = RelationCollector::new();
     let mut polynomials = 0u64;
     let max_families = 100_000u64;
-    while columns.len() < target && next_merge < max_families {
+    while collector.columns.len() < target && next_merge < max_families {
         let result = res_rx.recv().map_err(|_| EngineError::Worker)?;
         outstanding -= 1;
         buffered.insert(result.family, result);
@@ -439,28 +467,21 @@ fn find_factor(
             next_merge += 1;
             polynomials += r.polynomials;
             for rel in r.relations {
-                if let Some(lp) = rel.large {
-                    if let Some(first) = pending.remove(&lp) {
-                        columns.push(combine(first, rel, lp, &n))
-                    } else {
-                        pending.insert(lp, rel);
-                    }
-                } else {
-                    columns.push(to_column(rel))
-                }
-                if columns.len() >= target {
+                collector.ingest(rel, &n);
+                if collector.columns.len() >= target {
                     break;
                 }
             }
             progress(EngineProgress {
                 phase: EnginePhase::Sieving,
                 polynomials,
-                relations: columns.len(),
+                relations: collector.columns.len(),
                 target,
                 workers: threads,
             });
         }
-        while outstanding < threads * 2 && next_send < max_families && columns.len() < target {
+        while outstanding < threads * 2 && next_send < max_families && collector.columns.len() < target
+        {
             job_tx
                 .send(Some(next_send))
                 .map_err(|_| EngineError::Worker)?;
@@ -475,78 +496,25 @@ fn find_factor(
     for h in handles {
         let _ = h.join();
     }
-    if columns.len() <= base.len() {
+    if collector.columns.len() <= base.len() {
         return Err(EngineError::InsufficientRelations);
     }
     progress(EngineProgress {
         phase: EnginePhase::LinearAlgebra,
         polynomials,
-        relations: columns.len(),
+        relations: collector.columns.len(),
         target,
         workers: threads,
     });
-    let matrix_cols: Vec<Vec<u32>> = columns
-        .iter()
-        .map(|c| {
-            let mut v = Vec::new();
-            if c.sign {
-                v.push(0)
-            }
-            for &(i, e) in &c.powers {
-                if e & 1 != 0 {
-                    v.push(i + 1)
-                }
-            }
-            v
-        })
-        .collect();
-    let matrix = SparseBinaryMatrix::from_columns(base.len() + 1, &matrix_cols)
-        .map_err(|_| EngineError::InvalidDependency)?;
-    let deps = matrix.dense_dependencies();
+    let result = extract(&ctx, &collector.columns);
     progress(EngineProgress {
         phase: EnginePhase::Extracting,
         polynomials,
-        relations: columns.len(),
+        relations: collector.columns.len(),
         target,
         workers: threads,
     });
-    for dep in deps.iter() {
-        if !matrix.verify_dependency(dep) {
-            return Err(EngineError::InvalidDependency);
-        }
-        let mut x = Natural::ONE;
-        let mut sums = vec![0u32; base.len()];
-        let mut y = Natural::ONE;
-        for (j, c) in columns.iter().enumerate() {
-            if (dep[j / 64] >> (j % 64)) & 1 == 0 {
-                continue;
-            }
-            x = x.mul_mod(&c.root, &n);
-            y = y.mul_mod(&Natural::from_u64(c.extra_sqrt), &n);
-            for &(i, e) in &c.powers {
-                sums[i as usize] += e
-            }
-        }
-        for (e, &s) in base.iter().zip(&sums) {
-            for _ in 0..s / 2 {
-                y = y.mul_mod(&Natural::from_u64(e.prime as u64), &n)
-            }
-        }
-        let delta = if x >= y {
-            x.wrapping_sub(&y)
-        } else {
-            y.wrapping_sub(&x)
-        };
-        let g = delta.gcd(&n);
-        if !g.is_one() && g != n {
-            return Ok(g);
-        }
-        let g = x.add_mod(&y, &n).gcd(&n);
-        if !g.is_one() && g != n {
-            return Ok(g);
-        }
-    }
-    Err(EngineError::NoFactor)
+    result
 }
 
 fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> FamilyResult {
@@ -737,14 +705,14 @@ fn sieve_polynomial(
             }
         }
         let large = if q.is_one() {
-            None
-        } else if q.bit_len() <= 64
-            && q.as_parts()[0] <= ctx.large_limit
-            && is_prime64(q.as_parts()[0])
-        {
-            Some(q.as_parts()[0])
-        } else {
+            LargePrime::None
+        } else if q.bit_len() > 64 {
             continue;
+        } else {
+            match classify_cofactor(q.as_parts()[0], ctx.single_limit, ctx.double_enabled) {
+                Some(lp) => lp,
+                None => continue,
+            }
         };
         let mut root = t.div_rem(&ctx.n).unwrap().1;
         if tneg && !root.is_zero() {
@@ -764,19 +732,186 @@ fn to_column(r: Relation) -> Column {
         root: r.root,
         sign: r.sign,
         powers: r.powers.into_iter().map(|(i, e)| (i, e as u32)).collect(),
-        extra_sqrt: 1,
+        extra_sqrt: Vec::new(),
     }
 }
-fn combine(a: Relation, b: Relation, lp: u64, n: &Natural<16>) -> Column {
-    let mut map = BTreeMap::<u32, u32>::new();
-    for (i, e) in a.powers.into_iter().chain(b.powers) {
-        *map.entry(i).or_default() += e as u32
+
+/// Combine a set of relations whose large primes all cancel (each appears an even
+/// number of times) into a single full-relation column. The cancelled large primes
+/// contribute (count/2) copies to the reconstructed square root.
+fn combine_cycle(rels: &[Relation], n: &Natural<16>) -> Column {
+    let mut root = Natural::ONE;
+    let mut sign = false;
+    let mut powers: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut lp: BTreeMap<u64, u32> = BTreeMap::new();
+    for r in rels {
+        root = root.mul_mod(&r.root, n);
+        sign ^= r.sign;
+        for &(i, e) in &r.powers {
+            *powers.entry(i).or_default() += e as u32;
+        }
+        let (ps, k) = r.large.primes();
+        for &p in &ps[..k] {
+            *lp.entry(p).or_default() += 1;
+        }
+    }
+    let mut extra_sqrt = Vec::new();
+    for (p, c) in lp {
+        for _ in 0..c / 2 {
+            extra_sqrt.push(p);
+        }
     }
     Column {
-        root: a.root.mul_mod(&b.root, n),
-        sign: a.sign ^ b.sign,
-        powers: map.into_iter().collect(),
-        extra_sqrt: lp,
+        root,
+        sign,
+        powers: powers.into_iter().collect(),
+        extra_sqrt,
+    }
+}
+
+/// Classify a factored-out cofactor (>1, fits in `u64`) as a single or double
+/// large prime, or reject it. Portable (no threads / native-only deps).
+fn classify_cofactor(q: u64, single_limit: u64, double_enabled: bool) -> Option<LargePrime> {
+    if is_prime64(q) {
+        return (q <= single_limit).then_some(LargePrime::One(q));
+    }
+    if !double_enabled {
+        return None;
+    }
+    let d = pollard_u64(q)?;
+    let e = q / d;
+    if d > 1
+        && e > 1
+        && d <= single_limit
+        && e <= single_limit
+        && is_prime64(d)
+        && is_prime64(e)
+    {
+        Some(LargePrime::Two(d.min(e), d.max(e)))
+    } else {
+        None
+    }
+}
+
+/// Pollard's rho (Floyd) for a small composite `u64`; returns a nontrivial factor.
+fn pollard_u64(n: u64) -> Option<u64> {
+    if n.is_multiple_of(2) {
+        return Some(2);
+    }
+    let gcd = |mut a: u64, mut b: u64| {
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        a
+    };
+    let mut c = 1u64;
+    while c < 64 {
+        let f = |v: u64| ((v as u128 * v as u128 + c as u128) % n as u128) as u64;
+        let (mut x, mut y, mut d) = (2u64, 2u64, 1u64);
+        while d == 1 {
+            x = f(x);
+            y = f(f(y));
+            d = gcd(x.abs_diff(y), n);
+        }
+        if d != n {
+            return Some(d);
+        }
+        c += 1;
+    }
+    None
+}
+
+/// A spanning forest over large-prime vertices. Each relation is an edge between
+/// its large primes (single-large-prime relations use the reserved unit vertex
+/// `1`). A relation that closes a cycle combines every relation on the cycle into
+/// a full-relation column, since all large primes on a cycle cancel.
+#[derive(Default)]
+struct Forest {
+    id_of: HashMap<u64, u32>,
+    parent: Vec<u32>,
+    edge: Vec<Option<Relation>>,
+}
+impl Forest {
+    fn vertex(&mut self, prime: u64) -> u32 {
+        if let Some(&id) = self.id_of.get(&prime) {
+            return id;
+        }
+        let id = self.parent.len() as u32;
+        self.id_of.insert(prime, id);
+        self.parent.push(id);
+        self.edge.push(None);
+        id
+    }
+    fn root(&self, mut v: u32) -> u32 {
+        while self.parent[v as usize] != v {
+            v = self.parent[v as usize];
+        }
+        v
+    }
+    fn path(&self, mut v: u32, out: &mut Vec<Relation>) {
+        while self.parent[v as usize] != v {
+            out.push(self.edge[v as usize].clone().unwrap());
+            v = self.parent[v as usize];
+        }
+    }
+    /// Re-root the tree containing `v` so that `v` becomes its root.
+    fn reroot(&mut self, v: u32) {
+        let mut chain = vec![v];
+        let mut edges: Vec<Relation> = Vec::new();
+        let mut c = v;
+        while self.parent[c as usize] != c {
+            edges.push(self.edge[c as usize].clone().unwrap());
+            c = self.parent[c as usize];
+            chain.push(c);
+        }
+        self.parent[v as usize] = v;
+        self.edge[v as usize] = None;
+        for (i, e) in edges.into_iter().enumerate() {
+            self.parent[chain[i + 1] as usize] = chain[i];
+            self.edge[chain[i + 1] as usize] = Some(e);
+        }
+    }
+    fn link(&mut self, a: u32, b: u32, rel: Relation) {
+        self.reroot(b);
+        self.parent[b as usize] = a;
+        self.edge[b as usize] = Some(rel);
+    }
+}
+
+/// Deterministically accumulates relations into matrix columns, matching partial
+/// relations through the large-prime graph.
+struct RelationCollector {
+    forest: Forest,
+    columns: Vec<Column>,
+}
+impl RelationCollector {
+    fn new() -> Self {
+        Self {
+            forest: Forest::default(),
+            columns: Vec::new(),
+        }
+    }
+    fn ingest(&mut self, rel: Relation, n: &Natural<16>) {
+        match rel.large {
+            LargePrime::None => self.columns.push(to_column(rel)),
+            LargePrime::One(p) => self.edge(p, 1, rel, n),
+            LargePrime::Two(a, b) if a == b => self.columns.push(combine_cycle(&[rel], n)),
+            LargePrime::Two(a, b) => self.edge(a, b, rel, n),
+        }
+    }
+    fn edge(&mut self, pa: u64, pb: u64, rel: Relation, n: &Natural<16>) {
+        let va = self.forest.vertex(pa);
+        let vb = self.forest.vertex(pb);
+        if self.forest.root(va) == self.forest.root(vb) {
+            let mut cyc = vec![rel];
+            self.forest.path(va, &mut cyc);
+            self.forest.path(vb, &mut cyc);
+            self.columns.push(combine_cycle(&cyc, n));
+        } else {
+            self.forest.link(va, vb, rel);
+        }
     }
 }
 fn inv_u32(a: u32, p: u32) -> Option<u32> {
