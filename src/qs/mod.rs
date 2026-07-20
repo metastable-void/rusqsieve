@@ -292,6 +292,33 @@ pub mod parameters {
             _ => 131072,
         }
     }
+
+    /// Tuned SIQS engine parameters per input bit-length. These were selected by
+    /// benchmarking balanced semiprimes against `flintqs`. `lp_allowance` is the
+    /// large-prime cofactor budget (bits) used to derive the sieve threshold
+    /// `2 * (log2|g(x)| - lp_allowance)`.
+    #[derive(Clone, Copy, Debug)]
+    pub struct EngineParams {
+        pub factor_base_bound: u32,
+        pub sieve_half_width: u32,
+        pub lp_allowance: usize,
+    }
+    pub fn engine_params(bits: usize) -> EngineParams {
+        let (factor_base_bound, sieve_half_width, lp_allowance) = match bits {
+            0..=100 => (3_000, 32_768, 16),
+            101..=128 => (6_000, 32_768, 18),
+            129..=160 => (20_000, 65_536, 22),
+            161..=192 => (28_000, 65_536, 22),
+            193..=224 => (60_000, 131_072, 26),
+            225..=248 => (150_000, 131_072, 30),
+            _ => (300_000, 131_072, 34),
+        };
+        EngineParams {
+            factor_base_bound,
+            sieve_half_width,
+            lp_allowance,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

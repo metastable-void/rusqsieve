@@ -50,6 +50,7 @@ struct Context {
     interval: i32,
     target_a_bits: usize,
     large_limit: u64,
+    lp_allowance: usize,
 }
 
 #[derive(Clone)]
@@ -74,6 +75,16 @@ struct FamilyResult {
     relations: Vec<Relation>,
 }
 
+/// Per-worker reusable buffers (SPEC §21.1 — reuse sieve/candidate scratch).
+#[derive(Default)]
+struct EngineScratch {
+    scores: Vec<u16>,
+    /// `a^{-1} mod p` per factor-base prime, precomputed once per polynomial
+    /// family (the self-initialization invariant is shared by all b-variants).
+    /// `u32::MAX` marks primes dividing `a` (handled by the linear fallback).
+    ainv: Vec<u32>,
+}
+
 /// Immutable portable SIQS worker context.
 #[derive(Clone)]
 pub struct EngineContext(Arc<Context>);
@@ -94,39 +105,28 @@ pub struct EngineJobResult {
 
 /// Prepare an immutable context without creating threads.
 pub fn prepare(n: Natural<16>) -> Result<EngineContext, EngineError> {
-    let bits = n.bit_len();
-    let bound = match bits {
-        0..=128 => 4_000,
-        129..=180 => 20_000,
-        181..=220 => 60_000,
-        221..=270 => 140_000,
-        271..=330 => 300_000,
-        _ => 600_000,
-    };
-    let interval = match bits {
-        0..=180 => 32_768,
-        181..=230 => 65_536,
-        _ => 131_072,
-    };
+    let p = crate::qs::parameters::engine_params(n.bit_len());
     let qcfg = QsConfig {
-        factor_base_bound: AutoOr::Value(bound),
+        factor_base_bound: AutoOr::Value(p.factor_base_bound),
         ..QsConfig::default()
     };
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
-    let target_a = n.floor_sqrt().div_rem_u64(interval as u64).unwrap().0;
+    let target_a = n.floor_sqrt().div_rem_u64(p.sieve_half_width as u64).unwrap().0;
     Ok(EngineContext(Arc::new(Context {
         n,
         base,
-        interval,
+        interval: p.sieve_half_width as i32,
         target_a_bits: target_a.bit_len(),
-        large_limit: (bound as u64).saturating_mul(bound as u64),
+        large_limit: (p.factor_base_bound as u64).saturating_mul(p.factor_base_bound as u64),
+        lp_allowance: p.lp_allowance,
     })))
 }
 
 /// Execute a job using only the caller's thread and owned scratch memory.
 pub fn execute(context: &EngineContext, job: EngineJob) -> EngineJobResult {
-    let inner = sieve_family(&context.0, job.family);
+    let mut scratch = EngineScratch::default();
+    let inner = sieve_family(&context.0, job.family, &mut scratch);
     EngineJobResult {
         family: inner.family,
         polynomials: inner.polynomials,
@@ -282,7 +282,10 @@ pub fn factor(
     }
     let primality = PrimalityConfig::default();
     let mut factors = Vec::new();
-    for p in small_primes(10_000) {
+    for &p in crate::smallfactor::small_primes() {
+        if p > 10_000 {
+            break;
+        }
         loop {
             let (q, r) = n.div_rem_u64(p as u64).unwrap();
             if r != 0 {
@@ -318,18 +321,17 @@ fn factor_node(
     if n.is_one() {
         return Ok(());
     }
-    if is_probable_prime(&n, pc) {
-        out.push(n);
+    // Native machine-word fast path: everything up to 64 bits is factored with
+    // deterministic Miller-Rabin + Pollard-Brent in `u64`/`u128`, bypassing
+    // fixed-capacity big-integer arithmetic entirely.
+    if let Some(v) = n.to_u64() {
+        let mut small = Vec::new();
+        crate::smallfactor::factor_u64(v, &mut small);
+        out.extend(small.into_iter().map(Natural::from_u64));
         return Ok(());
     }
-    if n.bit_len() < 120 {
-        let factors = crate::factor::factor_complete(n, &crate::FactorConfig::default())
-            .map_err(|error| EngineError::Setup(error.to_string()))?;
-        for (prime, exponent) in factors.iter() {
-            for _ in 0..exponent.get() {
-                out.push(prime.clone());
-            }
-        }
+    if is_probable_prime(&n, pc) {
+        out.push(n);
         return Ok(());
     }
     if let Some((root, k)) = n.perfect_power() {
@@ -355,6 +357,15 @@ fn find_factor(
     threads: usize,
     progress: &mut impl FnMut(EngineProgress),
 ) -> Result<Natural<16>, EngineError> {
+    // Small inputs finish faster than 96 OS threads take to spawn and join, so
+    // cap worker count by problem size to avoid parallel-startup overhead.
+    let threads = match n.bit_len() {
+        0..=128 => threads.min(2),
+        129..=160 => threads.min(16),
+        161..=184 => threads.min(48),
+        _ => threads,
+    }
+    .max(1);
     progress(EngineProgress {
         phase: EnginePhase::BuildingFactorBase,
         polynomials: 0,
@@ -362,20 +373,9 @@ fn find_factor(
         target: 0,
         workers: threads,
     });
-    let bits = n.bit_len();
-    let bound = match bits {
-        0..=128 => 4_000,
-        129..=180 => 20_000,
-        181..=220 => 60_000,
-        221..=270 => 140_000,
-        271..=330 => 300_000,
-        _ => 600_000,
-    };
-    let interval = match bits {
-        0..=180 => 32_768,
-        181..=230 => 65_536,
-        _ => 131_072,
-    };
+    let p = crate::qs::parameters::engine_params(n.bit_len());
+    let bound = p.factor_base_bound;
+    let interval = p.sieve_half_width as i32;
     let qcfg = QsConfig {
         factor_base_bound: AutoOr::Value(bound),
         ..QsConfig::default()
@@ -390,6 +390,7 @@ fn find_factor(
         interval,
         target_a_bits: target_a.bit_len(),
         large_limit: (bound as u64).saturating_mul(bound as u64),
+        lp_allowance: p.lp_allowance,
     });
     let (job_tx, job_rx) = mpsc::channel::<Option<u64>>();
     let job_rx = Arc::new(Mutex::new(job_rx));
@@ -400,11 +401,12 @@ fn find_factor(
         let tx = res_tx.clone();
         let c = ctx.clone();
         handles.push(std::thread::spawn(move || {
+            let mut scratch = EngineScratch::default();
             loop {
                 let job = rx.lock().unwrap().recv();
                 match job {
                     Ok(Some(f)) => {
-                        if tx.send(sieve_family(&c, f)).is_err() {
+                        if tx.send(sieve_family(&c, f, &mut scratch)).is_err() {
                             break;
                         }
                     }
@@ -547,7 +549,7 @@ fn find_factor(
     Err(EngineError::NoFactor)
 }
 
-fn sieve_family(ctx: &Context, family: u64) -> FamilyResult {
+fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> FamilyResult {
     let Some((a, aidx)) = choose_a(ctx, family) else {
         return FamilyResult {
             family,
@@ -555,13 +557,32 @@ fn sieve_family(ctx: &Context, family: u64) -> FamilyResult {
             relations: Vec::new(),
         };
     };
+    // Self-initialization: `a^{-1} mod p` is invariant across every b-variant of
+    // this family, so compute it once here instead of once per polynomial.
+    scratch.ainv.clear();
+    scratch.ainv.reserve(ctx.base.len());
+    for e in ctx.base.iter() {
+        let p = e.prime;
+        let ap = if p == 2 { 0 } else { a.mod_u64(p as u64) as u32 };
+        scratch
+            .ainv
+            .push(if ap == 0 { u32::MAX } else { inv_u32(ap, p).unwrap_or(u32::MAX) });
+    }
     let variants = 1u64 << aidx.len().saturating_sub(1).min(6);
     let mut relations = Vec::new();
     for variant in 0..variants {
         let Some(b) = crt_root(ctx, &a, &aidx, variant) else {
             continue;
         };
-        sieve_polynomial(ctx, &a, &b, &aidx, family, variant, &mut relations)
+        sieve_polynomial(
+            ctx,
+            &a,
+            &b,
+            &aidx,
+            &scratch.ainv,
+            &mut scratch.scores,
+            &mut relations,
+        )
     }
     FamilyResult {
         family,
@@ -620,12 +641,13 @@ fn sieve_polynomial(
     a: &Natural<16>,
     b: &Natural<16>,
     aidx: &[u32],
-    _family: u64,
-    _variant: u64,
+    ainv: &[u32],
+    scores: &mut Vec<u16>,
     out: &mut Vec<Relation>,
 ) {
     let len = (ctx.interval as usize) * 2;
-    let mut scores = vec![0u16; len];
+    scores.clear();
+    scores.resize(len, 0);
     let bb = b.checked_mul(b).unwrap();
     let (c, csign) = if bb >= ctx.n {
         (bb.wrapping_sub(&ctx.n).div_rem(a).unwrap().0, false)
@@ -637,11 +659,10 @@ fn sieve_polynomial(
         if p == 2 {
             continue;
         }
-        let ap = a.mod_u64(p as u64) as u32;
         let bp = b.mod_u64(p as u64) as u32;
         let mut roots = [0u32; 2];
-        let count = if ap != 0 {
-            let Some(inv) = inv_u32(ap, p) else { continue };
+        let inv = ainv[index];
+        let count = if inv != u32::MAX {
             roots[0] = mulmod_u32((e.sqrt_n + p - bp) % p, inv, p);
             roots[1] = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, inv, p);
             if roots[0] == roots[1] { 1 } else { 2 }
@@ -663,9 +684,9 @@ fn sieve_polynomial(
                 scores[pos] = scores[pos].saturating_add(weight)
             }
         }
-        let _ = index;
     }
-    let threshold = ((ctx.n.bit_len().saturating_sub(a.bit_len() + 55)) * 2).clamp(80, 230) as u16;
+    let g_bits = ctx.n.bit_len().saturating_sub(a.bit_len());
+    let threshold = (g_bits.saturating_sub(ctx.lp_allowance) * 2).clamp(20, 400) as u16;
     for (pos, &score) in scores.iter().enumerate() {
         if score < threshold {
             continue;
@@ -695,6 +716,9 @@ fn sieve_polynomial(
         }
         let mut powers: Vec<(u32, u16)> = aidx.iter().copied().map(|i| (i, 1)).collect();
         for (i, e) in ctx.base.iter().enumerate() {
+            if q.is_one() {
+                break;
+            }
             let mut count = 0;
             loop {
                 let (d, r) = q.div_rem_u64(e.prime as u64).unwrap();
@@ -776,16 +800,6 @@ fn xorshift(mut x: u64) -> u64 {
     x ^= x >> 7;
     x ^= x << 17;
     x
-}
-#[cfg(any(unix, windows))]
-fn small_primes(limit: u32) -> Vec<u32> {
-    let mut ps = Vec::new();
-    for n in 2..=limit {
-        if n == 2 || n % 2 == 1 && ps.iter().take_while(|&&p| p <= n / p).all(|&p| n % p != 0) {
-            ps.push(n)
-        }
-    }
-    ps
 }
 fn is_prime64(n: u64) -> bool {
     if n < 2 {
