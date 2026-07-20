@@ -82,7 +82,7 @@ export function trialDivide(n, out, limit = 100000n) {
 
 // Bounded Pollard-Brent. Returns a nontrivial factor of the composite `n`, or null
 // if the iteration budget was exhausted (hand the number to the sieve instead).
-export function pollardBrent(n, budget = 1 << 22) {
+export function pollardBrent(n, budget = 1 << 20) {
   if (n % 2n === 0n) return 2n;
   let steps = 0;
   for (let c = 1n; c < 32n; c++) {

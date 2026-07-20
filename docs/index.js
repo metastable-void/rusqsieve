@@ -124,12 +124,25 @@ async function factorize(N, report) {
       for (let i = 0; i < pp.k; i++) stack.push(pp.base);
       continue;
     }
-    report({ phase: "pollard", n: c });
-    await tick();
-    const d = pollardBrent(c);
-    if (d && d > 1n && d < c) {
-      stack.push(d, c / d);
-      continue;
+    // Pollard's rho is only worthwhile where it can actually finish: it is the
+    // primary tool below the sieve's viable range (~80 bits), and a quick cheap
+    // peel above it (to catch a small factor trial division missed). It cannot
+    // split a balanced large semiprime — that is the sieve's job.
+    const bits = c.toString(2).length;
+    if (bits <= 84) {
+      report({ phase: "pollard", n: c });
+      await tick();
+      const d = pollardBrent(c, 1 << 21);
+      if (d && d > 1n && d < c) {
+        stack.push(d, c / d);
+        continue;
+      }
+    } else {
+      const d = pollardBrent(c, 1 << 15);
+      if (d && d > 1n && d < c) {
+        stack.push(d, c / d);
+        continue;
+      }
     }
     const factor = await siqsParallel(c.toString(), report);
     stack.push(factor, c / factor);
