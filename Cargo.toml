@@ -16,6 +16,7 @@ arch-optimized = []
 wasm-simd128 = []
 reference-qs = []
 
+
 [[bin]]
 name = "qs-factor"
 path = "src/bin/qs-factor.rs"

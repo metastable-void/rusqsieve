@@ -14,6 +14,8 @@ mod factors;
 mod primality;
 mod work;
 
+pub mod engine;
+
 #[cfg(any(unix, windows))]
 mod native;
 
@@ -37,6 +39,10 @@ pub use native::{factor, factor_with, factor_with_progress};
 
 /// Stable low-level interfaces for custom native or WebAssembly schedulers.
 pub mod low_level {
+    pub use crate::engine::{
+        EngineContext, EngineJob, EngineJobResult, EngineSession, execute as execute_engine_job,
+        prepare as prepare_engine,
+    };
     pub use crate::f2::{BlockLanczos, DependencySet, MatrixOperation, SparseBinaryMatrix};
     pub use crate::qs::{
         FactorBase, RawRelation, SieveContext, SieveScratch, prepare_siqs, sieve_job,
