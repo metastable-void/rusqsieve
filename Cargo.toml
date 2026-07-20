@@ -1,0 +1,33 @@
+[package]
+name = "rusqsieve"
+version = "0.1.0"
+edition = "2024"
+description = "Portable fixed-capacity integer factorization with scheduler-independent quadratic-sieve kernels"
+license = "Apache-2.0 OR MPL-2.0"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["cli"]
+cli = []
+relation-checks = []
+arch-optimized = []
+wasm-simd128 = []
+reference-qs = []
+
+[[bin]]
+name = "qs-factor"
+path = "src/bin/qs-factor.rs"
+required-features = ["cli"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
