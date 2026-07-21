@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Portable fixed-capacity integer factorization with scheduler-independent quadratic-sieve kernels"
 license = "Apache-2.0 OR MPL-2.0"
+author = "metastable-void"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
