@@ -313,6 +313,23 @@ impl<const P: usize> Natural<P> {
         }
         Some((qn, rn))
     }
+    /// Remainder modulo a single limb, computed without materializing the quotient. Much cheaper
+    /// than `div_rem_u64().1` in tight trial-division loops, where most divisibility tests fail
+    /// and the quotient would be discarded. Returns `0` for a zero divisor (caller must guard).
+    pub fn rem_u64(&self, divisor: u64) -> u64 {
+        if divisor == 0 {
+            return 0;
+        }
+        let Some(top) = self.parts.iter().rposition(|&x| x != 0) else {
+            return 0;
+        };
+        let d = divisor as u128;
+        let mut r = 0u128;
+        for i in (0..=top).rev() {
+            r = ((r << 64) | self.parts[i] as u128) % d;
+        }
+        r as u64
+    }
     pub fn div_rem_u64(&self, divisor: u64) -> Option<(Self, u64)> {
         if divisor == 0 {
             return None;

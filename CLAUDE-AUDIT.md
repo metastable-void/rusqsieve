@@ -289,3 +289,108 @@ Combined #1+#3 vs. the pre-session baseline:
     ideally behind a build option so workstation builds keep the flat single-pass sieve.
   - Aside: the real residual cache pressure *here* is resieve's `cand_at` at 256-bit (1 MB u32 =
     whole L2); a narrower survivor map is a lower-risk local follow-up.
+
+## Single-core sieve-yield optimization (2026-07-21, session 2)
+
+Goal: match flintqs single-core (it does 224-bit in ~20-31s, 256-bit in ~200s single-threaded;
+our HEAD baseline was 306s @224 and **3841.7s @256** single-core). Profiling (`RUSQSIEVE_PROFILE=1`)
+showed the cost is **entirely sieve yield**: at 224-bit, 461k polynomials for 3091 relations, LA
+negligible (0.14s), parallel scaling already good (7.3x @8, 24.5x @32). Survivor instrumentation
+showed **~99% of sieve survivors are false positives** (160k survivors → 1.6k relations at 192-bit).
+
+Landed (all verified, 24 tests pass, wasm builds both feature settings):
+- **Knuth-Schroeppel multiplier** (`knuth_schroeppel`, ported from FLINT). Sieves `k·n` (factor base,
+  roots, `Q(x)`) while extracting with `n` via `gcd(x−y, n)` (`Context.sieve_n` vs `n`). Primes
+  dividing `k` are added as ramified factor-base entries (`FactorBaseBuilder.multiplier`) instead of
+  reported as `FoundFactor`. **~1.9x at 224-bit.**
+- **Factor base retune.** Profiling-guided: the 161-192 tier's bound was ~2x too small
+  (28k→60k, nfb 1550→3007) → **2x at 192-bit**. 224 (60k) and 256 (150k) tiers were already near
+  their optimum *for this engine*. 129-160 bumped 20k→40k.
+- **Threshold margin** (`THRESH_MARGIN=4`) cuts false-positive survivors for a few extra polynomials.
+- **`rem_u64`** (remainder without quotient allocation) for trial-division tests (neutral here but
+  removes an allocation per test).
+
+Before → after (balanced semiprimes, verified):
+
+| bits | cores | HEAD | tuned | speedup |
+|------|-------|------|-------|---------|
+| 192  | 1     | 31.9 s  | 13.4 s  | 2.4x |
+| 224  | 1     | ~306 s  | 175.6 s | 1.7x |
+| 224  | 8     | 49.6 s  | 23.4 s  | 2.1x |
+| 256  | 1     | 3841.7 s | (measuring) | — |
+| 256  | 8     | —       | 231.0 s | — |
+| 256  | 32    | ~94 s   | 68.8 s  | 1.4x |
+
+vs flintqs single-core: we went from ~10-11x slower to ~5x slower — closed about half the gap.
+
+**Why we are still ~5x off flintqs, and the path to parity:** our per-polynomial cost scales with
+factor-base size — both the sieve score-write scan AND trial division are O(nfb). So bigger factor
+bases (where the smooth yield is) make each polynomial proportionally more expensive, and the
+optimum stalls at nfb≈3000. flintqs affords nfb 10k-25k precisely because it has (a) **bucket
+sieving** (frontier #2 — amortizes the scan, and now clearly justified: at flint-scale intervals the
+array exceeds L2) and (b) **resieving** (frontier #1 — trial-divides only primes that hit). Those two
+unlock large factor bases, which is the remaining multiplier. This is the concrete next step for
+flint parity; it is a substantial structured change (and #2 helps the mobile/wasm targets regardless).
+
+Tuning harness left in place (all no-ops when unset): `RUSQSIEVE_PROFILE=1` (phase/counter timings),
+`RUSQSIEVE_FB_BOUND`, `RUSQSIEVE_HALFW`, `RUSQSIEVE_THRESH_ADJ` (native only) for continued
+per-size tuning without rebuilds.
+
+## Roadmap to beat flintqs single-core (next steps)
+
+Status: single-core ~5x slower than flintqs (192: 13.4s vs 2.8s; 224: 176s vs ~31s). Multi-core
+scaling is already good (77% eff @32) and LA is negligible at current sizes — so **the whole
+problem is single-core sieve yield**, and the whole yield problem is one thing:
+
+**Core lever — afford a large factor base.** Smooth yield rises with nfb; flintqs runs nfb 10k-25k,
+we stall at nfb≈3000. We can't grow nfb because **both** hot costs are O(nfb): the sieve score-write
+scan and the per-survivor trial division. Kill those two dependencies on nfb, then grow the FB.
+Everything below serves that. flintqs references in `/home/dev/flint/src/qsieve/`.
+
+### Phase 1 — Resieving: make trial division O(#hits), not O(nfb)  [frontier #1]
+- We have a size-gated resieve (wins only at nfb≥7000) but `cand_at` is a u32-per-position array
+  (4× the score array → cache-heavy; that's why it loses at small nfb).
+- Do: shrink the survivor map (1-bit "is-survivor" bitmap + compact per-survivor bucket lists, or
+  u16 index with an overflow guard) so resieve wins at all sizes; then make it unconditional.
+- Ref: `collect_relations.c`, `large_prime_variant.c`. Target: trial-div cost independent of nfb.
+- Verify: RUSQSIEVE_PROFILE survivor/relation counts unchanged; determinism test; per-size timing.
+
+### Phase 2 — Bucket sieving: make the scan cache-efficient at large intervals  [frontier #2]
+- NOT the naive per-block re-stride (measured +13-41% regression — it fragments tight loops).
+- Do a PROPER bucket sieve: one pass appends `(block-local-offset, log)` into per-block buckets
+  (sequential writes, tight loops preserved), then drain each cache-resident block. Large primes
+  bucketed; small primes (stride < block) sieved directly per block.
+- Ref: `collect_relations.c`. Pays off once the interval array exceeds L2 (which large FBs want),
+  and helps the mobile/consumer/WASM targets (small L2) regardless.
+
+### Phase 3 — Grow the factor base + interval toward flint's table, then re-tune
+- With Phases 1-2, big FBs are cheap. Move `engine_params` toward flint's `qsieve_tune`
+  (qsieve.h): ~nfb 10k @224, ~25k @256, with proportionally larger intervals.
+- Blocked on Phase 4 (LA) — dense Gauss explodes at nfb=25k.
+
+### Phase 4 — Real sparse Block Lanczos  [frontier #6]
+- `f2::BlockLanczos` is a dense-Gauss stub, O(nfb³). At nfb=25k that's ~2.4e11 word-ops (minutes,
+  serial) → becomes the bottleneck the moment the FB is large. Negligible today ONLY because nfb≈3k.
+- Implement true Block Lanczos, O(nfb²·avg-weight); its matrix-vector products also parallelize,
+  helping multi-core. Ref: `block_lanczos.c` (957 lines).
+
+### Phase 5 — Systematic per-size auto-tuning
+- Extend the env harness (RUSQSIEVE_FB_BOUND/HALFW/THRESH_ADJ + PROFILE) into a sweeper that, per
+  bit-size and over several semiprimes, optimizes (fb_primes, sieve_size, small_primes, threshold,
+  ks_primes) — flint's speed is largely its auto-generated `qsieve_tune` table. Bake results into
+  `engine_params`. This converts "correct techniques" into "actually fast" and removes the
+  single-sample overfitting risk in the current hand-tuned values.
+
+### Phase 6 — Secondary levers (measure before/after each)
+- **Better `a` selection** (`choose_a`): pick `a` closer to `sqrt(2·kn)/M` and well-spread so `Q(x)`
+  is minimized → higher smooth density per polynomial. Ours is near-random. Ref: `compute_poly_data.c`.
+- **Large-prime yield**: confirm our union-find double-large-prime cycles match `large_prime_variant.c`
+  effectiveness (partials → full relations).
+- **Montgomery REDC** for `mul_mod` [frontier #4] — only if profiling shows it hot.
+- **SIMD candidate scan** [frontier #5] — needs a scoped `unsafe` module behind `arch-optimized`.
+
+### Sequencing & expected payoff
+Phase 1 → 2 → (4 ∥ 3) → 5. Phases 1-3 (affording nfb≈10k) should close most of the 5x and target
+single-core parity; combined with existing scaling that means beating flintqs at low core counts,
+not just at tens of cores. Each phase gated on: `cargo test` green (determinism + relation
+invariant), factors verified, and a single-core before/after at 192/224/256 vs flintqs.

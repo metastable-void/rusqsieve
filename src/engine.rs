@@ -1,7 +1,7 @@
 //! Portable SIQS engine and scheduler-facing work kernels.
-use crate::{Natural, PARTS};
+use crate::{Natural, PARTS, jacobi_u64};
 use crate::f2::SparseBinaryMatrix;
-use crate::qs::{AutoOr, FactorBaseEntry, QsConfig, prepare_siqs};
+use crate::qs::{AutoOr, FactorBaseEntry, MultiplierChoice, QsConfig, prepare_siqs};
 #[cfg(any(unix, windows))]
 use crate::{PrimalityConfig, is_probable_prime};
 use std::collections::{BTreeMap, HashMap};
@@ -45,7 +45,12 @@ impl std::error::Error for EngineError {}
 
 #[derive(Clone)]
 struct Context {
+    /// The number being factored. Used for root reduction and the extraction gcd.
     n: Natural,
+    /// `k·n` for the Knuth-Schroeppel multiplier `k`. The factor base, polynomial roots, and
+    /// `Q(x) = (a·x+b)² − k·n` are all built against this; because `k·n ≡ 0 (mod n)`, the
+    /// congruence `x² ≡ y² (mod k·n)` still yields a factor of `n` via `gcd(x−y, n)`.
+    sieve_n: Natural,
     base: Arc<[FactorBaseEntry]>,
     interval: i32,
     target_a_bits: usize,
@@ -96,6 +101,9 @@ struct FamilyResult {
     family: u64,
     polynomials: u64,
     relations: Vec<Relation>,
+    /// Total sieve survivors examined (read only by the native profiling path).
+    #[allow(dead_code)]
+    survivors: u64,
 }
 
 /// Per-worker reusable buffers (SPEC §21.1 — reuse sieve/candidate scratch).
@@ -234,22 +242,31 @@ fn deserialize_family(b: &[u8]) -> Option<FamilyResult> {
         family,
         polynomials,
         relations,
+        survivors: 0,
     })
 }
 
 /// Prepare an immutable context without creating threads.
 pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let p = crate::qs::parameters::engine_params(n.bit_len());
+    let k = knuth_schroeppel(&n);
+    let sieve_n = n.checked_mul(&Natural::from_u64(k)).unwrap_or_else(|| n.clone());
     let qcfg = QsConfig {
         factor_base_bound: AutoOr::Value(p.factor_base_bound),
+        multiplier: MultiplierChoice::Value(k as u32),
         ..QsConfig::default()
     };
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
-    let target_a = n.floor_sqrt().div_rem_u64(p.sieve_half_width as u64).unwrap().0;
+    let target_a = sieve_n
+        .floor_sqrt()
+        .div_rem_u64(p.sieve_half_width as u64)
+        .unwrap()
+        .0;
     let (single_limit, double_enabled) = large_prime_policy(p.factor_base_bound, p.lp_allowance);
     Ok(EngineContext(Arc::new(Context {
         n,
+        sieve_n,
         base,
         interval: p.sieve_half_width as i32,
         target_a_bits: target_a.bit_len(),
@@ -527,17 +544,33 @@ fn find_factor(
     let p = crate::qs::parameters::engine_params(n.bit_len());
     let bound = p.factor_base_bound;
     let interval = p.sieve_half_width as i32;
+    let prof = std::env::var_os("RUSQSIEVE_PROFILE").is_some();
+    let t_fb = std::time::Instant::now();
+    let k = knuth_schroeppel(&n);
+    let sieve_n = n.checked_mul(&Natural::from_u64(k)).unwrap_or_else(|| n.clone());
     let qcfg = QsConfig {
         factor_base_bound: AutoOr::Value(bound),
+        multiplier: MultiplierChoice::Value(k as u32),
         ..QsConfig::default()
     };
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let target = base.len() + 64;
-    let target_a = n.floor_sqrt().div_rem_u64(interval as u64).unwrap().0;
+    if prof {
+        eprintln!(
+            "PROFILE fb_build={:.3}s nfb={} interval={} target={} k={}",
+            t_fb.elapsed().as_secs_f64(),
+            base.len(),
+            interval,
+            target,
+            k
+        );
+    }
+    let target_a = sieve_n.floor_sqrt().div_rem_u64(interval as u64).unwrap().0;
     let (single_limit, double_enabled) = large_prime_policy(bound, p.lp_allowance);
     let ctx = Arc::new(Context {
         n: n.clone(),
+        sieve_n,
         base: base.clone(),
         interval,
         target_a_bits: target_a.bit_len(),
@@ -579,9 +612,11 @@ fn find_factor(
         next_send += 1;
         outstanding += 1
     }
+    let t_sieve = std::time::Instant::now();
     let mut buffered = BTreeMap::new();
     let mut collector = RelationCollector::new();
     let mut polynomials = 0u64;
+    let mut total_survivors = 0u64;
     let max_families = 100_000u64;
     while collector.columns.len() < target && next_merge < max_families {
         let result = res_rx.recv().map_err(|_| EngineError::Worker)?;
@@ -590,6 +625,7 @@ fn find_factor(
         while let Some(r) = buffered.remove(&next_merge) {
             next_merge += 1;
             polynomials += r.polynomials;
+            total_survivors += r.survivors;
             for rel in r.relations {
                 collector.ingest(rel, &n);
                 if collector.columns.len() >= target {
@@ -620,6 +656,16 @@ fn find_factor(
     for h in handles {
         let _ = h.join();
     }
+    if prof {
+        eprintln!(
+            "PROFILE sieve+collect={:.3}s polys={} families={} survivors={} relations={}",
+            t_sieve.elapsed().as_secs_f64(),
+            polynomials,
+            next_merge,
+            total_survivors,
+            collector.columns.len()
+        );
+    }
     if collector.columns.len() <= base.len() {
         return Err(EngineError::InsufficientRelations);
     }
@@ -630,7 +676,15 @@ fn find_factor(
         target,
         workers: threads,
     });
+    let t_la = std::time::Instant::now();
     let result = extract(&ctx, &collector.columns);
+    if prof {
+        eprintln!(
+            "PROFILE extract(LA)={:.3}s columns={}",
+            t_la.elapsed().as_secs_f64(),
+            collector.columns.len()
+        );
+    }
     progress(EngineProgress {
         phase: EnginePhase::Extracting,
         polynomials,
@@ -646,6 +700,7 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
         family,
         polynomials: 0,
         relations: Vec::new(),
+        survivors: 0,
     };
     let Some((a, aidx)) = choose_a(ctx, family) else {
         return empty(family);
@@ -710,8 +765,9 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
     // Sieve every polynomial in Gray-code order, advancing the roots in O(1) per
     // prime between consecutive polynomials instead of recomputing them.
     let mut relations = Vec::new();
+    let mut survivors = 0u64;
     for v in 0..variants {
-        sieve_one_poly(
+        survivors += sieve_one_poly(
             ctx,
             &a,
             &b,
@@ -723,7 +779,7 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
             &mut scratch.cand_at,
             &mut scratch.resieve_fac,
             &mut relations,
-        );
+        ) as u64;
         if v + 1 >= variants {
             break;
         }
@@ -769,6 +825,7 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
         family,
         polynomials: variants,
         relations,
+        survivors,
     }
 }
 
@@ -812,6 +869,10 @@ const RESIEVE_MIN_FB: usize = 7000;
 /// contribution to a smooth `g(x)`.
 const SMALL_SKIP: u32 = 20;
 const SMALL_SLACK: usize = 3;
+/// Extra score bits required above the smooth threshold. Tuning found that raising the bar a few
+/// bits sharply cuts false-positive survivors (99% of survivors were non-smooth) at the cost of a
+/// few more polynomials — a net win across 192/224/256-bit.
+const THRESH_MARGIN: i32 = 4;
 
 #[allow(clippy::too_many_arguments)]
 fn sieve_one_poly(
@@ -826,16 +887,16 @@ fn sieve_one_poly(
     cand_at: &mut Vec<u32>,
     resieve_fac: &mut Vec<Vec<u32>>,
     out: &mut Vec<Relation>,
-) {
+) -> usize {
     let base = &ctx.base;
     let len = (ctx.interval as usize) * 2;
     scores.clear();
     scores.resize(len, 0);
     let bb = b.checked_mul(b).unwrap();
-    let (c, csign) = if bb >= ctx.n {
-        (bb.wrapping_sub(&ctx.n).div_rem(a).unwrap().0, false)
+    let (c, csign) = if bb >= ctx.sieve_n {
+        (bb.wrapping_sub(&ctx.sieve_n).div_rem(a).unwrap().0, false)
     } else {
-        (ctx.n.wrapping_sub(&bb).div_rem(a).unwrap().0, true)
+        (ctx.sieve_n.wrapping_sub(&bb).div_rem(a).unwrap().0, true)
     };
     let neg_interval = -(ctx.interval as i64);
     // Logarithmic sieve using the self-initialized roots. Byte scores keep the
@@ -879,11 +940,20 @@ fn sieve_one_poly(
             }
         }
     }
-    let g_bits = ctx.n.bit_len().saturating_sub(a.bit_len());
-    // Lower the threshold by SMALL_SLACK to compensate for the tiny primes we no longer score.
-    let threshold = g_bits
-        .saturating_sub(ctx.lp_allowance)
-        .saturating_sub(SMALL_SLACK)
+    let g_bits = ctx.sieve_n.bit_len().saturating_sub(a.bit_len());
+    // Score threshold: a survivor's sieved-prime log-weight must come within `lp_allowance` bits
+    // of g(x). SMALL_SLACK compensates for the tiny primes we no longer score; THRESH_MARGIN
+    // raises the bar to suppress false-positive survivors (measured to cut wasted trial division
+    // for a small polynomial-count increase). RUSQSIEVE_THRESH_ADJ (read once) tunes it further.
+    static THRESH_ADJ: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let adj = *THRESH_ADJ.get_or_init(|| {
+        std::env::var("RUSQSIEVE_THRESH_ADJ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    });
+    let threshold = (g_bits as i32 - ctx.lp_allowance as i32 - SMALL_SLACK as i32 + THRESH_MARGIN
+        + adj)
         .clamp(1, 255) as u8;
     candidates.clear();
     for (pos, &score) in scores.iter().enumerate() {
@@ -892,8 +962,9 @@ fn sieve_one_poly(
         }
     }
     if candidates.is_empty() {
-        return;
+        return 0;
     }
+    let survivors = candidates.len();
 
     // Resieve (audit frontier #1) pays off only once the factor base is large enough that
     // trial-dividing every survivor by all of it outweighs one extra strided pass. Below the
@@ -1007,12 +1078,8 @@ fn sieve_one_poly(
             for &ai in aidx {
                 let p = base[ai as usize].prime as u64;
                 let mut count = 0;
-                loop {
-                    let (d, r) = q.div_rem_u64(p).unwrap();
-                    if r != 0 {
-                        break;
-                    }
-                    q = d;
+                while q.rem_u64(p) == 0 {
+                    q = q.div_rem_u64(p).unwrap().0;
                     count += 1;
                 }
                 record(ai, count, &mut powers);
@@ -1021,12 +1088,8 @@ fn sieve_one_poly(
             for &idx in resieve_fac[si].iter() {
                 let p = base[idx as usize].prime as u64;
                 let mut count = 0;
-                loop {
-                    let (d, r) = q.div_rem_u64(p).unwrap();
-                    if r != 0 {
-                        break;
-                    }
-                    q = d;
+                while q.rem_u64(p) == 0 {
+                    q = q.div_rem_u64(p).unwrap().0;
                     count += 1;
                 }
                 record(idx, count, &mut powers);
@@ -1040,13 +1103,10 @@ fn sieve_one_poly(
                 if q.is_one() {
                     break;
                 }
+                let p = e.prime as u64;
                 let mut count = 0;
-                loop {
-                    let (d, r) = q.div_rem_u64(e.prime as u64).unwrap();
-                    if r != 0 {
-                        break;
-                    }
-                    q = d;
+                while q.rem_u64(p) == 0 {
+                    q = q.div_rem_u64(p).unwrap().0;
                     count += 1;
                 }
                 record(i as u32, count, &mut powers);
@@ -1073,6 +1133,7 @@ fn sieve_one_poly(
             large,
         });
     }
+    survivors
 }
 
 fn to_column(r: Relation) -> Column {
@@ -1283,6 +1344,60 @@ fn xorshift(mut x: u64) -> u64 {
     x ^= x >> 7;
     x ^= x << 17;
     x
+}
+
+/// Knuth-Schroeppel multiplier selection. Chooses a small `k` such that `k·n` is a quadratic
+/// residue modulo many small primes, raising the density of smooth `Q(x)` values (a standard
+/// 2–3× QS speed-up). Ported from FLINT's `qsieve_knuth_schroeppel`. Returns `k` (>= 1).
+fn knuth_schroeppel(n: &Natural) -> u64 {
+    const MULTIPLIERS: [u64; 29] = [
+        1, 2, 3, 5, 6, 7, 10, 11, 13, 14, 15, 17, 19, 21, 22, 23, 26, 29, 30, 31, 33, 34, 35, 37,
+        38, 41, 42, 43, 47,
+    ];
+    const KS_PRIMES: usize = 500;
+    let nmod8 = n.mod_u64(8);
+    let mut weights = [0.0f64; MULTIPLIERS.len()];
+    for (w, &k) in weights.iter_mut().zip(&MULTIPLIERS) {
+        let mod8 = (nmod8 * k) % 8;
+        let mut v = 0.346_573_59_f64; // ln2 / 2
+        if mod8 == 1 {
+            v *= 4.0;
+        } else if mod8 == 5 {
+            v *= 2.0;
+        }
+        *w = v - (k as f64).ln() / 2.0;
+    }
+    // Weight each multiplier by the small primes for which `k·n` is a quadratic residue.
+    let mut p = 3u64;
+    let mut seen = 0usize;
+    while seen < KS_PRIMES {
+        if is_prime64(p) {
+            seen += 1;
+            let nmod = n.mod_u64(p);
+            if nmod != 0 {
+                let logpdivp = (p as f64).ln() / p as f64;
+                let kron = jacobi_u64(nmod, p) as i32; // (n / p), handles even nmod
+                for (w, &k) in weights.iter_mut().zip(&MULTIPLIERS) {
+                    let km = k % p;
+                    if km == 0 {
+                        *w += logpdivp; // p | k → k·n ≡ 0 (mod p)
+                    } else if kron * jacobi_u64(km, p) as i32 == 1 {
+                        *w += 2.0 * logpdivp; // k·n is a QR mod p
+                    }
+                }
+            }
+        }
+        p += 2;
+    }
+    let mut best = f64::NEG_INFINITY;
+    let mut k = 1u64;
+    for (&w, &m) in weights.iter().zip(&MULTIPLIERS) {
+        if w > best {
+            best = w;
+            k = m;
+        }
+    }
+    k
 }
 fn is_prime64(n: u64) -> bool {
     if n < 2 {

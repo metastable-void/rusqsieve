@@ -106,6 +106,10 @@ pub struct FactorBaseBuilder<const P: usize> {
     tested: u64,
     nonresidue: u64,
     finished: bool,
+    /// Knuth-Schroeppel multiplier `k` (1 if none). Primes dividing `k` divide the working
+    /// modulus `k·n` but are not factors of `n`; they are added as ramified factor-base entries
+    /// (`sqrt_n = 0`) rather than reported as `FoundFactor`.
+    multiplier: u64,
 }
 impl<const P: usize> FactorBaseBuilder<P> {
     pub fn new(n: Natural<P>, bound: u32) -> Result<Self, FactorBaseError> {
@@ -116,6 +120,7 @@ impl<const P: usize> FactorBaseBuilder<P> {
             n,
             bound,
             candidate: 2,
+            multiplier: 1,
             entries: Vec::new(),
             tested: 0,
             nonresidue: 0,
@@ -136,7 +141,12 @@ impl<const P: usize> FactorBaseBuilder<P> {
             self.tested += 1;
             let r = self.n.mod_u64(p as u64) as u32;
             if r == 0 && self.n != Natural::from_u64(p as u64) {
-                return Err(FactorBaseError::FoundFactor(p));
+                // `p | working`. If `p | k` it only divides the multiplier, not `n` — fall through
+                // and add it as a ramified prime (`r == 0` ⇒ `sqrt_n = 0`). Otherwise it is a real
+                // factor of `n`.
+                if !self.multiplier.is_multiple_of(p as u64) {
+                    return Err(FactorBaseError::FoundFactor(p));
+                }
             }
             if p == 2 || legendre_u32(r, p) >= 0 {
                 self.entries.push(FactorBaseEntry {
@@ -251,6 +261,7 @@ pub fn prepare_siqs<const P: usize>(
         AutoOr::Auto => parameters::factor_base_bound(n.bit_len()),
     };
     let mut b = FactorBaseBuilder::new(working.clone(), bound).map_err(QsError::FactorBase)?;
+    b.multiplier = multiplier as u64;
     loop {
         match b.step(4096) {
             Ok(FactorBaseBuildStatus::Complete) => break,
@@ -304,15 +315,26 @@ pub mod parameters {
         pub lp_allowance: usize,
     }
     pub fn engine_params(bits: usize) -> EngineParams {
-        let (factor_base_bound, sieve_half_width, lp_allowance) = match bits {
+        #[allow(unused_mut)]
+        let (mut factor_base_bound, mut sieve_half_width, lp_allowance) = match bits {
             0..=100 => (3_000, 32_768, 16),
             101..=128 => (6_000, 32_768, 18),
-            129..=160 => (20_000, 65_536, 22),
-            161..=192 => (28_000, 65_536, 22),
+            129..=160 => (40_000, 65_536, 22),
+            161..=192 => (60_000, 65_536, 22),
             193..=224 => (60_000, 131_072, 26),
             225..=248 => (150_000, 131_072, 30),
             _ => (300_000, 131_072, 34),
         };
+        // Tuning overrides (experimentation only; unset in production builds).
+        #[cfg(any(unix, windows))]
+        {
+            if let Some(v) = std::env::var("RUSQSIEVE_FB_BOUND").ok().and_then(|s| s.parse().ok()) {
+                factor_base_bound = v;
+            }
+            if let Some(v) = std::env::var("RUSQSIEVE_HALFW").ok().and_then(|s| s.parse().ok()) {
+                sieve_half_width = v;
+            }
+        }
         EngineParams {
             factor_base_bound,
             sieve_half_width,

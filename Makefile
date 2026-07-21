@@ -22,7 +22,7 @@ $(WASM): $(shell find src -name '*.rs') Cargo.toml
 $(DOCS)/rusqsieve.wasm: $(WASM)
 	@mkdir -p $(DOCS)
 	@if command -v wasm-opt >/dev/null 2>&1; then \
-	  wasm-opt -Oz -o $@ $< && echo "wasm-opt -Oz -> $@"; \
+	  wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int -o $@ $< && echo "wasm-opt -Oz -> $@"; \
 	else cp $< $@; fi
 
 $(DOCS)/%: $(WEB)/%
