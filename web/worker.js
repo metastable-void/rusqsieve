@@ -18,14 +18,14 @@ self.onmessage = async ({ data }) => {
       const n = putString(ex, data.n);
       context = ex.qs_worker_prepare(n.ptr, n.len);
       ex.qs_dealloc(n.ptr, n.len, 1);
-      self.postMessage({ type: "prepared", ok: context !== 0 });
+      self.postMessage({ type: "prepared", ok: context !== 0, gen: data.gen });
     } else if (data.cmd === "sieve") {
       const handle = ex.qs_worker_sieve(context, data.family, data.count);
       const payload = takePacket(ex, handle); // raw [count][len,bytes]…
-      if (payload) self.postMessage({ type: "relations", payload }, [payload.buffer]);
-      else self.postMessage({ type: "relations", payload: null });
+      if (payload) self.postMessage({ type: "relations", payload, gen: data.gen }, [payload.buffer]);
+      else self.postMessage({ type: "relations", payload: null, gen: data.gen });
     }
   } catch (error) {
-    self.postMessage({ type: "error", error: String(error?.message || error) });
+    self.postMessage({ type: "error", error: String(error?.message || error), gen: data.gen });
   }
 };

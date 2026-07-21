@@ -76,14 +76,24 @@ function siqsParallel(decimal, report) {
 
     for (const w of workers) {
       w.onmessage = ({ data }) => {
-        if (finished || data.gen !== undefined) {
-          /* handled below */
+        // Errors are always surfaced; other messages from an obsolete generation
+        // (a worker's in-flight job for a previous composite) are ignored.
+        if (data.type === "error") {
+          if (!finished) {
+            finished = true;
+            reject(new Error(data.error));
+          }
+          return;
         }
+        if (finished || data.gen !== myGen) return;
         if (data.type === "prepared") {
-          if (!data.ok) return finished || (finished = true, reject(new Error("worker prepare failed")));
+          if (!data.ok) {
+            finished = true;
+            reject(new Error("worker could not build a sieve"));
+            return;
+          }
           dispatch(w);
         } else if (data.type === "relations") {
-          if (finished || data.gen !== myGen) return;
           if (data.payload) {
             const b = putBytes(coord, data.payload);
             relations = coord.qs_coord_submit(session, b.ptr, b.len);
@@ -95,8 +105,6 @@ function siqsParallel(decimal, report) {
             finished = true;
             reject(new Error("relation budget exhausted"));
           } else dispatch(w);
-        } else if (data.type === "error") {
-          if (!finished) (finished = true), reject(new Error(data.error));
         }
       };
       w.postMessage({ cmd: "prepare", n: decimal, gen: myGen });
