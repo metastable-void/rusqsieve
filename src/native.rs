@@ -1,5 +1,5 @@
 use crate::{
-    FactorConfig, FactorError, FactorSession, LocalWorkBudget, Natural, PrimeFactors,
+    FactorConfig, FactorError, FactorSession, LocalWorkBudget, Natural, PARTS, PrimeFactors,
     ProgressAction,
 };
 use std::time::Instant;
@@ -24,12 +24,12 @@ where
     if input.is_zero() {
         return Err(FactorError::ZeroHasNoPrimeFactorization);
     }
-    if P <= 16 {
+    if P <= PARTS {
         let mut bytes = vec![0u8; P * 8];
         let written = input
             .write_le_bytes(&mut bytes)
             .map_err(|_| FactorError::CapacityExceeded)?;
-        let fast_input = Natural::<16>::from_le_bytes(&bytes[..written])
+        let fast_input = Natural::from_le_bytes(&bytes[..written])
             .map_err(|_| FactorError::CapacityExceeded)?;
         let workers = match config.parallelism {
             crate::Parallelism::Auto => std::thread::available_parallelism().map_or(1, usize::from),
@@ -68,7 +68,7 @@ where
         .map_err(|_| FactorError::NoNontrivialFactor)?;
         let mut output = PrimeFactors::new();
         for value in fast {
-            let mut raw = [0u8; 128];
+            let mut raw = [0u8; PARTS * 8];
             let n = value
                 .write_le_bytes(&mut raw)
                 .map_err(|_| FactorError::CapacityExceeded)?;

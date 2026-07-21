@@ -1,5 +1,5 @@
 //! Portable SIQS engine and scheduler-facing work kernels.
-use crate::Natural;
+use crate::{Natural, PARTS};
 use crate::f2::SparseBinaryMatrix;
 use crate::qs::{AutoOr, FactorBaseEntry, QsConfig, prepare_siqs};
 #[cfg(any(unix, windows))]
@@ -45,7 +45,7 @@ impl std::error::Error for EngineError {}
 
 #[derive(Clone)]
 struct Context {
-    n: Natural<16>,
+    n: Natural,
     base: Arc<[FactorBaseEntry]>,
     interval: i32,
     target_a_bits: usize,
@@ -76,7 +76,7 @@ impl LargePrime {
 
 #[derive(Clone)]
 struct Relation {
-    root: Natural<16>,
+    root: Natural,
     sign: bool,
     powers: Vec<(u32, u16)>,
     large: LargePrime,
@@ -84,7 +84,7 @@ struct Relation {
 
 #[derive(Clone)]
 struct Column {
-    root: Natural<16>,
+    root: Natural,
     sign: bool,
     powers: Vec<(u32, u32)>,
     /// Large primes that were squared out when combining partials; each
@@ -137,7 +137,7 @@ impl EngineJobResult {
     /// Serialize this family's relations for transport to a coordinator (e.g. from a
     /// Web Worker back to the main thread). Format is little-endian:
     /// `family:u64, polynomials:u64, count:u32`, then per relation
-    /// `root:16×u64, sign:u8, large:{tag:u8, 0/1/2 × u64}, powers_len:u32, [index:u32, exp:u16]…`.
+    /// `root:PARTS×u64, sign:u8, large:{tag:u8, 0/1/2 × u64}, powers_len:u32, [index:u32, exp:u16]…`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&self.inner.family.to_le_bytes());
@@ -201,7 +201,7 @@ fn deserialize_family(b: &[u8]) -> Option<FamilyResult> {
     let count = c.u32()? as usize;
     let mut relations = Vec::with_capacity(count.min(1 << 20));
     for _ in 0..count {
-        let root = Natural::<16>::from_le_bytes(c.take(128)?).ok()?;
+        let root = Natural::from_le_bytes(c.take(PARTS * 8)?).ok()?;
         let sign = c.u8()? != 0;
         let large = match c.u8()? {
             0 => LargePrime::None,
@@ -231,7 +231,7 @@ fn deserialize_family(b: &[u8]) -> Option<FamilyResult> {
 }
 
 /// Prepare an immutable context without creating threads.
-pub fn prepare(n: Natural<16>) -> Result<EngineContext, EngineError> {
+pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let p = crate::qs::parameters::engine_params(n.bit_len());
     let qcfg = QsConfig {
         factor_base_bound: AutoOr::Value(p.factor_base_bound),
@@ -348,12 +348,12 @@ impl EngineSession {
     pub fn polynomials(&self) -> u64 {
         self.polynomials
     }
-    pub fn extract_factor(&self) -> Result<Natural<16>, EngineError> {
+    pub fn extract_factor(&self) -> Result<Natural, EngineError> {
         extract(&self.context.0, &self.collector.columns)
     }
 }
 
-fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural<16>, EngineError> {
+fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural, EngineError> {
     if columns.len() <= ctx.base.len() {
         return Err(EngineError::InsufficientRelations);
     }
@@ -417,10 +417,10 @@ fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural<16>, EngineError
 
 #[cfg(any(unix, windows))]
 pub fn factor(
-    mut n: Natural<16>,
+    mut n: Natural,
     threads: usize,
     mut progress: impl FnMut(EngineProgress),
-) -> Result<Vec<Natural<16>>, EngineError> {
+) -> Result<Vec<Natural>, EngineError> {
     if n.is_zero() {
         return Err(EngineError::Setup("zero has no prime factorization".into()));
     }
@@ -449,11 +449,11 @@ pub fn factor(
 
 #[cfg(any(unix, windows))]
 fn factor_node(
-    n: Natural<16>,
+    n: Natural,
     threads: usize,
     pc: &PrimalityConfig,
     progress: &mut impl FnMut(EngineProgress),
-    out: &mut Vec<Natural<16>>,
+    out: &mut Vec<Natural>,
 ) -> Result<(), EngineError> {
     progress(EngineProgress {
         phase: EnginePhase::Preprocessing,
@@ -497,10 +497,10 @@ fn factor_node(
 
 #[cfg(any(unix, windows))]
 fn find_factor(
-    n: Natural<16>,
+    n: Natural,
     threads: usize,
     progress: &mut impl FnMut(EngineProgress),
-) -> Result<Natural<16>, EngineError> {
+) -> Result<Natural, EngineError> {
     // Small inputs finish faster than 96 OS threads take to spawn and join, so
     // cap worker count by problem size to avoid parallel-startup overhead.
     let threads = match n.bit_len() {
@@ -650,7 +650,7 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
     let variants = 1u64 << nvar;
 
     // SIQS B-values: b = Σ ±Bⱼ (mod a), with Bⱼ ≡ sqrt(n) (mod qⱼ), 0 (mod other q).
-    let mut bvals: Vec<Natural<16>> = Vec::with_capacity(s);
+    let mut bvals: Vec<Natural> = Vec::with_capacity(s);
     for &i in &aidx {
         let q = base[i as usize].prime;
         let Some((ap, _)) = a.div_rem_u64(q as u64) else {
@@ -668,7 +668,7 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
     }
     // True (unreduced) 2·Bⱼ, each < 2a. Kept unreduced so the O(1) root advance can
     // account for the mod-a wrap uniformly.
-    let two_full: Vec<Natural<16>> = bvals[..nvar].iter().map(|bj| bj.wrapping_add(bj)).collect();
+    let two_full: Vec<Natural> = bvals[..nvar].iter().map(|bj| bj.wrapping_add(bj)).collect();
 
     // Per-prime precompute for the initial polynomial: both roots and, for each
     // varying B-value, the O(1) root advance `2·Bⱼ·a⁻¹ mod p`.
@@ -763,7 +763,7 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
     }
 }
 
-fn choose_a(ctx: &Context, family: u64) -> Option<(Natural<16>, Vec<u32>)> {
+fn choose_a(ctx: &Context, family: u64) -> Option<(Natural, Vec<u32>)> {
     let pool: Vec<usize> = ctx
         .base
         .iter()
@@ -793,8 +793,8 @@ fn choose_a(ctx: &Context, family: u64) -> Option<(Natural<16>, Vec<u32>)> {
 #[allow(clippy::too_many_arguments)]
 fn sieve_one_poly(
     ctx: &Context,
-    a: &Natural<16>,
-    b: &Natural<16>,
+    a: &Natural,
+    b: &Natural,
     aidx: &[u32],
     root1: &[u32],
     root2: &[u32],
@@ -952,7 +952,7 @@ fn to_column(r: Relation) -> Column {
 /// Combine a set of relations whose large primes all cancel (each appears an even
 /// number of times) into a single full-relation column. The cancelled large primes
 /// contribute (count/2) copies to the reconstructed square root.
-fn combine_cycle(rels: &[Relation], n: &Natural<16>) -> Column {
+fn combine_cycle(rels: &[Relation], n: &Natural) -> Column {
     let mut root = Natural::ONE;
     let mut sign = false;
     let mut powers: BTreeMap<u32, u32> = BTreeMap::new();
@@ -1106,7 +1106,7 @@ impl RelationCollector {
             columns: Vec::new(),
         }
     }
-    fn ingest(&mut self, rel: Relation, n: &Natural<16>) {
+    fn ingest(&mut self, rel: Relation, n: &Natural) {
         match rel.large {
             LargePrime::None => self.columns.push(to_column(rel)),
             LargePrime::One(p) => self.edge(p, 1, rel, n),
@@ -1114,7 +1114,7 @@ impl RelationCollector {
             LargePrime::Two(a, b) => self.edge(a, b, rel, n),
         }
     }
-    fn edge(&mut self, pa: u64, pb: u64, rel: Relation, n: &Natural<16>) {
+    fn edge(&mut self, pa: u64, pb: u64, rel: Relation, n: &Natural) {
         let va = self.forest.vertex(pa);
         let vb = self.forest.vertex(pb);
         if self.forest.root(va) == self.forest.root(vb) {
@@ -1206,8 +1206,8 @@ mod tests {
 
     #[test]
     fn portable_jobs_are_deterministic() {
-        let p = Natural::<16>::from_u64(18_446_744_073_709_551_557);
-        let q = Natural::<16>::from_u64(18_446_744_073_709_551_533);
+        let p = Natural::from_u64(18_446_744_073_709_551_557);
+        let q = Natural::from_u64(18_446_744_073_709_551_533);
         let context = prepare(p.checked_mul(&q).unwrap()).unwrap();
         let a = execute(&context, EngineJob { family: 7 });
         let b = execute(&context, EngineJob { family: 7 });
@@ -1219,8 +1219,8 @@ mod tests {
 
     #[test]
     fn collector_accepts_out_of_order_results() {
-        let p = Natural::<16>::from_u64(18_446_744_073_709_551_557);
-        let q = Natural::<16>::from_u64(18_446_744_073_709_551_533);
+        let p = Natural::from_u64(18_446_744_073_709_551_557);
+        let q = Natural::from_u64(18_446_744_073_709_551_533);
         let context = prepare(p.checked_mul(&q).unwrap()).unwrap();
         let mut session = EngineSession::new(context.clone());
         let jobs = session.take_jobs(2);
@@ -1233,8 +1233,8 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn full_parallel_engine_factors_128_bit_semiprime() {
-        let p = Natural::<16>::from_u64(18_446_744_073_709_551_557);
-        let q = Natural::<16>::from_u64(18_446_744_073_709_551_533);
+        let p = Natural::from_u64(18_446_744_073_709_551_557);
+        let q = Natural::from_u64(18_446_744_073_709_551_533);
         let n = p.checked_mul(&q).unwrap();
         let factors = factor(n.clone(), 2, |_| {}).unwrap();
         assert_eq!(factors, [q, p]);

@@ -16,6 +16,15 @@ relation-checks = []
 arch-optimized = []
 wasm-simd128 = []
 reference-qs = []
+# Cap `Natural`'s default capacity (and the SIQS engine width) at 8 limbs (512
+# bits) instead of 16 (1024 bits), halving each value's storage and rejecting
+# inputs above 512 bits. On a scalar (SSE2) build this measures marginally
+# SLOWER for 192-256-bit inputs (the sieve's arithmetic scales with significant
+# limbs, not capacity). But a 512-bit value is exactly two AVX2 registers, so
+# paired with AVX2 (`-C target-cpu=x86-64-v3`) the fixed-width ops vectorize
+# cleanly and this becomes the fastest configuration measured. AVX-512 is worse
+# than AVX2 here — its frequency throttling outweighs the wider registers.
+limit-to-512-bits = []
 
 
 [[bin]]

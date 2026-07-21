@@ -39,7 +39,7 @@ fn run() -> Result<(), String> {
     // Parse with the crate's public type first so CLI capacity and syntax stay
     // consistent with the library API. The SIQS engine has a deliberately
     // smaller practical bound than Natural's storage capacity.
-    let natural = Natural::<16>::from_decimal(input).map_err(|error| error.to_string())?;
+    let natural = Natural::from_decimal(input).map_err(|error| error.to_string())?;
     if natural.is_zero() {
         return Err("zero has no prime factorization".into());
     }
@@ -89,7 +89,7 @@ fn run() -> Result<(), String> {
     // The engine checks its own result. Verify it once more through Natural
     // before exposing machine-readable output, so incomplete results never
     // look like a successful factorization.
-    let mut verified_product = Natural::<16>::ONE;
+    let mut verified_product = Natural::ONE;
     let mut rendered = Vec::with_capacity(factors.len());
     for value in factors {
         let decimal = value.to_string();

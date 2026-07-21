@@ -53,10 +53,21 @@ impl fmt::Display for BufferTooSmall {
 }
 impl std::error::Error for BufferTooSmall {}
 
+/// The default limb capacity of [`Natural`] and the width the SIQS engine runs
+/// at. 16 limbs (1024 bits) by default; 8 limbs (512 bits) when the
+/// `limit-to-512-bits` feature is enabled. The smaller width only shrinks each
+/// value's storage and the cost of the fixed-capacity (`0..P`) operations; it
+/// does not reduce the sieve's dominant arithmetic, which scales with an
+/// operand's significant limbs rather than its capacity.
+#[cfg(not(feature = "limit-to-512-bits"))]
+pub const PARTS: usize = 16;
+#[cfg(feature = "limit-to-512-bits")]
+pub const PARTS: usize = 8;
+
 /// A fixed-capacity unsigned integer with little-endian 64-bit limbs.
 #[repr(transparent)]
 #[derive(Clone, Eq, PartialEq, Hash)]
-pub struct Natural<const PARTS_64: usize = 16> {
+pub struct Natural<const PARTS_64: usize = PARTS> {
     parts: [u64; PARTS_64],
 }
 

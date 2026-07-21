@@ -31,7 +31,7 @@ pub use factor::{
 };
 pub use factors::PrimeFactors;
 pub use natural::{
-    BufferTooSmall, CapacityError, ExtendedGcdResult, Montgomery, MontgomeryError, Natural,
+    BufferTooSmall, CapacityError, ExtendedGcdResult, Montgomery, MontgomeryError, Natural, PARTS,
     ParseNaturalError, WideNatural, jacobi_u64, legendre_u32, tonelli_shanks_u32,
 };
 pub use primality::{PrimalityConfig, WitnessPolicy, is_probable_prime};

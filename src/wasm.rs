@@ -1,12 +1,12 @@
 //! Raw, versioned C ABI for `wasm32-unknown-unknown`.
 use crate::engine::{self, EngineContext, EngineJob, EngineSession};
-use crate::{FactorConfig, FactorSession, LocalWorkBudget, Natural};
+use crate::{FactorConfig, FactorSession, LocalWorkBudget, Natural, PARTS};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
 
 const ABI_VERSION: u32 = 1;
 const MAX_PACKET: usize = 16 * 1024 * 1024;
-type WasmNatural = Natural<16>;
+type WasmNatural = Natural;
 struct Slot<T> {
     generation: u16,
     value: Option<T>,
@@ -69,7 +69,7 @@ impl<T> Registry<T> {
         }
     }
 }
-thread_local! {static SESSIONS:RefCell<Registry<FactorSession<16>>>=const{RefCell::new(Registry::new())};static BUFFERS:RefCell<Registry<Box<[u8]>>>=const{RefCell::new(Registry::new())};
+thread_local! {static SESSIONS:RefCell<Registry<FactorSession<PARTS>>>=const{RefCell::new(Registry::new())};static BUFFERS:RefCell<Registry<Box<[u8]>>>=const{RefCell::new(Registry::new())};
     static COORDS: RefCell<Registry<EngineSession>> = const { RefCell::new(Registry::new()) };
     static WORKERS: RefCell<Registry<EngineContext>> = const { RefCell::new(Registry::new()) };
 }
@@ -356,8 +356,8 @@ pub extern "C" fn qs_coord_submit(session: u32, pointer: u32, length: u32) -> u3
         s.relations() as u32
     })
 }
-/// Run the linear algebra and return a nontrivial factor as a 128-byte little-endian
-/// `Natural<16>` payload, or 0 if extraction failed (needs more relations).
+/// Run the linear algebra and return a nontrivial factor as a `PARTS * 8`-byte
+/// little-endian `Natural` payload, or 0 if extraction failed (needs more relations).
 #[unsafe(no_mangle)]
 pub extern "C" fn qs_coord_extract(session: u32) -> u32 {
     COORDS.with(|r| {
@@ -367,7 +367,7 @@ pub extern "C" fn qs_coord_extract(session: u32) -> u32 {
         };
         match s.extract_factor() {
             Ok(d) => {
-                let mut payload = Vec::with_capacity(128);
+                let mut payload = Vec::with_capacity(PARTS * 8);
                 for limb in d.as_parts() {
                     payload.extend_from_slice(&limb.to_le_bytes());
                 }
