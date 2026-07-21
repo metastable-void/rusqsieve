@@ -3,6 +3,7 @@ compile_error!("the qs-factor CLI is unavailable on wasm32 targets");
 
 use rusqsieve::{Natural, engine};
 use std::io::{self, IsTerminal, Read, Write};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ProgressMode {
@@ -24,6 +25,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let started = Instant::now();
     let options = parse_options()?;
     let mut text = String::new();
     io::stdin()
@@ -109,6 +111,10 @@ fn run() -> Result<(), String> {
             }
             return Err(format!("cannot write stdout: {error}"));
         }
+    }
+
+    if show_progress {
+        eprintln!("elapsed: {:.3} s", started.elapsed().as_secs_f64());
     }
     Ok(())
 }
