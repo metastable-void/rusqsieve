@@ -67,16 +67,16 @@ fn run() -> Result<(), String> {
     let factors = engine::factor(natural.clone(), thread_count, |snapshot| {
         if show_progress {
             match snapshot.phase {
-                engine::EnginePhase::Preprocessing => eprint!("\rpreprocessing"),
-                engine::EnginePhase::BuildingFactorBase => eprint!("\rbuilding factor base"),
+                engine::EnginePhase::Preprocessing => eprint!("\npreprocessing"),
+                engine::EnginePhase::BuildingFactorBase => eprint!("\nbuilding factor base"),
                 engine::EnginePhase::Sieving => eprint!(
-                    "\rsieving: {}/~{} relations, {} polynomials, {} workers",
+                    "\nsieving: {}/~{} relations, {} polynomials, {} workers",
                     snapshot.relations, snapshot.target, snapshot.polynomials, snapshot.workers
                 ),
                 engine::EnginePhase::LinearAlgebra => {
-                    eprint!("\rlinear algebra: {} relations", snapshot.relations)
+                    eprint!("\nlinear algebra: {} relations", snapshot.relations)
                 }
-                engine::EnginePhase::Extracting => eprint!("\rextracting factors"),
+                engine::EnginePhase::Extracting => eprint!("\nextracting factors"),
             }
             let _ = io::stderr().flush();
         }
