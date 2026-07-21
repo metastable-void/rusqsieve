@@ -317,7 +317,7 @@ Before → after (balanced semiprimes, verified):
 | 192  | 1     | 31.9 s  | 13.4 s  | 2.4x |
 | 224  | 1     | ~306 s  | 175.6 s | 1.7x |
 | 224  | 8     | 49.6 s  | 23.4 s  | 2.1x |
-| 256  | 1     | 3841.7 s | (measuring) | — |
+| 256  | 1     | 3841.7 s | 1765.9 s | 2.2x |
 | 256  | 8     | —       | 231.0 s | — |
 | 256  | 32    | ~94 s   | 68.8 s  | 1.4x |
 
@@ -355,13 +355,27 @@ Everything below serves that. flintqs references in `/home/dev/flint/src/qsieve/
 - Ref: `collect_relations.c`, `large_prime_variant.c`. Target: trial-div cost independent of nfb.
 - Verify: RUSQSIEVE_PROFILE survivor/relation counts unchanged; determinism test; per-size timing.
 
-### Phase 2 — Bucket sieving: make the scan cache-efficient at large intervals  [frontier #2]
+### Phase 2 — Cache-blocked three-tier sieve: scan cost stops scaling with nfb  [frontier #2]
 - NOT the naive per-block re-stride (measured +13-41% regression — it fragments tight loops).
-- Do a PROPER bucket sieve: one pass appends `(block-local-offset, log)` into per-block buckets
-  (sequential writes, tight loops preserved), then drain each cache-resident block. Large primes
-  bucketed; small primes (stride < block) sieved directly per block.
+- Partition the factor base into THREE tiers (the standard msieve/yafu/flint architecture):
+  - **small** (stride ≪ block, or `p < SMALL_SKIP`): not sieved / handled at factoring time (#3).
+  - **medium** (stride < block): sieved directly within each cache-resident block — hits many
+    times per block, so writes stay in L1 and the tight inner loop is preserved.
+  - **large** (stride ≥ block, hit ≤once per block): PROPER bucket sieve — one pass appends
+    `(block-local-offset, log)` into per-block buckets (sequential writes), then each block is
+    drained locally. No re-striding, tight loops preserved, random writes → sequential.
 - Ref: `collect_relations.c`. Pays off once the interval array exceeds L2 (which large FBs want),
   and helps the mobile/consumer/WASM targets (small L2) regardless.
+
+### Phase 2b — Cheaper root updates (the third O(nfb)-per-poly cost)  [SIMD target]
+- Self-init advances every prime's two roots each polynomial (`sieve_family`, the `root1/root2 +=
+  delta (mod p)` loop over nfb primes) — a per-poly O(nfb) cost alongside scan and trial-division.
+- Scalar win: `delta` is already reduced to `[0,p)`, so `root + delta < 2p` → replace the `% p`
+  with a branchless conditional subtract.
+- SIMD win: this loop (and the `score >= threshold` candidate scan) are the two genuinely
+  vectorizable hot spots — unlike the strided score writes, which do not vectorize. Behind
+  `arch-optimized` with a scoped `unsafe` module + runtime dispatch; per-target (x86 AVX2, wasm
+  simd128).
 
 ### Phase 3 — Grow the factor base + interval toward flint's table, then re-tune
 - With Phases 1-2, big FBs are cheap. Move `engine_params` toward flint's `qsieve_tune`
@@ -384,13 +398,29 @@ Everything below serves that. flintqs references in `/home/dev/flint/src/qsieve/
 ### Phase 6 — Secondary levers (measure before/after each)
 - **Better `a` selection** (`choose_a`): pick `a` closer to `sqrt(2·kn)/M` and well-spread so `Q(x)`
   is minimized → higher smooth density per polynomial. Ours is near-random. Ref: `compute_poly_data.c`.
+- **Polynomial batching**: process a batch of the family's b-variant polynomials together so setup,
+  root state, and candidate handling amortize and stay cache-resident (complements Phases 2/2b).
 - **Large-prime yield**: confirm our union-find double-large-prime cycles match `large_prime_variant.c`
   effectiveness (partials → full relations).
 - **Montgomery REDC** for `mul_mod` [frontier #4] — only if profiling shows it hot.
-- **SIMD candidate scan** [frontier #5] — needs a scoped `unsafe` module behind `arch-optimized`.
+- (SIMD moved to Phase 2b — root updates + candidate scan are the vectorizable spots, not the writes.)
+
+Cross-check: this matches the reference "fixed-width, cache-blocked SIQS with small/medium/bucketed-
+large prime tiers, double-large-prime collection, staged candidate resieving, polynomial batching,
+and SIMD for root updates and candidate scans" — Phases 2/2b/1/6 cover it. What that summary omits
+but we still need for parity at scale: real Block Lanczos (Phase 4, once nfb is large) and the
+per-size auto-tuning (Phase 5) that is the bulk of flint's actual edge.
 
 ### Sequencing & expected payoff
 Phase 1 → 2 → (4 ∥ 3) → 5. Phases 1-3 (affording nfb≈10k) should close most of the 5x and target
 single-core parity; combined with existing scaling that means beating flintqs at low core counts,
 not just at tens of cores. Each phase gated on: `cargo test` green (determinism + relation
 invariant), factors verified, and a single-core before/after at 192/224/256 vs flintqs.
+
+### Cross-platform validation (2026-07-21)
+Regenerated `docs/rusqsieve.wasm` (improved engine) factored a 256-bit semiprime in **225.2s on an
+8-thread iPad Air (M3)** — matching native Xeon 8259CL 8-thread (231s). WASM ≈ native on Apple
+silicon, and the multiplier + tuning carry straight into the browser demo. Implication for the
+roadmap: the wins are **algorithmic** (Phases 1-5) and portable — SIMD (Phase 2b) is a per-target
+add-on, not the main lever. Bucket sieving (Phase 2) helps most on cache-constrained phones/older
+devices; M3's large caches (like the Xeon's 1MB L2) already keep the current 256KB array resident.
