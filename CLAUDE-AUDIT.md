@@ -200,3 +200,92 @@ unchanged (already overhead-bound). rusqsieve now beats flintqs 2.9–4.5× acro
   choices; results canonicalized before matrix construction.
 - No threads in the math core; no unsafe on native (`forbid(unsafe_code)` off wasm); portable
   (musl/wasm) builds preserved; frozen API/ABI names preserved.
+
+## Next frontiers (identified 2026-07-21)
+
+Follow-up analysis (width×ISA benchmark + FLINT stdin re-baseline). Measured on the 96-core
+Xeon 8259CL: at a *fixed* thread count rusqsieve is ~12–13× less efficient **per core** than
+single-threaded flintqs (192-bit 2.78 s / 224-bit 31.27 s flint vs 4.32 s / 49.59 s ours at
+8 threads) — a roughly *constant* factor across sizes, i.e. a slow inner loop, not a bad
+asymptotic. flintqs aborts (SIGABRT) at 256-bit here; rusqsieve factors it in ~92 s (32 thr),
+so we are already more robust at the top end. Frontiers, highest-leverage first:
+
+1. **Resieving — replace full-factor-base trial division.** `engine.rs::sieve_one_poly`
+   (~L898) trial-divides every sieve survivor's `g(x)` by *every* factor-base prime with a
+   full `div_rem_u64` (which also zeroes a fresh quotient `Natural` per call). Replace with a
+   second, root-strided *resieve* pass that records which primes actually hit each survivor
+   position, then divide only by those (~a dozen) primes. Turns O(FB×survivors) heavy bignum
+   divisions into O(FB) light stride-marks + O(#factors) divisions per survivor. Pure algorithm,
+   no unsafe, determinism-preserving. Expected: closes most of the ~12× per-core gap. **[TOP]**
+2. **Bucket sieving for large primes.** (Previously "assessed, deferred" above.) Large-stride
+   primes cause a cache miss per hit in the score-stepping loop. Partition the interval into
+   cache-resident blocks and bucket large-prime hits per block, then drain block-locally.
+   Interacts with (1): the resieve pass benefits from the same bucketing. Est. ~15–25% at ≥224-bit.
+3. **Threshold / parameter tuning + tiny-prime skipping.** Don't sieve the smallest primes
+   (account for them with threshold slack), and tighten the survivor threshold so fewer bogus
+   candidates reach the (post-#1, still non-free) factoring step. Cheap, contained, measurable.
+4. **Montgomery REDC for `mul_mod`.** `Montgomery::{mul,pow}` currently forward to division-based
+   `mul_mod` (widening_mul + Knuth). No REDC exists. Not hot at ≤256-bit (only in
+   cycle-combine/extract), so deferred — real only if `mul_mod` moves onto the hot path.
+5. **SIMD candidate-survivor scan.** The `score >= threshold` scan (~L855) maps cleanly to
+   `vpcmpub`+`vpcompressd`, but it is a minority of runtime and needs `unsafe` intrinsics blocked
+   by `#![forbid(unsafe_code)]` on native. Only worthwhile after 1–3, behind `arch-optimized`
+   with runtime dispatch.
+6. **Parallel linear algebra.** `f2::BlockLanczos` is single-threaded; irrelevant while sieving
+   dominates, becomes the tail past ~256-bit.
+
+Width×ISA aside (measured): `limit-to-512-bits` (`PARTS=8`) alone is ~6–8% *slower* scalar, but
+`PARTS=8 + AVX2` (`-C target-cpu=x86-64-v3`) is the fastest config measured — AVX-512 is worse
+than AVX2 (Cascade Lake downclock). These are ~2% effects, dwarfed by frontier #1.
+
+**Status 2026-07-21:** implementing #1, #2, #3 (this session). #4–#6 recorded for later.
+
+### Frontier results (2026-07-21, this session)
+
+Implemented #1 and #3; measured on the reference host (balanced semiprimes, factors verified,
+same thread counts as the baselines: 8 for 192/224-bit, 32 for 256-bit). All 24 unit tests pass.
+
+- **#1 Resieve — implemented, size-gated (`RESIEVE_MIN_FB = 7000`).** For a large factor base a
+  second root-strided pass records exactly which primes hit each survivor, replacing full trial
+  division. Below the gate the extra pass costs more than it saves, so the original trial
+  division is kept. Root-gating the small-FB path (a `pos ≡ root (mod p)` pre-test) was tried at
+  your suggestion but measured ~2–4% *slower* (the early `q==1` break + `q` shrinking to one limb
+  already make those divisions cheaper than the gate's per-prime modulo), so it was reverted.
+  Effect: −14% at 256-bit; neutral (unchanged path) at ≤224-bit.
+- **#3 Tiny-prime skipping — implemented (`SMALL_SKIP = 20`, `SMALL_SLACK = 3`).** Primes < 20 are
+  no longer added to the byte scores (they are ~32% of the score-write traffic but tiny weight);
+  they are still divided out during factoring, and the threshold is lowered by 3 to compensate.
+  A quick 192-bit sweep found SKIP=20 optimal (SKIP=40/60 lower the threshold too far → more
+  false-positive survivors → net slower). This is the dominant win, and it targets exactly the
+  score-write cost the bucket-sieving note above is about.
+
+Combined #1+#3 vs. the pre-session baseline:
+
+| bits | baseline | #1+#3 | speedup |
+|------|----------|-------|---------|
+| 192  | 4.36 s   | 3.62 s | −17.0% |
+| 224  | 50.44 s  | 41.95 s | −16.8% |
+| 256  | 94.81 s  | 73.86 s | −22.1% |
+
+#2 (bucket sieving) attempted next; #4–#6 still deferred.
+
+- **#2 Blocked/bucket sieving — implemented, measured, reverted (portability optimization,
+  needs on-target validation).** rusqsieve ships to many machines: high-end workstations, consumer
+  PCs, tablets, **smartphones (ARM L2 often 256–512 KB)**, and WASM on all of them. The engine's max
+  score array is **256 KB** (2 × 131072 half-width). On this dev box (Xeon, **1 MB L2/core**) that is
+  L2-resident, so the sieve is not memory-bound here — but on the smaller-L2 consumer/mobile targets
+  the array exceeds L2 and the sieve *is* memory-bound, which is exactly where blocking helps. So #2
+  is a genuine win for those targets, not a dead end.
+  - **Tried:** a blocked sieve applying each prime's hits one 16 KiB (L1-sized) block at a time,
+    carrying per-prime positions across blocks. Correct (identical scores/relations; determinism test
+    passes) but **13% / 41% / 33% slower at 192 / 224 / 256-bit on the Xeon** — fragmenting each
+    prime's long tightly-pipelined strided loop into ~16 short per-block loops destroys inner-loop
+    throughput, and this box has no cache deficit to recover. Reverted.
+  - **Correct form:** a true bucket sieve (one pass appends `(pos, weight)` into per-block buckets,
+    then each block is drained block-locally — no re-striding, so tight loops are preserved). This
+    should be neutral-to-slight-loss on large-L2 parts and a real win where the array exceeds L2. It
+    cannot be validated on this host (which has no cache deficit), so it is deferred pending a
+    benchmark on a representative small-cache target (a phone/tablet/low-end PC, or WASM there),
+    ideally behind a build option so workstation builds keep the flat single-pass sieve.
+  - Aside: the real residual cache pressure *here* is resieve's `cand_at` at 256-bit (1 MB u32 =
+    whole L2); a narrower survivor map is a lower-risk local follow-up.

@@ -113,6 +113,13 @@ struct EngineScratch {
     bainv: Vec<u32>,
     /// Positions surviving the score threshold, reused across polynomials.
     candidates: Vec<u32>,
+    /// Resieve (audit frontier #1): `cand_at[pos]` is the index into `candidates`
+    /// of the survivor at `pos`, or `u32::MAX`. Kept clean between polynomials by
+    /// clearing only survivor slots, so it never needs a full memset.
+    cand_at: Vec<u32>,
+    /// Resieve: per-survivor list of factor-base indices whose sieve stride lands
+    /// on it. Only these primes are trial-divided out of the survivor's `g(x)`.
+    resieve_fac: Vec<Vec<u32>>,
 }
 
 /// Immutable portable SIQS worker context.
@@ -713,6 +720,8 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
             &scratch.root2,
             &mut scratch.scores,
             &mut scratch.candidates,
+            &mut scratch.cand_at,
+            &mut scratch.resieve_fac,
             &mut relations,
         );
         if v + 1 >= variants {
@@ -790,6 +799,20 @@ fn choose_a(ctx: &Context, family: u64) -> Option<(Natural, Vec<u32>)> {
     (idx.len() >= 3).then_some((a, idx))
 }
 
+/// Minimum factor-base size at which resieving (audit frontier #1) beats full trial division.
+/// Below this the extra strided resieve pass costs more than the divisions it removes; above it
+/// the trial-division cost dominates and resieving wins. Measured crossover on the reference host
+/// (192/224/256-bit → nfb 1550/3027/12904): loss at ~3k, win at ~13k.
+const RESIEVE_MIN_FB: usize = 7000;
+
+/// Tiny-prime skipping (audit frontier #3): primes below this are not added to the byte scores.
+/// They account for a large share of the score-write traffic (∑ 2·len/p) but contribute little
+/// log weight, and they are still divided out during factoring, so skipping them only removes
+/// sieve work. The score threshold is lowered by `SMALL_SLACK` to make up for their absent
+/// contribution to a smooth `g(x)`.
+const SMALL_SKIP: u32 = 20;
+const SMALL_SLACK: usize = 3;
+
 #[allow(clippy::too_many_arguments)]
 fn sieve_one_poly(
     ctx: &Context,
@@ -800,6 +823,8 @@ fn sieve_one_poly(
     root2: &[u32],
     scores: &mut Vec<u8>,
     candidates: &mut Vec<u32>,
+    cand_at: &mut Vec<u32>,
+    resieve_fac: &mut Vec<Vec<u32>>,
     out: &mut Vec<Relation>,
 ) {
     let base = &ctx.base;
@@ -814,17 +839,21 @@ fn sieve_one_poly(
     };
     let neg_interval = -(ctx.interval as i64);
     // Logarithmic sieve using the self-initialized roots. Byte scores keep the
-    // whole array resident in cache (SPEC §12.6).
+    // whole array resident in cache (SPEC §12.6). (Frontier #2 blocked/bucket sieving was
+    // implemented and measured here: a naive per-block re-stride regressed 13–41% on this
+    // large-L2 host because it fragments each prime's tight strided loop; see CLAUDE-AUDIT.md.)
     for (idx, e) in base.iter().enumerate() {
         let p = e.prime;
-        if p == 2 {
+        // Skip 2 (special) and tiny primes (frontier #3): both are recovered during factoring.
+        if p == 2 || p < SMALL_SKIP {
             continue;
         }
         let pu = p as usize;
         let weight = (32 - p.leading_zeros()) as u8;
         if root1[idx] != u32::MAX {
             for &root in &[root1[idx], root2[idx]] {
-                let start = (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64) as usize;
+                let start = (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64)
+                    as usize;
                 let mut pos = start;
                 while pos < len {
                     scores[pos] = scores[pos].saturating_add(weight);
@@ -841,7 +870,8 @@ fn sieve_one_poly(
             let cm = c.mod_u64(p as u64) as u32;
             let signed_c = if csign && cm != 0 { p - cm } else { cm };
             let root = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
-            let start = (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64) as usize;
+            let start =
+                (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64) as usize;
             let mut pos = start;
             while pos < len {
                 scores[pos] = scores[pos].saturating_add(weight);
@@ -850,15 +880,72 @@ fn sieve_one_poly(
         }
     }
     let g_bits = ctx.n.bit_len().saturating_sub(a.bit_len());
-    let threshold = g_bits.saturating_sub(ctx.lp_allowance).clamp(1, 255) as u8;
+    // Lower the threshold by SMALL_SLACK to compensate for the tiny primes we no longer score.
+    let threshold = g_bits
+        .saturating_sub(ctx.lp_allowance)
+        .saturating_sub(SMALL_SLACK)
+        .clamp(1, 255) as u8;
     candidates.clear();
     for (pos, &score) in scores.iter().enumerate() {
         if score >= threshold {
             candidates.push(pos as u32);
         }
     }
-    for &posu in candidates.iter() {
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Resieve (audit frontier #1) pays off only once the factor base is large enough that
+    // trial-dividing every survivor by all of it outweighs one extra strided pass. Below the
+    // gate we keep the original full trial division (see `RESIEVE_MIN_FB`).
+    let use_resieve = base.len() >= RESIEVE_MIN_FB;
+    let two_idx = base.iter().position(|e| e.prime == 2).map(|i| i as u32);
+    if use_resieve {
+        // Map position → survivor index (u32::MAX = none). Only survivor slots are ever written,
+        // so `cand_at` stays clean between polynomials without a full memset.
+        if cand_at.len() != len {
+            cand_at.clear();
+            cand_at.resize(len, u32::MAX);
+        }
+        for (si, &posu) in candidates.iter().enumerate() {
+            cand_at[posu as usize] = si as u32;
+        }
+        if resieve_fac.len() < candidates.len() {
+            resieve_fac.resize_with(candidates.len(), Vec::new);
+        }
+        for f in resieve_fac[..candidates.len()].iter_mut() {
+            f.clear();
+        }
+        // Record, per survivor, which normal primes' strides land on it. Because
+        // `p | g(x) ⟺ x ≡ root (mod p)`, this misses no normal prime. Prime 2 and the primes
+        // dividing `a` (root1 == MAX) are divided out directly per survivor below — both are
+        // cheap and sidestep the linear-root edge cases.
+        for (idx, e) in base.iter().enumerate() {
+            let p = e.prime;
+            if p == 2 || root1[idx] == u32::MAX {
+                continue;
+            }
+            let pu = p as usize;
+            for &root in &[root1[idx], root2[idx]] {
+                let start = (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64)
+                    as usize;
+                let mut pos = start;
+                while pos < len {
+                    let si = cand_at[pos];
+                    if si != u32::MAX {
+                        resieve_fac[si as usize].push(idx as u32);
+                    }
+                    pos += pu;
+                }
+            }
+        }
+    }
+
+    for (si, &posu) in candidates.iter().enumerate() {
         let pos = posu as usize;
+        if use_resieve {
+            cand_at[pos] = u32::MAX; // restore the clean state for the next polynomial
+        }
         let x = pos as i64 - ctx.interval as i64;
         let xabs = x.unsigned_abs();
         let ax = a.checked_mul(&Natural::from_u64(xabs)).unwrap();
@@ -896,25 +983,73 @@ fn sieve_one_poly(
             continue;
         }
         let mut powers: Vec<(u32, u16)> = aidx.iter().copied().map(|i| (i, 1)).collect();
-        for (i, e) in ctx.base.iter().enumerate() {
-            if q.is_one() {
-                break;
+        // Merge a divided-out exponent for factor-base index `i` into `powers`.
+        let record = |i: u32, count: u16, powers: &mut Vec<(u32, u16)>| {
+            if count == 0 {
+                return;
             }
-            let mut count = 0;
-            loop {
-                let (d, r) = q.div_rem_u64(e.prime as u64).unwrap();
-                if r != 0 {
+            if let Some(v) = powers.iter_mut().find(|v| v.0 == i) {
+                v.1 += count;
+            } else {
+                powers.push((i, count));
+            }
+        };
+        if use_resieve {
+            // Prime 2 (not sieved): strip via trailing zeros.
+            if let Some(ti) = two_idx {
+                let c2 = q.trailing_zeros();
+                if c2 != 0 {
+                    q >>= c2;
+                    record(ti, c2 as u16, &mut powers);
+                }
+            }
+            // Primes dividing `a` (seeded at exponent 1) — a handful, divide directly.
+            for &ai in aidx {
+                let p = base[ai as usize].prime as u64;
+                let mut count = 0;
+                loop {
+                    let (d, r) = q.div_rem_u64(p).unwrap();
+                    if r != 0 {
+                        break;
+                    }
+                    q = d;
+                    count += 1;
+                }
+                record(ai, count, &mut powers);
+            }
+            // Exactly the normal primes the resieve pass landed on this survivor.
+            for &idx in resieve_fac[si].iter() {
+                let p = base[idx as usize].prime as u64;
+                let mut count = 0;
+                loop {
+                    let (d, r) = q.div_rem_u64(p).unwrap();
+                    if r != 0 {
+                        break;
+                    }
+                    q = d;
+                    count += 1;
+                }
+                record(idx, count, &mut powers);
+            }
+        } else {
+            // Small factor base: full trial division. Root-gating (a cheap `pos ≡ root (mod p)`
+            // pre-test) was measured ~2–4% slower here — the early `q.is_one()` break plus `q`
+            // shrinking to a single limb already make these divisions cheaper than the gate's
+            // per-prime modulo — so we keep the straightforward loop.
+            for (i, e) in base.iter().enumerate() {
+                if q.is_one() {
                     break;
                 }
-                q = d;
-                count += 1
-            }
-            if count != 0 {
-                if let Some(v) = powers.iter_mut().find(|v| v.0 == i as u32) {
-                    v.1 += count
-                } else {
-                    powers.push((i as u32, count))
+                let mut count = 0;
+                loop {
+                    let (d, r) = q.div_rem_u64(e.prime as u64).unwrap();
+                    if r != 0 {
+                        break;
+                    }
+                    q = d;
+                    count += 1;
                 }
+                record(i as u32, count, &mut powers);
             }
         }
         let large = if q.is_one() {
