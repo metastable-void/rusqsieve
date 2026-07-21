@@ -36,6 +36,22 @@
           />
           <button id="go" disabled>Factor</button>
         </div>
+        <p id="input-info" class="input-info"></p>
+        <div class="generator">
+          <label for="rsa-bits">Generate an RSA-style semiprime</label>
+          <div class="gen-row">
+            <input
+              type="range"
+              id="rsa-bits"
+              min="128"
+              max="384"
+              step="32"
+              value="192"
+            />
+            <output id="rsa-bits-label" class="gen-bits">192 bits</output>
+            <button id="rsa-gen" class="gen-btn" type="button">Generate</button>
+          </div>
+        </div>
         <div class="examples">
           Try:
           <button class="ex" data-n="600851475143">600851475143</button>
@@ -70,6 +86,7 @@
       for (const b of document.querySelectorAll(".ex"))
         b.addEventListener("click", () => {
           input.value = b.dataset.n;
+          input.dispatchEvent(new Event("input"));
           input.focus();
         });
     </script>

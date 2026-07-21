@@ -103,6 +103,40 @@ button:disabled {
   opacity: 0.5;
   cursor: default;
 }
+.input-info {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0.5rem 0 0;
+  min-height: 1.2em;
+}
+.generator {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+.gen-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 0.8rem;
+}
+#rsa-bits {
+  flex: 1;
+  min-width: 160px;
+  accent-color: var(--accent);
+}
+.gen-bits {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  color: var(--accent);
+  min-width: 4.5em;
+}
+.gen-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
 .examples {
   margin-top: 0.9rem;
   font-size: 0.85rem;
@@ -163,8 +197,28 @@ button:disabled {
   font-family: var(--mono);
   font-size: clamp(1.1rem, 3.5vw, 1.6rem);
   font-weight: 600;
-  word-break: break-all;
   line-height: 1.4;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.5rem;
+}
+.factors .factor {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.factors .value {
+  word-break: break-all;
+}
+.factors .bits {
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+.factors .sep {
+  color: var(--muted);
+  align-self: center;
 }
 .result .meta {
   color: var(--good);

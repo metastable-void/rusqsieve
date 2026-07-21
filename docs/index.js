@@ -2,7 +2,7 @@
 // hands hard composites to a pool of wasm Web Workers running the quadratic sieve,
 // with the pool sized to navigator.hardwareConcurrency.
 import { instantiate, loadModule, putString, putBytes, takePacket, bytesToBigInt } from "./abi.js";
-import { trialDivide, isPrime, perfectPower, pollardBrent, groupFactors } from "./numtheory.js";
+import { trialDivide, isPrime, perfectPower, pollardBrent, groupFactors, rsaNumber, bitLength } from "./numtheory.js";
 
 const WASM_URL = new URL("./rusqsieve.wasm", import.meta.url);
 const BATCH = 4; // polynomial families dispatched per sieve job
@@ -10,12 +10,16 @@ const MAX_FAMILIES = 2_000_000;
 
 const els = {
   input: document.getElementById("input"),
+  inputInfo: document.getElementById("input-info"),
   go: document.getElementById("go"),
   bar: document.getElementById("bar"),
   status: document.getElementById("status"),
   result: document.getElementById("result"),
   workers: document.getElementById("workers"),
   meter: document.getElementById("meter"),
+  rsaBits: document.getElementById("rsa-bits"),
+  rsaBitsLabel: document.getElementById("rsa-bits-label"),
+  rsaGen: document.getElementById("rsa-gen"),
 };
 
 let coord = null; // coordinator wasm instance (main thread)
@@ -172,9 +176,6 @@ const PHASE_TEXT = {
 const digits = (n) => n.toString().length;
 
 function render(grouped, original, seconds) {
-  const pretty = grouped
-    .map(({ prime, exponent }) => (exponent === 1 ? `${prime}` : `${prime}${sup(exponent)}`))
-    .join(" · ");
   const plain = grouped
     .map(({ prime, exponent }) => (exponent === 1 ? `${prime}` : `${prime}^${exponent}`))
     .join(" * ");
@@ -182,17 +183,56 @@ function render(grouped, original, seconds) {
   for (const { prime, exponent } of grouped) product *= prime ** BigInt(exponent);
   const verified = product === original;
   els.result.innerHTML = "";
+
+  // Each factor is shown with its own bit length beneath it, joined by "·".
   const big = document.createElement("div");
   big.className = "factors";
-  big.textContent = grouped.length ? pretty : "1";
+  if (!grouped.length) {
+    big.textContent = "1";
+  } else {
+    grouped.forEach(({ prime, exponent }, i) => {
+      if (i) {
+        const sep = document.createElement("span");
+        sep.className = "sep";
+        sep.textContent = "·";
+        big.append(sep);
+      }
+      const factor = document.createElement("span");
+      factor.className = "factor";
+      const value = document.createElement("span");
+      value.className = "value";
+      value.textContent = exponent === 1 ? `${prime}` : `${prime}${sup(exponent)}`;
+      const bits = document.createElement("span");
+      bits.className = "bits";
+      bits.textContent = `${bitLength(prime)} bits`;
+      factor.append(value, bits);
+      big.append(factor);
+    });
+  }
+
   const meta = document.createElement("div");
   meta.className = "meta";
-  meta.textContent = `${grouped.length} distinct prime${grouped.length === 1 ? "" : "s"} · ${verified ? "✓ verified" : "✗ VERIFICATION FAILED"} · ${seconds.toFixed(seconds < 10 ? 2 : 1)} s`;
+  meta.textContent =
+    `${grouped.length} distinct prime${grouped.length === 1 ? "" : "s"} · ` +
+    `${bitLength(original)}-bit input · ` +
+    `${verified ? "✓ verified" : "✗ VERIFICATION FAILED"} · ` +
+    `${seconds.toFixed(seconds < 10 ? 2 : 1)} s`;
   const copy = document.createElement("code");
   copy.className = "plain";
   copy.textContent = plain || "1";
   els.result.append(big, meta, copy);
   els.result.classList.toggle("bad", !verified);
+}
+
+// Live "N digits · M bits" readout for whatever is currently in the input box.
+function updateInputInfo() {
+  const text = els.input.value.trim();
+  if (/^\d+$/.test(text) && BigInt(text) > 0n) {
+    const N = BigInt(text);
+    els.inputInfo.textContent = `${text.length} digit${text.length === 1 ? "" : "s"} · ${bitLength(N)} bits`;
+  } else {
+    els.inputInfo.textContent = "";
+  }
 }
 
 async function run() {
@@ -244,6 +284,32 @@ els.go.addEventListener("click", run);
 els.input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !els.go.disabled) run();
 });
+els.input.addEventListener("input", updateInputInfo);
+
+// RSA-style semiprime generator (128–384 bits, in steps of 32).
+els.rsaBits.addEventListener("input", () => {
+  els.rsaBitsLabel.textContent = `${els.rsaBits.value} bits`;
+});
+els.rsaGen.addEventListener("click", () => {
+  const bits = Number(els.rsaBits.value);
+  els.rsaGen.disabled = true;
+  els.rsaGen.textContent = "Generating…";
+  // Yield one frame so the disabled/label state paints before the (synchronous,
+  // but brief) prime search runs.
+  requestAnimationFrame(() => {
+    try {
+      els.input.value = rsaNumber(bits).toString();
+      updateInputInfo();
+      els.input.focus();
+    } catch (e) {
+      els.status.textContent = "Generator error: " + (e?.message || e);
+    } finally {
+      els.rsaGen.disabled = false;
+      els.rsaGen.textContent = "Generate";
+    }
+  });
+});
+
 els.go.disabled = true;
 els.status.textContent = "Loading WebAssembly…";
 boot().catch((e) => {

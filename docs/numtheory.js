@@ -123,6 +123,52 @@ export function pollardBrent(n, budget = 1 << 20) {
   return null;
 }
 
+// Bit length of a positive BigInt.
+export const bitLength = (n) => (n <= 0n ? 0 : n.toString(2).length);
+
+// Cryptographically-random odd BigInt of exactly `bits` bits, with the top two
+// bits forced high so that a product of two such numbers lands in the intended
+// combined bit length (each factor is >= 0.75·2^(bits-1), so the product is
+// >= 2^(2·bits-2) · 0.5625 > 2^(2·bits-2), i.e. exactly 2·bits bits).
+function randomOdd(bits) {
+  const bytes = new Uint8Array((bits + 7) >> 3);
+  crypto.getRandomValues(bytes);
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
+  n &= (1n << BigInt(bits)) - 1n; // trim to `bits` bits
+  n |= (1n << BigInt(bits - 1)) | (1n << BigInt(bits - 2)); // top two bits
+  return n | 1n; // odd
+}
+
+// Small odd primes for a quick composite pre-screen before Miller-Rabin.
+const SMALL_PRIMES = [3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n, 41n, 43n, 47n];
+
+// A random prime of exactly `bits` bits, found by scanning upward from a random
+// odd seed. Primality is the same deterministic-then-strong Miller-Rabin as isPrime.
+export function randomPrime(bits) {
+  for (;;) {
+    let n = randomOdd(bits);
+    for (let tries = 0; tries < 20000; tries++, n += 2n) {
+      if (SMALL_PRIMES.some((p) => n % p === 0n)) continue;
+      if (isPrime(n)) return n;
+    }
+    // Astronomically unlikely to fall through; reseed and try again.
+  }
+}
+
+// An RSA-style modulus of exactly `bits` bits: the product of two distinct random
+// primes of roughly half that size each.
+export function rsaNumber(bits) {
+  const pbits = bits >> 1;
+  const qbits = bits - pbits;
+  let p, q;
+  do {
+    p = randomPrime(pbits);
+    q = randomPrime(qbits);
+  } while (p === q);
+  return p * q;
+}
+
 // [prime, ...] with multiplicity -> sorted [{ prime, exponent }].
 export function groupFactors(primes) {
   primes.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
