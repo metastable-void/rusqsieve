@@ -5,6 +5,12 @@ which is the direct benchmark on this machine. All changes must stay within `SPE
 (SIQS on the main path, true logarithmic sieve, deterministic results across parallelism,
 frozen public / `low_level` / wasm-ABI names, relation/matrix/dependency invariants).
 
+The matching FLINT source checkout is `/home/dev/flint`; use it as the primary implementation
+reference rather than recollection or an online version. This LXD container is effectively
+dedicated bare metal: no other guests share the host. Load-average changes during benchmarking are
+normally caused by Codex, VS Code, Claude Code, or commands from this project, so avoid concurrent
+build/test activity and use interleaved saved-binary A/B runs for timing comparisons.
+
 ## Measured baselines (before optimization)
 
 Balanced semiprimes, `qs-factor --threads 1`, release build:
@@ -602,3 +608,40 @@ counts. The full native suite passes (25 unit tests plus integration/doc tests),
 WASM release build remains green. FLINT factors this same input in 2.83 s wall / 2.73 s user, so the
 single-core gap narrows from about 3.5× on this run to about 2.7×. The larger blocked-interval
 structural work remains the next major lever.
+
+## Session 2026-07-24: FLINT hot-loop parity work
+
+Compared directly against the authoritative checkout at `/home/dev/flint/src/qsieve/` and ported
+four scalar techniques from `collect_relations.c` / `compute_poly_data.c`:
+
+- A paired, two-hit-unrolled root-stride kernel replaces two independent saturating loops. Inputs
+  with `g_bits <= 192` use proven non-overflowing byte addition; wider inputs retain saturation.
+- Scores are biased by `128 - threshold`, allowing the overwhelmingly-empty candidate scan to
+  reject eight bytes with one `u64` high-bit test, with a scalar fallback outside the safe range.
+- SIQS `B` is now a true signed coefficient with the smaller CRT term, not reduced modulo `A`.
+  Gray-code root updates are therefore one conditional modular add/subtract, matching FLINT and
+  eliminating the old per-prime modular-wrap correction.
+- Candidate factoring stops once confirmed factor weights account for the stored sieve score, and
+  skipped small primes use the same Lemire root gate. Retuning moves the 192-bit small-prime cutoff
+  from 20/slack 3 to 100/slack 8, close to FLINT's count-based `small_primes=13` setting.
+
+On the checked-in 192-bit example, single-thread wall time moves from the translated-root result
+of 7.45 s to **5.67 s** (FLINT: 2.83 s), a further 24% and a total 43% reduction from the 9.91 s
+session baseline. On a fresh balanced 224-bit semiprime
+`21523772555907914536866856055060033603780528151558474367883009969243`, rusqsieve completes in
+**45.52 s** versus FLINT **26.76 s**; the pre-session audit baseline for this tier was 98.4 s.
+
+Measured negative results retained as guidance:
+
+- At 192 bits, increasing half-width from 65,536 to 131,072 regresses 7.30 s → 8.12 s; a 32,768
+  half-width only gains ~2%. Larger intervals are not independently beneficial before blocking.
+- Reducing the relation target below raw factor-base size fails extraction at 90%, 95%, and 98% on
+  the 224-bit sample. FLINT's much stronger singleton reduction / relation graph yield cannot be
+  copied by changing one threshold; the experiment was reverted.
+- At 224 bits the existing 250k factor-base bound remains near the local optimum: 200k takes
+  50.76 s and 350k takes 50.61 s versus 45.52 s at 250k.
+- A compact prime/weight structure-of-arrays view regresses 192-bit time by ~4%; reverted.
+
+Per-thread parity is still not achieved, but the gap is now ~2.0× at 192 bits and ~1.7× at 224
+bits, down from 3.8× / 3.4× at the start of the day. The remaining high-leverage difference visible
+in FLINT is its cache-blocked large-interval sieve plus more effective relation filtering.

@@ -725,7 +725,10 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
     let nvar = (s - 1).min(6); // number of sign bits varied per family
     let variants = 1u64 << nvar;
 
-    // SIQS B-values: b = Σ ±Bⱼ (mod a), with Bⱼ ≡ sqrt(n) (mod qⱼ), 0 (mod other q).
+    // SIQS B-values: b = Σ ±Bⱼ, with Bⱼ ≡ ±sqrt(n) (mod qⱼ), 0 (mod other q).
+    // Keep the true signed B instead of reducing it modulo A. This is the standard self-init
+    // representation used by FLINT and makes every Gray-code root update one conditional
+    // add/subtract, without a per-prime correction for modular-A wraps.
     let mut bvals: Vec<Natural> = Vec::with_capacity(s);
     for &i in &aidx {
         let q = base[i as usize].prime;
@@ -735,15 +738,15 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
         let Some(apinv) = inv_u32(ap.mod_u64(q as u64) as u32, q) else {
             return empty(family);
         };
-        let coeff = (base[i as usize].sqrt_n as u64 * apinv as u64) % q as u64;
-        bvals.push(ap.mul_mod(&Natural::from_u64(coeff), &a));
+        let mut coeff = (base[i as usize].sqrt_n as u64 * apinv as u64) % q as u64;
+        coeff = coeff.min(q as u64 - coeff);
+        bvals.push(ap.checked_mul(&Natural::from_u64(coeff)).unwrap());
     }
     let mut b = Natural::ZERO;
     for bj in &bvals {
-        b = b.add_mod(bj, &a);
+        b = b.checked_add(bj).unwrap();
     }
-    // True (unreduced) 2·Bⱼ, each < 2a. Kept unreduced so the O(1) root advance can
-    // account for the mod-a wrap uniformly.
+    let mut bneg = false;
     let two_full: Vec<Natural> = bvals[..nvar].iter().map(|bj| bj.wrapping_add(bj)).collect();
 
     // Per-prime precompute for the initial polynomial: both roots and, for each
@@ -766,7 +769,10 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
         let Some(ainvp) = inv_u32(ap, p) else {
             continue;
         };
-        let bp = b.mod_u64(p as u64) as u32;
+        let mut bp = b.mod_u64(p as u64) as u32;
+        if bneg && bp != 0 {
+            bp = p - bp;
+        }
         let xroot1 = mulmod_u32((e.sqrt_n + p - bp) % p, ainvp, p);
         let xroot2 = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, ainvp, p);
         scratch.root1[idx] = add_mod_u32(xroot1, ctx.interval_mod_p[idx], p);
@@ -787,6 +793,7 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
             ctx,
             &a,
             &b,
+            bneg,
             &aidx,
             &scratch.root1,
             &scratch.root2,
@@ -800,39 +807,27 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
         let j = (v + 1).trailing_zeros() as usize;
         let gray = v ^ (v >> 1);
         let flip_to_one = (gray >> j) & 1 == 0;
-        // Advance b to the next polynomial (kept reduced in [0, a)) and record the
-        // number of a-wraps: because a·a⁻¹ ≡ 1 (mod p), each wrap shifts every
-        // prime's root by the same amount, so `shift` is applied uniformly below.
-        let (add_bainv, shift): (bool, i64) = if flip_to_one {
-            // b_new = (b - 2Bⱼ) mod a; raw = b + 2a - 2Bⱼ ∈ (0, 3a).
-            let mut raw = b.wrapping_add(&a).wrapping_add(&a).wrapping_sub(&two_full[j]);
-            let mut kp = 0i64;
-            while raw >= a {
-                raw = raw.wrapping_sub(&a);
-                kp += 1;
-            }
-            b = raw;
-            (true, -(2 - kp))
+        let add_bainv = if flip_to_one {
+            (b, bneg) = signed_add(&b, bneg, &two_full[j], true);
+            true
         } else {
-            let mut raw = b.wrapping_add(&two_full[j]);
-            let mut k = 0i64;
-            while raw >= a {
-                raw = raw.wrapping_sub(&a);
-                k += 1;
-            }
-            b = raw;
-            (false, k)
+            (b, bneg) = signed_add(&b, bneg, &two_full[j], false);
+            false
         };
         let off = j * nfb;
         for idx in 0..nfb {
             if scratch.root1[idx] == u32::MAX {
                 continue;
             }
-            let p = base[idx].prime as i64;
-            let d = scratch.bainv[off + idx] as i64;
-            let delta = (if add_bainv { d } else { -d } + shift).rem_euclid(p);
-            scratch.root1[idx] = ((scratch.root1[idx] as i64 + delta) % p) as u32;
-            scratch.root2[idx] = ((scratch.root2[idx] as i64 + delta) % p) as u32;
+            let p = base[idx].prime;
+            let d = scratch.bainv[off + idx];
+            if add_bainv {
+                scratch.root1[idx] = add_mod_u32(scratch.root1[idx], d, p);
+                scratch.root2[idx] = add_mod_u32(scratch.root2[idx], d, p);
+            } else {
+                scratch.root1[idx] = sub_mod_u32(scratch.root1[idx], d, p);
+                scratch.root2[idx] = sub_mod_u32(scratch.root2[idx], d, p);
+            }
         }
     }
     FamilyResult {
@@ -840,6 +835,22 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
         polynomials: variants,
         relations,
         survivors,
+    }
+}
+
+fn signed_add(a: &Natural, aneg: bool, b: &Natural, bneg: bool) -> (Natural, bool) {
+    if aneg == bneg {
+        let sum = a.checked_add(b).expect("signed SIQS coefficient overflow");
+        let neg = aneg && !sum.is_zero();
+        (sum, neg)
+    } else if a >= b {
+        let diff = a.wrapping_sub(b);
+        let neg = aneg && !diff.is_zero();
+        (diff, neg)
+    } else {
+        let diff = b.wrapping_sub(a);
+        let neg = bneg && !diff.is_zero();
+        (diff, neg)
     }
 }
 
@@ -878,11 +889,11 @@ fn choose_a(ctx: &Context, family: u64) -> Option<(Natural, Vec<u32>)> {
 /// `RUSQSIEVE_SMALL_SKIP` / `RUSQSIEVE_SMALL_SLACK` override them for tuning.
 fn small_skip() -> u32 {
     static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_default("RUSQSIEVE_SMALL_SKIP", 20) as u32)
+    *V.get_or_init(|| env_default("RUSQSIEVE_SMALL_SKIP", 100) as u32)
 }
 fn small_slack() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_default("RUSQSIEVE_SMALL_SLACK", 3))
+    *V.get_or_init(|| env_default("RUSQSIEVE_SMALL_SLACK", 8))
 }
 /// Extra score bits required above the smooth threshold. Raising the bar a few bits sharply cuts
 /// false-positive survivors (≈99% of survivors are non-smooth) at the cost of a few more
@@ -905,11 +916,161 @@ fn env_default(name: &str, default: usize) -> usize {
     }
 }
 
+/// Add the two root strides for one factor-base prime. Interleaving the roots and unrolling two
+/// hits at a time mirrors FLINT's flat sieve kernel and cuts loop-control overhead in the dominant
+/// score-write pass. For the practical range where `g_bits <= 192`, scores cannot overflow: every
+/// scored prime is at least 23, so the sum of rounded log weights is below
+/// `g_bits * (1 + 1/log2(23))`, with ample room in a byte. Wider inputs retain saturating addition.
+#[inline(always)]
+fn sieve_root_pair<const SATURATING: bool>(
+    scores: &mut [u8],
+    root1: usize,
+    root2: usize,
+    step: usize,
+    weight: u8,
+) {
+    #[inline(always)]
+    fn add<const SATURATING: bool>(slot: &mut u8, weight: u8) {
+        *slot = if SATURATING {
+            slot.saturating_add(weight)
+        } else {
+            slot.wrapping_add(weight)
+        };
+    }
+
+    let len = scores.len();
+    let mut pos1 = root1;
+    let mut pos2 = root2;
+    while pos1 < len
+        && pos2 < len
+        && pos1.saturating_add(step) < len
+        && pos2.saturating_add(step) < len
+    {
+        add::<SATURATING>(&mut scores[pos1], weight);
+        add::<SATURATING>(&mut scores[pos2], weight);
+        pos1 += step;
+        pos2 += step;
+        add::<SATURATING>(&mut scores[pos1], weight);
+        add::<SATURATING>(&mut scores[pos2], weight);
+        pos1 += step;
+        pos2 += step;
+    }
+    while pos1 < len && pos2 < len {
+        add::<SATURATING>(&mut scores[pos1], weight);
+        add::<SATURATING>(&mut scores[pos2], weight);
+        pos1 += step;
+        pos2 += step;
+    }
+    while pos1 < len {
+        add::<SATURATING>(&mut scores[pos1], weight);
+        pos1 += step;
+    }
+    while pos2 < len {
+        add::<SATURATING>(&mut scores[pos2], weight);
+        pos2 += step;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_polynomial<const SATURATING: bool>(
+    ctx: &Context,
+    b: &Natural,
+    bneg: bool,
+    c: &Natural,
+    csign: bool,
+    root1: &[u32],
+    root2: &[u32],
+    scores: &mut [u8],
+    small_skip: u32,
+) {
+    for (idx, e) in ctx.base.iter().enumerate() {
+        let p = e.prime;
+        if p == 2 || p < small_skip {
+            continue;
+        }
+        let pu = p as usize;
+        let weight = (32 - p.leading_zeros()) as u8;
+        if root1[idx] != u32::MAX {
+            sieve_root_pair::<SATURATING>(
+                scores,
+                root1[idx] as usize,
+                root2[idx] as usize,
+                pu,
+                weight,
+            );
+        } else {
+            // p | a: the polynomial is linear (2bx + c) mod p — one root, per poly.
+            let mut bp = b.mod_u64(p as u64) as u32;
+            if bneg && bp != 0 {
+                bp = p - bp;
+            }
+            let denom = (2 * bp as u64 % p as u64) as u32;
+            let Some(inv) = inv_u32(denom, p) else {
+                continue;
+            };
+            let cm = c.mod_u64(p as u64) as u32;
+            let signed_c = if csign && cm != 0 { p - cm } else { cm };
+            let xroot = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
+            let mut pos = add_mod_u32(xroot, ctx.interval_mod_p[idx], p) as usize;
+            while pos < scores.len() {
+                scores[pos] = if SATURATING {
+                    scores[pos].saturating_add(weight)
+                } else {
+                    scores[pos].wrapping_add(weight)
+                };
+                pos += pu;
+            }
+        }
+    }
+}
+
+/// Collect high-scoring positions. When the score array was initialized with `128 - threshold`,
+/// the high bit is the threshold comparison; test eight bytes at once before examining a word's
+/// individual positions. This is the portable form of FLINT's word-at-a-time candidate scan.
+fn collect_candidates(
+    scores: &[u8],
+    threshold: u8,
+    high_bit_biased: bool,
+    candidates: &mut Vec<u32>,
+) {
+    candidates.clear();
+    if !high_bit_biased {
+        for (pos, &score) in scores.iter().enumerate() {
+            if score >= threshold {
+                candidates.push(pos as u32);
+            }
+        }
+        return;
+    }
+
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    let mut chunks = scores.chunks_exact(8);
+    for (word_index, chunk) in chunks.by_ref().enumerate() {
+        let word = u64::from_ne_bytes(chunk.try_into().unwrap());
+        if word & HIGH_BITS == 0 {
+            continue;
+        }
+        let base = word_index * 8;
+        for (offset, &score) in chunk.iter().enumerate() {
+            if score & 0x80 != 0 {
+                candidates.push((base + offset) as u32);
+            }
+        }
+    }
+    let base = scores.len() - chunks.remainder().len();
+    for (offset, &score) in chunks.remainder().iter().enumerate() {
+        if score & 0x80 != 0 {
+            candidates.push((base + offset) as u32);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sieve_one_poly(
     ctx: &Context,
     a: &Natural,
     b: &Natural,
+    bneg: bool,
     aidx: &[u32],
     root1: &[u32],
     root2: &[u32],
@@ -921,58 +1082,17 @@ fn sieve_one_poly(
     let len = (ctx.interval as usize) * 2;
     // Tuning knobs read once per polynomial (cached), never in the per-prime hot loops.
     let small_skip = small_skip();
-    scores.clear();
-    scores.resize(len, 0);
     let bb = b.checked_mul(b).unwrap();
     let (c, csign) = if bb >= ctx.sieve_n {
         (bb.wrapping_sub(&ctx.sieve_n).div_rem(a).unwrap().0, false)
     } else {
         (ctx.sieve_n.wrapping_sub(&bb).div_rem(a).unwrap().0, true)
     };
-    // Logarithmic sieve using the self-initialized roots. Byte scores keep the
-    // whole array resident in cache (SPEC §12.6). (Frontier #2 blocked/bucket sieving was
-    // implemented and measured here: a naive per-block re-stride regressed 13–41% on this
-    // large-L2 host because it fragments each prime's tight strided loop; see CLAUDE-AUDIT.md.)
-    for (idx, e) in base.iter().enumerate() {
-        let p = e.prime;
-        // Skip 2 (special) and tiny primes (frontier #3): both are recovered during factoring.
-        if p == 2 || p < small_skip {
-            continue;
-        }
-        let pu = p as usize;
-        let weight = (32 - p.leading_zeros()) as u8;
-        if root1[idx] != u32::MAX {
-            for &root in &[root1[idx], root2[idx]] {
-                let start = root as usize;
-                let mut pos = start;
-                while pos < len {
-                    scores[pos] = scores[pos].saturating_add(weight);
-                    pos += pu;
-                }
-            }
-        } else {
-            // p | a: the polynomial is linear (2bx + c) mod p — one root, per poly.
-            let bp = b.mod_u64(p as u64) as u32;
-            let denom = (2 * bp as u64 % p as u64) as u32;
-            let Some(inv) = inv_u32(denom, p) else {
-                continue;
-            };
-            let cm = c.mod_u64(p as u64) as u32;
-            let signed_c = if csign && cm != 0 { p - cm } else { cm };
-            let xroot = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
-            let start = add_mod_u32(xroot, ctx.interval_mod_p[idx], p) as usize;
-            let mut pos = start;
-            while pos < len {
-                scores[pos] = scores[pos].saturating_add(weight);
-                pos += pu;
-            }
-        }
-    }
     let g_bits = ctx.sieve_n.bit_len().saturating_sub(a.bit_len());
     // Score threshold: a survivor's sieved-prime log-weight must come within `lp_allowance` bits
     // of g(x). SMALL_SLACK compensates for the tiny primes we no longer score; THRESH_MARGIN
-    // raises the bar to suppress false-positive survivors (measured to cut wasted trial division
-    // for a small polynomial-count increase). RUSQSIEVE_THRESH_ADJ (read once) tunes it further.
+    // raises the bar to suppress false-positive survivors. Bias practical-range score bytes so
+    // the candidate comparison becomes a high-bit test, enabling a word-at-a-time scan.
     static THRESH_ADJ: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     let adj = *THRESH_ADJ.get_or_init(|| {
         std::env::var("RUSQSIEVE_THRESH_ADJ")
@@ -984,12 +1104,20 @@ fn sieve_one_poly(
         + thresh_margin()
         + adj)
         .clamp(1, 255) as u8;
-    candidates.clear();
-    for (pos, &score) in scores.iter().enumerate() {
-        if score >= threshold {
-            candidates.push(pos as u32);
-        }
+    let high_bit_biased = g_bits <= 192 && threshold <= 128;
+    let initial_score = if high_bit_biased { 128 - threshold } else { 0 };
+    scores.clear();
+    scores.resize(len, initial_score);
+    // Logarithmic sieve using the self-initialized roots. Byte scores keep the
+    // whole array resident in cache (SPEC §12.6). (Frontier #2 blocked/bucket sieving was
+    // implemented and measured here: a naive per-block re-stride regressed 13–41% on this
+    // large-L2 host because it fragments each prime's tight strided loop; see CLAUDE-AUDIT.md.)
+    if g_bits <= 192 {
+        score_polynomial::<false>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
+    } else {
+        score_polynomial::<true>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
     }
+    collect_candidates(scores, threshold, high_bit_biased, candidates);
     if candidates.is_empty() {
         return 0;
     }
@@ -1003,39 +1131,29 @@ fn sieve_one_poly(
 
     for &posu in candidates.iter() {
         let pos = posu as usize;
+        // The score is the sum of one rounded log weight per sieve hit. Once confirmed factors
+        // account for that weight, no later normal factor-base prime can divide this candidate.
+        // This is FLINT's `extra_bits < sieve[i]` stopping rule and avoids scanning the tail of the
+        // factor base for partial relations. It is exact on the non-saturating practical-range
+        // kernel; wider saturated scores conservatively disable the shortcut.
+        let score_target = if g_bits <= 192 {
+            scores[pos].wrapping_sub(initial_score) as u16
+        } else {
+            u16::MAX
+        };
+        let mut confirmed_score = 0u16;
         let x = pos as i64 - ctx.interval as i64;
         let xabs = x.unsigned_abs();
         let ax = a.checked_mul(&Natural::from_u64(xabs)).unwrap();
         // t = a·x + b, needed for the relation's square root.
-        let (t, tneg) = if x >= 0 {
-            (ax.checked_add(b).unwrap(), false)
-        } else if ax >= *b {
-            (ax.wrapping_sub(b), true)
-        } else {
-            (b.wrapping_sub(&ax), false)
-        };
+        let (t, tneg) = signed_add(&ax, x < 0, b, bneg);
         // Value to factor: g(x) = Q(x)/a = a·x² + 2b·x + c, computed directly with
         // signs (c_math = ∓c per csign). This avoids the wide t² squaring and the
         // division by a — a is guaranteed to divide Q since b² ≡ n (mod a).
         let ax2 = ax.checked_mul(&Natural::from_u64(xabs)).unwrap();
         let two_bx = b.wrapping_add(b).checked_mul(&Natural::from_u64(xabs)).unwrap();
-        let mut pos_sum = ax2;
-        let mut neg_sum = Natural::ZERO;
-        if x >= 0 {
-            pos_sum = pos_sum.checked_add(&two_bx).unwrap();
-        } else {
-            neg_sum = two_bx;
-        }
-        if csign {
-            neg_sum = neg_sum.checked_add(&c).unwrap();
-        } else {
-            pos_sum = pos_sum.checked_add(&c).unwrap();
-        }
-        let (mut q, sign) = if pos_sum >= neg_sum {
-            (pos_sum.wrapping_sub(&neg_sum), false)
-        } else {
-            (neg_sum.wrapping_sub(&pos_sum), true)
-        };
+        let (gx, gxneg) = signed_add(&ax2, false, &two_bx, bneg ^ (x < 0));
+        let (mut q, sign) = signed_add(&gx, gxneg, &c, csign);
         if q.is_zero() {
             continue;
         }
@@ -1059,11 +1177,20 @@ fn sieve_one_poly(
                 record(ti, c2 as u16, &mut powers);
             }
         }
-        // Tiny primes (3 ≤ p < small_skip): not sieved — divide directly (they divide most survivors).
+        // Small primes are not score-sieved, but still use the same cheap position-root gate as the
+        // main factor base. This follows FLINT: it avoids both their disproportionately dense score
+        // writes and an unconditional big-integer remainder for every survivor.
         for (i, e) in base[..small_end].iter().enumerate() {
             let p = e.prime as u64;
             if p == 2 {
                 continue;
+            }
+            let r1 = root1[i];
+            if r1 != u32::MAX {
+                let posmodp = fastmod(posu, e.prime, ctx.pinv[i]);
+                if posmodp != r1 && posmodp != root2[i] {
+                    continue;
+                }
             }
             let mut count = 0;
             while q.rem_u64(p) == 0 {
@@ -1080,6 +1207,9 @@ fn sieve_one_poly(
                 q = q.div_rem_u64(p).unwrap().0;
                 count += 1;
             }
+            if count != 0 && p >= small_skip as u64 {
+                confirmed_score += (64 - p.leading_zeros()) as u16;
+            }
             record(ai, count, &mut powers);
         }
         // Barrett-gated trial division (FLINT `qsieve_evaluate_candidate` style): a normal prime `p`
@@ -1089,7 +1219,7 @@ fn sieve_one_poly(
         // tests + O(#factors) divides, with no second sieve pass, so it stays cheap at every
         // factor-base size (unlike the old O(nfb) bignum-remainder loop).
         for idx in small_end..base.len() {
-            if q.is_one() {
+            if q.is_one() || confirmed_score >= score_target {
                 break;
             }
             let r1 = root1[idx];
@@ -1107,6 +1237,9 @@ fn sieve_one_poly(
             while q.rem_u64(pu) == 0 {
                 q = q.div_rem_u64(pu).unwrap().0;
                 count += 1;
+            }
+            if count != 0 {
+                confirmed_score += (32 - p.leading_zeros()) as u16;
             }
             record(idx as u32, count, &mut powers);
         }
@@ -1345,6 +1478,10 @@ fn add_mod_u32(a: u32, b: u32, p: u32) -> u32 {
     } else {
         sum as u32
     }
+}
+#[inline]
+fn sub_mod_u32(a: u32, b: u32, p: u32) -> u32 {
+    if a >= b { a - b } else { a + (p - b) }
 }
 /// Lemire fast-mod constant for divisor `p`: `⌊2^64 / p⌋ + 1` (via `u64::MAX / p + 1`, which equals
 /// it for every `p ≥ 2`). Precomputed once per factor-base prime; see [`fastmod`].
