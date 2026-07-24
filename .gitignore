@@ -4,3 +4,9 @@
 /.codex
 .DS_Store
 ._*
+/comb.*
+/flprels.*
+/fnew.*
+/frels.*
+/lpnew.*
+/lprels.*

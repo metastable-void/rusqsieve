@@ -52,6 +52,10 @@ struct Context {
     /// congruence `x² ≡ y² (mod k·n)` still yields a factor of `n` via `gcd(x−y, n)`.
     sieve_n: Natural,
     base: Arc<[FactorBaseEntry]>,
+    /// Lemire fast-mod constant `⌊2^64 / p⌋ + 1` per factor-base prime, precomputed once. Used to
+    /// test `x mod p == root` (a ~3-instruction multiply-shift) in trial division without a
+    /// hardware divide, so the whole factor base can be gated per survivor cheaply.
+    pinv: Arc<[u64]>,
     interval: i32,
     target_a_bits: usize,
     lp_allowance: usize,
@@ -121,13 +125,6 @@ struct EngineScratch {
     bainv: Vec<u32>,
     /// Positions surviving the score threshold, reused across polynomials.
     candidates: Vec<u32>,
-    /// Resieve (audit frontier #1): `cand_at[pos]` is the index into `candidates`
-    /// of the survivor at `pos`, or `u32::MAX`. Kept clean between polynomials by
-    /// clearing only survivor slots, so it never needs a full memset.
-    cand_at: Vec<u32>,
-    /// Resieve: per-survivor list of factor-base indices whose sieve stride lands
-    /// on it. Only these primes are trial-divided out of the survivor's `g(x)`.
-    resieve_fac: Vec<Vec<u32>>,
 }
 
 /// Immutable portable SIQS worker context.
@@ -258,6 +255,7 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     };
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
+    let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
     let target_a = sieve_n
         .floor_sqrt()
         .div_rem_u64(p.sieve_half_width as u64)
@@ -268,6 +266,7 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
         n,
         sieve_n,
         base,
+        pinv,
         interval: p.sieve_half_width as i32,
         target_a_bits: target_a.bit_len(),
         lp_allowance: p.lp_allowance,
@@ -555,6 +554,7 @@ fn find_factor(
     };
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
+    let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
     let target = base.len() + 64;
     if prof {
         eprintln!(
@@ -572,6 +572,7 @@ fn find_factor(
         n: n.clone(),
         sieve_n,
         base: base.clone(),
+        pinv,
         interval,
         target_a_bits: target_a.bit_len(),
         lp_allowance: p.lp_allowance,
@@ -776,8 +777,6 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
             &scratch.root2,
             &mut scratch.scores,
             &mut scratch.candidates,
-            &mut scratch.cand_at,
-            &mut scratch.resieve_fac,
             &mut relations,
         ) as u64;
         if v + 1 >= variants {
@@ -856,23 +855,40 @@ fn choose_a(ctx: &Context, family: u64) -> Option<(Natural, Vec<u32>)> {
     (idx.len() >= 3).then_some((a, idx))
 }
 
-/// Minimum factor-base size at which resieving (audit frontier #1) beats full trial division.
-/// Below this the extra strided resieve pass costs more than the divisions it removes; above it
-/// the trial-division cost dominates and resieving wins. Measured crossover on the reference host
-/// (192/224/256-bit → nfb 1550/3027/12904): loss at ~3k, win at ~13k.
-const RESIEVE_MIN_FB: usize = 7000;
-
-/// Tiny-prime skipping (audit frontier #3): primes below this are not added to the byte scores.
-/// They account for a large share of the score-write traffic (∑ 2·len/p) but contribute little
-/// log weight, and they are still divided out during factoring, so skipping them only removes
-/// sieve work. The score threshold is lowered by `SMALL_SLACK` to make up for their absent
-/// contribution to a smooth `g(x)`.
-const SMALL_SKIP: u32 = 20;
-const SMALL_SLACK: usize = 3;
-/// Extra score bits required above the smooth threshold. Tuning found that raising the bar a few
-/// bits sharply cuts false-positive survivors (99% of survivors were non-smooth) at the cost of a
-/// few more polynomials — a net win across 192/224/256-bit.
-const THRESH_MARGIN: i32 = 4;
+/// Tiny-prime skipping (audit frontier #3): primes below `small_skip()` are not added to the byte
+/// scores. They account for a large share of the score-write traffic (∑ 2·len/p) but contribute
+/// little log weight, and they are still divided out during factoring, so skipping them only removes
+/// sieve work. The score threshold is lowered by `small_slack()` to make up for their absent
+/// contribution to a smooth `g(x)`. Both are read once per polynomial and cached locally.
+/// `RUSQSIEVE_SMALL_SKIP` / `RUSQSIEVE_SMALL_SLACK` override them for tuning.
+fn small_skip() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_default("RUSQSIEVE_SMALL_SKIP", 20) as u32)
+}
+fn small_slack() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_default("RUSQSIEVE_SMALL_SLACK", 3))
+}
+/// Extra score bits required above the smooth threshold. Raising the bar a few bits sharply cuts
+/// false-positive survivors (≈99% of survivors are non-smooth) at the cost of a few more
+/// polynomials. `RUSQSIEVE_THRESH_MARGIN` overrides it for tuning.
+fn thresh_margin() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_default("RUSQSIEVE_THRESH_MARGIN", 4) as i32)
+}
+/// Read an unsigned tuning override, defaulting when unset or non-Unix. Callers cache the result
+/// in a per-knob `OnceLock` so the hot path never touches the environment or a lock.
+fn env_default(name: &str, default: usize) -> usize {
+    #[cfg(any(unix, windows))]
+    {
+        return std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = name;
+        default
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn sieve_one_poly(
@@ -884,12 +900,12 @@ fn sieve_one_poly(
     root2: &[u32],
     scores: &mut Vec<u8>,
     candidates: &mut Vec<u32>,
-    cand_at: &mut Vec<u32>,
-    resieve_fac: &mut Vec<Vec<u32>>,
     out: &mut Vec<Relation>,
 ) -> usize {
     let base = &ctx.base;
     let len = (ctx.interval as usize) * 2;
+    // Tuning knobs read once per polynomial (cached), never in the per-prime hot loops.
+    let small_skip = small_skip();
     scores.clear();
     scores.resize(len, 0);
     let bb = b.checked_mul(b).unwrap();
@@ -906,7 +922,7 @@ fn sieve_one_poly(
     for (idx, e) in base.iter().enumerate() {
         let p = e.prime;
         // Skip 2 (special) and tiny primes (frontier #3): both are recovered during factoring.
-        if p == 2 || p < SMALL_SKIP {
+        if p == 2 || p < small_skip {
             continue;
         }
         let pu = p as usize;
@@ -952,7 +968,8 @@ fn sieve_one_poly(
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
     });
-    let threshold = (g_bits as i32 - ctx.lp_allowance as i32 - SMALL_SLACK as i32 + THRESH_MARGIN
+    let threshold = (g_bits as i32 - ctx.lp_allowance as i32 - small_slack() as i32
+        + thresh_margin()
         + adj)
         .clamp(1, 255) as u8;
     candidates.clear();
@@ -966,57 +983,14 @@ fn sieve_one_poly(
     }
     let survivors = candidates.len();
 
-    // Resieve (audit frontier #1) pays off only once the factor base is large enough that
-    // trial-dividing every survivor by all of it outweighs one extra strided pass. Below the
-    // gate we keep the original full trial division (see `RESIEVE_MIN_FB`).
-    let use_resieve = base.len() >= RESIEVE_MIN_FB;
     let two_idx = base.iter().position(|e| e.prime == 2).map(|i| i as u32);
-    if use_resieve {
-        // Map position → survivor index (u32::MAX = none). Only survivor slots are ever written,
-        // so `cand_at` stays clean between polynomials without a full memset.
-        if cand_at.len() != len {
-            cand_at.clear();
-            cand_at.resize(len, u32::MAX);
-        }
-        for (si, &posu) in candidates.iter().enumerate() {
-            cand_at[posu as usize] = si as u32;
-        }
-        if resieve_fac.len() < candidates.len() {
-            resieve_fac.resize_with(candidates.len(), Vec::new);
-        }
-        for f in resieve_fac[..candidates.len()].iter_mut() {
-            f.clear();
-        }
-        // Record, per survivor, which normal primes' strides land on it. Because
-        // `p | g(x) ⟺ x ≡ root (mod p)`, this misses no normal prime. Prime 2 and the primes
-        // dividing `a` (root1 == MAX) are divided out directly per survivor below — both are
-        // cheap and sidestep the linear-root edge cases.
-        for (idx, e) in base.iter().enumerate() {
-            let p = e.prime;
-            if p == 2 || root1[idx] == u32::MAX {
-                continue;
-            }
-            let pu = p as usize;
-            for &root in &[root1[idx], root2[idx]] {
-                let start = (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64)
-                    as usize;
-                let mut pos = start;
-                while pos < len {
-                    let si = cand_at[pos];
-                    if si != u32::MAX {
-                        resieve_fac[si as usize].push(idx as u32);
-                    }
-                    pos += pu;
-                }
-            }
-        }
-    }
+    // Factor-base entries with `prime < small_skip` occupy the low indices (the base is sorted
+    // ascending). Those tiny primes are not sieved — gating them would waste a `fastmod` where a
+    // direct divide is cheaper (they divide most survivors) — so they are divided out directly.
+    let small_end = base.partition_point(|e| e.prime < small_skip);
 
-    for (si, &posu) in candidates.iter().enumerate() {
+    for &posu in candidates.iter() {
         let pos = posu as usize;
-        if use_resieve {
-            cand_at[pos] = u32::MAX; // restore the clean state for the next polynomial
-        }
         let x = pos as i64 - ctx.interval as i64;
         let xabs = x.unsigned_abs();
         let ax = a.checked_mul(&Natural::from_u64(xabs)).unwrap();
@@ -1065,52 +1039,64 @@ fn sieve_one_poly(
                 powers.push((i, count));
             }
         };
-        if use_resieve {
-            // Prime 2 (not sieved): strip via trailing zeros.
-            if let Some(ti) = two_idx {
-                let c2 = q.trailing_zeros();
-                if c2 != 0 {
-                    q >>= c2;
-                    record(ti, c2 as u16, &mut powers);
-                }
+        // Prime 2 (not sieved): strip via trailing zeros.
+        if let Some(ti) = two_idx {
+            let c2 = q.trailing_zeros();
+            if c2 != 0 {
+                q >>= c2;
+                record(ti, c2 as u16, &mut powers);
             }
-            // Primes dividing `a` (seeded at exponent 1) — a handful, divide directly.
-            for &ai in aidx {
-                let p = base[ai as usize].prime as u64;
-                let mut count = 0;
-                while q.rem_u64(p) == 0 {
-                    q = q.div_rem_u64(p).unwrap().0;
-                    count += 1;
-                }
-                record(ai, count, &mut powers);
+        }
+        // Tiny primes (3 ≤ p < small_skip): not sieved — divide directly (they divide most survivors).
+        for (i, e) in base[..small_end].iter().enumerate() {
+            let p = e.prime as u64;
+            if p == 2 {
+                continue;
             }
-            // Exactly the normal primes the resieve pass landed on this survivor.
-            for &idx in resieve_fac[si].iter() {
-                let p = base[idx as usize].prime as u64;
-                let mut count = 0;
-                while q.rem_u64(p) == 0 {
-                    q = q.div_rem_u64(p).unwrap().0;
-                    count += 1;
-                }
-                record(idx, count, &mut powers);
+            let mut count = 0;
+            while q.rem_u64(p) == 0 {
+                q = q.div_rem_u64(p).unwrap().0;
+                count += 1;
             }
-        } else {
-            // Small factor base: full trial division. Root-gating (a cheap `pos ≡ root (mod p)`
-            // pre-test) was measured ~2–4% slower here — the early `q.is_one()` break plus `q`
-            // shrinking to a single limb already make these divisions cheaper than the gate's
-            // per-prime modulo — so we keep the straightforward loop.
-            for (i, e) in base.iter().enumerate() {
-                if q.is_one() {
-                    break;
-                }
-                let p = e.prime as u64;
-                let mut count = 0;
-                while q.rem_u64(p) == 0 {
-                    q = q.div_rem_u64(p).unwrap().0;
-                    count += 1;
-                }
-                record(i as u32, count, &mut powers);
+            record(i as u32, count, &mut powers);
+        }
+        // Primes dividing `a` (seeded at exponent 1, root1 == MAX so not gated) — divide directly.
+        for &ai in aidx {
+            let p = base[ai as usize].prime as u64;
+            let mut count = 0;
+            while q.rem_u64(p) == 0 {
+                q = q.div_rem_u64(p).unwrap().0;
+                count += 1;
             }
+            record(ai, count, &mut powers);
+        }
+        // Barrett-gated trial division (FLINT `qsieve_evaluate_candidate` style): a normal prime `p`
+        // divides `g(x)` iff `x ≡ root1 or root2 (mod p)`. Compute `x mod p` with a precomputed
+        // multiply-shift (`fastmod`) — no hardware divide — and bignum-divide only on a hit. This
+        // makes trial division O(nfb) cheap tests + O(#factors) divides, with no second sieve pass,
+        // so it stays cheap at every factor-base size (unlike the old O(nfb) bignum-remainder loop).
+        for idx in small_end..base.len() {
+            if q.is_one() {
+                break;
+            }
+            let r1 = root1[idx];
+            if r1 == u32::MAX {
+                continue; // prime divides `a`; handled above
+            }
+            let p = base[idx].prime;
+            let xm = fastmod(xabs as u32, p, ctx.pinv[idx]);
+            debug_assert_eq!(xm, (xabs % p as u64) as u32, "fastmod mismatch p={p}");
+            let xmodp = if x >= 0 || xm == 0 { xm } else { p - xm };
+            if xmodp != r1 && xmodp != root2[idx] {
+                continue;
+            }
+            let pu = p as u64;
+            let mut count = 0;
+            while q.rem_u64(pu) == 0 {
+                q = q.div_rem_u64(pu).unwrap().0;
+                count += 1;
+            }
+            record(idx as u32, count, &mut powers);
         }
         let large = if q.is_one() {
             LargePrime::None
@@ -1338,6 +1324,20 @@ fn inv_u32(a: u32, p: u32) -> Option<u32> {
 }
 fn mulmod_u32(a: u32, b: u32, p: u32) -> u32 {
     (a as u64 * b as u64 % p as u64) as u32
+}
+/// Lemire fast-mod constant for divisor `p`: `⌊2^64 / p⌋ + 1` (via `u64::MAX / p + 1`, which equals
+/// it for every `p ≥ 2`). Precomputed once per factor-base prime; see [`fastmod`].
+#[inline]
+fn lemire_c(p: u32) -> u64 {
+    (u64::MAX / p as u64) + 1
+}
+/// `a mod p` by Daniel Lemire's "faster remainder" (multiply-shift, no hardware divide). Exact for
+/// `a, p < 2^32` with `c == lemire_c(p)`. Used to gate trial division: a factor-base prime `p`
+/// divides `g(x)` at position `x` iff `x mod p` equals one of its two sieve roots.
+#[inline]
+fn fastmod(a: u32, p: u32, c: u64) -> u32 {
+    let lowbits = c.wrapping_mul(a as u64);
+    ((lowbits as u128 * p as u128) >> 64) as u32
 }
 fn xorshift(mut x: u64) -> u64 {
     x ^= x << 13;

@@ -308,6 +308,17 @@ pub mod parameters {
     /// benchmarking balanced semiprimes against `flintqs`. `lp_allowance` is the
     /// large-prime cofactor budget (bits) used to derive the sieve threshold
     /// `2 * (log2|g(x)| - lp_allowance)`.
+    ///
+    /// The 193–224 range grows the factor base far beyond the older 60k bound. With Barrett-gated
+    /// trial division (`engine.rs`, FLINT-style) the per-survivor factoring is cheap at any nfb, so
+    /// these relation-starved bit-lengths benefit from a larger factor base: it raises smooth
+    /// density, needing far fewer polynomials, dropping total sieve work (measured −15% at 208,
+    /// −33% at 192, −45% at 224 vs the pre-optimization baseline). These nfb targets (≈5.7k at 208,
+    /// ≈11k at 224) track FLINT's `qsieve_tune` table. Beyond 224 the optimum is *smaller* (≈7k at
+    /// 240, ≈9k at 256): with many more polynomials, the per-polynomial O(nfb) costs (Gray-code root
+    /// updates and the score-write scan) dominate and cap the affordable factor base. Lifting that
+    /// cap needs the still-unbuilt cache-blocked sieve + larger intervals (fewer, larger polynomials)
+    /// and a sparse Block-Lanczos linear algebra (the dense solve is single-threaded and O(nfb²⁺)).
     #[derive(Clone, Copy, Debug)]
     pub struct EngineParams {
         pub factor_base_bound: u32,
@@ -321,9 +332,10 @@ pub mod parameters {
             101..=128 => (6_000, 32_768, 18),
             129..=160 => (40_000, 65_536, 22),
             161..=192 => (60_000, 65_536, 22),
-            193..=224 => (60_000, 131_072, 26),
+            193..=208 => (120_000, 131_072, 26),
+            209..=224 => (250_000, 131_072, 26),
             225..=248 => (150_000, 131_072, 30),
-            _ => (300_000, 131_072, 34),
+            _ => (200_000, 131_072, 34),
         };
         // Tuning overrides (experimentation only; unset in production builds).
         #[cfg(any(unix, windows))]

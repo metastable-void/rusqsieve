@@ -323,6 +323,19 @@ impl<const P: usize> Natural<P> {
         let Some(top) = self.parts.iter().rposition(|&x| x != 0) else {
             return 0;
         };
+        // Fast path for divisors < 2^32 (every factor-base prime): process 32 bits at a time so the
+        // running remainder stays < 2^32 and each step is a native u64 divide. The u128 `%` below
+        // lowers to a `__umodti3` libcall on x86/ARM/wasm (none have a 128-bit HW divide), which
+        // dominates the trial-division inner loop; this avoids it.
+        if divisor <= u32::MAX as u64 {
+            let mut r = 0u64;
+            for i in (0..=top).rev() {
+                let limb = self.parts[i];
+                r = ((r << 32) | (limb >> 32)) % divisor;
+                r = ((r << 32) | (limb & 0xffff_ffff)) % divisor;
+            }
+            return r;
+        }
         let d = divisor as u128;
         let mut r = 0u128;
         for i in (0..=top).rev() {
@@ -338,6 +351,24 @@ impl<const P: usize> Natural<P> {
         let Some(top) = self.parts.iter().rposition(|&x| x != 0) else {
             return Some((q, 0));
         };
+        // Fast path for divisors < 2^32 (see `rem_u64`): 32-bit-at-a-time division keeps every
+        // step a native u64 divide, avoiding the u128 div/rem `__udivti3`/`__umodti3` libcalls.
+        // Each 64-bit limb yields two 32-bit quotient pieces; both are < 2^32 because the incoming
+        // remainder `r < divisor`, so `(qhi << 32) | qlo` reconstructs the limb exactly.
+        if divisor <= u32::MAX as u64 {
+            let mut r = 0u64;
+            for i in (0..=top).rev() {
+                let limb = self.parts[i];
+                let hi = (r << 32) | (limb >> 32);
+                let qhi = hi / divisor;
+                r = hi - qhi * divisor;
+                let lo = (r << 32) | (limb & 0xffff_ffff);
+                let qlo = lo / divisor;
+                r = lo - qlo * divisor;
+                q.parts[i] = (qhi << 32) | qlo;
+            }
+            return Some((q, r));
+        }
         let d = divisor as u128;
         let mut r = 0u128;
         for i in (0..=top).rev() {

@@ -424,3 +424,152 @@ silicon, and the multiplier + tuning carry straight into the browser demo. Impli
 roadmap: the wins are **algorithmic** (Phases 1-5) and portable — SIMD (Phase 2b) is a per-target
 add-on, not the main lever. Bucket sieving (Phase 2) helps most on cache-constrained phones/older
 devices; M3's large caches (like the Xeon's 1MB L2) already keep the current 256KB array resident.
+
+## Session 2026-07-24: Barrett-gated trial division + arithmetic + factor-base retune
+
+Executed the roadmap. The headline result is a portable, correctness-preserving redesign of the
+per-survivor trial division that supersedes the "resieve" strategy (frontiers #1 / Phase 1) with the
+technique FLINT actually uses. Measured on the reference host (Xeon 8259CL), balanced semiprimes,
+every run factor-verified and determinism-checked, all 24 tests green, both WASM feature settings
+build:
+
+| bits | cores | before (HEAD) | after | speedup |
+|-----:|------:|--------------:|------:|--------:|
+| 192  | 1     | 15.60 s | **10.45 s** | −33 % |
+| 224  | 8     | 27.27 s | **15.03 s** | −45 % |
+| 256  | 32    | 67.81 s | **43.07 s** | −36 % |
+
+(A/B via two saved binaries run interleaved to cancel this shared host's load drift — see the
+measurement note below. vs single-thread flintqs the 192-bit gap narrows from ~5.7× to ~3.8×.)
+
+### What landed
+
+1. **Fast small-divisor big-integer division** (`natural/mod.rs::rem_u64`/`div_rem_u64`). Divisors
+   `< 2^32` (every factor-base prime) are processed **32 bits at a time in `u64`**, so each step is a
+   native machine divide. The previous code did the Horner step in `u128`, which lowers to a
+   `__umodti3`/`__udivti3` **libcall** on x86, ARM, *and* wasm (none have a 128-bit hardware divide).
+   Portable win, larger on ARM/wasm; verified by the existing randomized `num-bigint` differential
+   tests. (~−10 % at 192 on its own.)
+
+2. **Barrett-gated trial division** (`engine.rs`, FLINT `qsieve_evaluate_candidate` style) — the core
+   change. A precomputed per-prime Lemire constant `⌊2^64/p⌋+1` (`Context.pinv`) lets us test
+   `x mod p == root` with a **multiply-shift** (`fastmod`, ~3 instructions, no divide) and bignum-
+   divide `g(x)` **only on a hit**. Trial division becomes `O(nfb)` cheap tests + `O(#factors)` big
+   divides, with **no second sieve pass**. This *replaces* the whole resieve machinery (survivor
+   bitmap, `cand_at`, `resieve_fac`, the `RESIEVE_MIN_FB` gate — all removed): resieve as a stride
+   pass was only ever break-even because it added a pass ≈ the trial division it removed (see
+   2026-07-21 note); Barrett-gating removes the cost without adding a pass. The earlier "root-gating
+   was 2–4 % slower" finding used a plain `%` (hardware `idiv`, ≈ the bignum-rem cost it replaced),
+   *not* a precomputed Barrett inverse — that was the missing ingredient. Debug builds assert
+   `fastmod == a % p`; the gate has no false positives/negatives by construction, so the relation
+   invariant and determinism are preserved.
+
+3. **Factor-base retune** (`qs/mod.rs::engine_params`). With cheap trial division the relation-starved
+   193–224 range profits from a much larger factor base: `193–208 → 120k` (nfb≈5.7k), `209–224 → 250k`
+   (nfb≈11k) — both up from 60k. `249+ → 200k` (down from 300k; Barrett shifted the optimum lower and
+   it also trims the single-threaded LA). nfb targets track FLINT's `qsieve_tune`. Re-verified at
+   192/208/224/240/256 *after* the Barrett change (the earlier resieve-era optima were confirmed to
+   still hold or shift as noted).
+
+### Measured findings that correct the roadmap's framing
+
+- **The 192-bit gap vs flint is inner-loop constant factor, not factor-base size.** flint uses ≈3000
+   fb primes at 190-bit too (its `fb_primes` counts QR-primes ≈ π(bound)/2; nfb 10k–25k is its 220–260
+   regime). At 192 both use ~3000 primes; the 5.7× gap was trial-division (43 %) + score-write (40 %).
+   Barrett-gating erases most of the trial-division half.
+- **"Afford a large factor base" only helps where the input is relation-starved AND per-poly O(nfb)
+   costs don't dominate.** 193–224: big win. 240/256: the optimum FB is *smaller* (nfb≈7k/9k) because
+   they run far more polynomials, and each pays O(nfb) for Gray-code root updates + the score-write
+   scan. That per-poly O(nfb) cost — not trial division — is now the cap.
+- **FLINT's `qsieve_do_sieving2` "block" sieve is carried-position per-block re-striding** — exactly
+   the form this audit measured as 13–41 % *slower* on the 1 MB-L2 Xeon. FLINT does **not** use
+   (pos,prime) append/drain buckets. Cache-blocking is a small-L2 (mobile) win, not a large-L2 one.
+
+### Tested and reverted (kept as negative results)
+
+- **Branchless conditional-subtract root update** (Phase 2b scalar): **+0.6 s at 192 on x86** (the
+   `%p` `idiv` is fine here; masked/branch forms both regressed). Real win needs SIMD — out of scope
+   under `#![forbid(unsafe_code)]` on native. Reverted.
+- **Slice-iterator (`step_by`) score loop**: regressed — LLVM already elides the indexed loop's bounds
+   checks. Reverted.
+- **In-loop section profiling** (temporary `RUSQSIEVE_PROFILE` section timers): the `Instant::now`
+   calls between hot sections inhibited optimization (~1.6 s at 192 even when disabled). Used to find
+   the bottlenecks (score 40 % / factor 43 % at 192), then removed.
+
+### The new bottleneck and the next levers (with data)
+
+After Barrett-gating, **score-write is ≈60 % at 192**, and the per-poly O(nfb) root-update + scan cap
+the factor base at 240/256. Concrete next steps, highest-leverage first:
+
+1. **Larger sieve intervals + a cache-blocked sieve, together.** A bigger interval means fewer, larger
+   polynomials → the per-poly O(nfb) costs amortize → 240/256 could afford a larger FB (lifting the
+   cap above). But a >256 KB score array exceeds mobile L2, so the interval can only grow *paired with*
+   a blocked sieve (FLINT's carried-position `do_sieving2`, or a true bucket sieve) that keeps writes
+   cache-local. This is the portable structural item that most helps the mobile/consumer targets.
+2. **Sparse Block Lanczos** (`f2`, frontier #6). The dense-Gauss LA is single-threaded and grows fast:
+   7.6 s at 256/nfb13k, 26 s at 256/nfb21k. It caps FB growth at the top end and must be replaced
+   before nfb≫15k is worthwhile.
+3. **SIMD root updates + candidate scan** (Phase 2b/#5) — the two vectorizable per-poly O(nfb) loops;
+   behind `arch-optimized` with a scoped `unsafe` module + runtime dispatch, per target.
+
+### Measurement note (shared host)
+
+The dev box is a shared 96-core machine; multi-thread **wall** times swing with other tenants' load
+(turbo/bandwidth), and thread-summed section timings inflate under load. Reliable comparisons here are
+**interleaved A/B of two saved binaries** (head vs new, alternated) — cross-time single-shot numbers
+are not trustworthy. Env knobs for continued tuning (no-ops when unset): `RUSQSIEVE_PROFILE`,
+`RUSQSIEVE_FB_BOUND`, `RUSQSIEVE_HALFW`, `RUSQSIEVE_SMALL_SKIP`, `RUSQSIEVE_SMALL_SLACK`,
+`RUSQSIEVE_THRESH_MARGIN`, `RUSQSIEVE_THRESH_ADJ`.
+
+### Honest status vs. the goal — per-thread parity with FLINT (2026-07-24)
+
+**We are NOT there yet.** Per-thread (single-core) is the yardstick and we are still behind:
+
+| bits | rusqsieve 1-core | flintqs 1-core | ratio |
+|-----:|-----------------:|---------------:|------:|
+| 192  | 10.45 s          | 2.73 s         | ~3.8× slower |
+| 224  | 98.4 s           | 29.0 s         | ~3.4× slower |
+
+(Both measured, factor-verified.) This session closed roughly a third of the per-thread gap (192 was
+~5.7× before). We already *beat* single-thread FLINT at modest core counts (224 in 15 s on 8 threads
+vs FLINT's 29 s) — but that was already true before this work and is **not** the goal.
+**Per-thread parity is not achieved.**
+
+**Why we're still ~3.8× off:** the single biggest single-core cost — the **score-write sieve pass
+(~60 % at 192)** — is essentially untouched. Barrett-gating removed the trial-division half of the
+cost; the sieve-stepping half remains, and the per-poly O(nfb) costs (root updates + candidate scan)
+cap how large a factor base 240/256 can use. Closing the rest needs the structural sieve work below,
+which was assessed but **not implemented** this session.
+
+#### Phase-by-phase scorecard
+
+| phase | plan | status |
+|------|------|--------|
+| 1 | resieve → cheap trial division | **DONE** (better: Barrett-gating, no 2nd pass). Trial-div no longer a bottleneck. |
+| 2 | cache-blocked 3-tier / bucket sieve | **NOT DONE** — the #1 remaining lever (score-write ≈60 % @192; caps FB @240/256). |
+| 2b | root-update: branchless, then SIMD | scalar **tried+reverted** (x86 regression); SIMD **NOT DONE**. |
+| 3 | grow factor base | **PARTIAL** — done at 193–224; 240/256 capped until Phase 2. |
+| 4 | sparse Block Lanczos | **NOT DONE** — dense LA single-threaded (7.6–26 s @256); bites only at nfb≫15k. |
+| 5 | per-size auto-tuning sweeper | **NOT DONE** — only a coarse manual retune (a big part of FLINT's edge is its auto table). |
+| 6 | better `a`-selection, poly batching, larger intervals | **NOT DONE**. |
+
+#### TO-DO to reach (and beat) per-thread parity — prioritized
+
+1. **[Phase 2 + 6] Larger sieve intervals + a cache-blocked / bucket sieve, implemented together.**
+   Biggest lever. A larger interval cuts polynomial count → amortizes the per-poly O(nfb) root-update
+   and scan → lets 240/256 afford a large FB (where the smooth yield is). The larger score array must
+   be blocked (FLINT `do_sieving2` carried-position blocks, or a true (pos,weight)-bucket sieve) so it
+   stays cache-resident on small-L2 (mobile) targets. Gate on `cargo test` + determinism + per-size
+   1-core A/B. This is expected to close most of the remaining ~3.8×.
+2. **[Phase 5] Per-size auto-tuning sweeper** over (fb_bound, interval, small_skip, threshold, ks_primes)
+   across several semiprimes per bit-size; bake results into `engine_params`. Removes the
+   single-sample overfitting risk in the current hand-tuned values and is much of FLINT's real edge.
+3. **[Phase 4] Sparse Block Lanczos** (`f2::BlockLanczos` is a dense-Gauss stub) — required before the
+   factor base can grow past nfb≈15k (256+), and it parallelizes, helping multi-core too.
+4. **[Phase 6] Better `a`-selection** (`choose_a` is near-random; pick `a≈√(2·kn)/M`, well-spread) and
+   **polynomial batching** (process a family's b-variants together to amortize setup + stay cache-hot).
+5. **[Phase 2b / #5] SIMD** for the root-update and candidate-scan loops (the two vectorizable per-poly
+   O(nfb) spots), behind `arch-optimized` with a scoped `unsafe` module + runtime dispatch, per target
+   (x86 AVX2, wasm simd128). Scalar-only won here is a dead end (measured).
+6. **[hygiene]** Add a direct differential test for `fastmod`/`lemire_c` (currently only covered
+   indirectly by a debug-only `debug_assert` in the engine + the end-to-end factor tests).
