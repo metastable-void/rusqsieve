@@ -573,3 +573,32 @@ which was assessed but **not implemented** this session.
    (x86 AVX2, wasm simd128). Scalar-only won here is a dead end (measured).
 6. **[hygiene]** Add a direct differential test for `fastmod`/`lemire_c` (currently only covered
    indirectly by a debug-only `debug_assert` in the engine + the end-to-end factor tests).
+
+## Session 2026-07-24: translated position roots
+
+The first follow-up after the Barrett work removes another division-heavy operation from the
+score-write hot path:
+
+- Sieve roots are now stored as score-array-position residues (`x + interval mod p`) instead of
+  signed polynomial-coordinate residues (`x mod p`). `interval mod p` is precomputed once with the
+  immutable engine context. The old sieve translated both roots on every prime of every polynomial
+  with `i64::rem_euclid`, issuing multiple hardware divides in the dominant loop.
+- Gray-code root advances remain unchanged because translating every root by a fixed residue
+  commutes with each modular update. Candidate trial-division gating now compares `position mod p`
+  directly, also removing the per-candidate signed-coordinate conversion.
+- Added the roadmap's direct differential coverage for `lemire_c`/`fastmod`, together with the new
+  modular root-translation helper.
+
+Single-thread A/B on the checked-in 58-digit (192-bit) example, using saved release binaries and
+identical sieve output:
+
+| version | wall time | polynomials | survivors | relations |
+|--------:|----------:|------------:|----------:|----------:|
+| prior HEAD | 9.91–9.99 s | 21,888 | 65,304 | 3,116 |
+| translated roots | **7.45 s** | 21,888 | 65,304 | 3,116 |
+
+That is a repeatable **25% wall-time reduction** while preserving factorization output and all sieve
+counts. The full native suite passes (25 unit tests plus integration/doc tests), and the portable
+WASM release build remains green. FLINT factors this same input in 2.83 s wall / 2.73 s user, so the
+single-core gap narrows from about 3.5× on this run to about 2.7×. The larger blocked-interval
+structural work remains the next major lever.

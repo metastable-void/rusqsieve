@@ -56,6 +56,10 @@ struct Context {
     /// test `x mod p == root` (a ~3-instruction multiply-shift) in trial division without a
     /// hardware divide, so the whole factor base can be gated per survivor cheaply.
     pinv: Arc<[u64]>,
+    /// `interval mod p` per factor-base prime. Sieve roots are residues of the signed polynomial
+    /// coordinate `x`, while score-array positions represent `x + interval`; precomputing this
+    /// fixed translation avoids two signed divisions per prime and polynomial in the sieve pass.
+    interval_mod_p: Arc<[u32]>,
     interval: i32,
     target_a_bits: usize,
     lp_allowance: usize,
@@ -114,7 +118,8 @@ struct FamilyResult {
 #[derive(Default)]
 struct EngineScratch {
     scores: Vec<u8>,
-    /// The two sieve roots per factor-base prime for the current polynomial.
+    /// The two score-array-position residues per factor-base prime for the current polynomial.
+    /// These include the fixed `+interval` translation from signed polynomial coordinates.
     /// `root1[i] == u32::MAX` marks a prime that is not directly sieved (2, or a
     /// prime dividing `a`, handled by the per-polynomial linear fallback).
     root1: Vec<u32>,
@@ -256,6 +261,10 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
+    let interval_mod_p: Arc<[u32]> = base
+        .iter()
+        .map(|e| p.sieve_half_width % e.prime)
+        .collect();
     let target_a = sieve_n
         .floor_sqrt()
         .div_rem_u64(p.sieve_half_width as u64)
@@ -267,6 +276,7 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
         sieve_n,
         base,
         pinv,
+        interval_mod_p,
         interval: p.sieve_half_width as i32,
         target_a_bits: target_a.bit_len(),
         lp_allowance: p.lp_allowance,
@@ -555,6 +565,8 @@ fn find_factor(
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
+    let interval_mod_p: Arc<[u32]> =
+        base.iter().map(|e| interval as u32 % e.prime).collect();
     let target = base.len() + 64;
     if prof {
         eprintln!(
@@ -573,6 +585,7 @@ fn find_factor(
         sieve_n,
         base: base.clone(),
         pinv,
+        interval_mod_p,
         interval,
         target_a_bits: target_a.bit_len(),
         lp_allowance: p.lp_allowance,
@@ -754,8 +767,10 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
             continue;
         };
         let bp = b.mod_u64(p as u64) as u32;
-        scratch.root1[idx] = mulmod_u32((e.sqrt_n + p - bp) % p, ainvp, p);
-        scratch.root2[idx] = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, ainvp, p);
+        let xroot1 = mulmod_u32((e.sqrt_n + p - bp) % p, ainvp, p);
+        let xroot2 = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, ainvp, p);
+        scratch.root1[idx] = add_mod_u32(xroot1, ctx.interval_mod_p[idx], p);
+        scratch.root2[idx] = add_mod_u32(xroot2, ctx.interval_mod_p[idx], p);
         for (j, bj) in bvals.iter().take(nvar).enumerate() {
             let bjp = bj.mod_u64(p as u64) as u32;
             let two_bjp = (2 * bjp as u64 % p as u64) as u32;
@@ -914,7 +929,6 @@ fn sieve_one_poly(
     } else {
         (ctx.sieve_n.wrapping_sub(&bb).div_rem(a).unwrap().0, true)
     };
-    let neg_interval = -(ctx.interval as i64);
     // Logarithmic sieve using the self-initialized roots. Byte scores keep the
     // whole array resident in cache (SPEC §12.6). (Frontier #2 blocked/bucket sieving was
     // implemented and measured here: a naive per-block re-stride regressed 13–41% on this
@@ -929,8 +943,7 @@ fn sieve_one_poly(
         let weight = (32 - p.leading_zeros()) as u8;
         if root1[idx] != u32::MAX {
             for &root in &[root1[idx], root2[idx]] {
-                let start = (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64)
-                    as usize;
+                let start = root as usize;
                 let mut pos = start;
                 while pos < len {
                     scores[pos] = scores[pos].saturating_add(weight);
@@ -946,9 +959,8 @@ fn sieve_one_poly(
             };
             let cm = c.mod_u64(p as u64) as u32;
             let signed_c = if csign && cm != 0 { p - cm } else { cm };
-            let root = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
-            let start =
-                (root as i64 - neg_interval.rem_euclid(p as i64)).rem_euclid(p as i64) as usize;
+            let xroot = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
+            let start = add_mod_u32(xroot, ctx.interval_mod_p[idx], p) as usize;
             let mut pos = start;
             while pos < len {
                 scores[pos] = scores[pos].saturating_add(weight);
@@ -1071,10 +1083,11 @@ fn sieve_one_poly(
             record(ai, count, &mut powers);
         }
         // Barrett-gated trial division (FLINT `qsieve_evaluate_candidate` style): a normal prime `p`
-        // divides `g(x)` iff `x ≡ root1 or root2 (mod p)`. Compute `x mod p` with a precomputed
-        // multiply-shift (`fastmod`) — no hardware divide — and bignum-divide only on a hit. This
-        // makes trial division O(nfb) cheap tests + O(#factors) divides, with no second sieve pass,
-        // so it stays cheap at every factor-base size (unlike the old O(nfb) bignum-remainder loop).
+        // divides `g(x)` iff the candidate's score-array position matches one of the translated
+        // roots modulo `p`. Compute that residue with a precomputed multiply-shift (`fastmod`) — no
+        // hardware divide — and bignum-divide only on a hit. This makes trial division O(nfb) cheap
+        // tests + O(#factors) divides, with no second sieve pass, so it stays cheap at every
+        // factor-base size (unlike the old O(nfb) bignum-remainder loop).
         for idx in small_end..base.len() {
             if q.is_one() {
                 break;
@@ -1084,10 +1097,9 @@ fn sieve_one_poly(
                 continue; // prime divides `a`; handled above
             }
             let p = base[idx].prime;
-            let xm = fastmod(xabs as u32, p, ctx.pinv[idx]);
-            debug_assert_eq!(xm, (xabs % p as u64) as u32, "fastmod mismatch p={p}");
-            let xmodp = if x >= 0 || xm == 0 { xm } else { p - xm };
-            if xmodp != r1 && xmodp != root2[idx] {
+            let posmodp = fastmod(posu, p, ctx.pinv[idx]);
+            debug_assert_eq!(posmodp, posu % p, "fastmod mismatch p={p}");
+            if posmodp != r1 && posmodp != root2[idx] {
                 continue;
             }
             let pu = p as u64;
@@ -1325,6 +1337,15 @@ fn inv_u32(a: u32, p: u32) -> Option<u32> {
 fn mulmod_u32(a: u32, b: u32, p: u32) -> u32 {
     (a as u64 * b as u64 % p as u64) as u32
 }
+#[inline]
+fn add_mod_u32(a: u32, b: u32, p: u32) -> u32 {
+    let sum = a as u64 + b as u64;
+    if sum >= p as u64 {
+        (sum - p as u64) as u32
+    } else {
+        sum as u32
+    }
+}
 /// Lemire fast-mod constant for divisor `p`: `⌊2^64 / p⌋ + 1` (via `u64::MAX / p + 1`, which equals
 /// it for every `p ≥ 2`). Precomputed once per factor-base prime; see [`fastmod`].
 #[inline]
@@ -1453,6 +1474,21 @@ fn powmod64(mut a: u64, mut e: u64, n: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precomputed_remainders_and_root_translation_are_exact() {
+        for p in 2u32..=10_000 {
+            let c = lemire_c(p);
+            for a in [0, 1, p - 1, p, p.saturating_add(1), u32::MAX] {
+                assert_eq!(fastmod(a, p, c), a % p, "p={p}, a={a}");
+            }
+            for a in [0, 1, p - 1] {
+                for b in [0, 1, p - 1] {
+                    assert_eq!(add_mod_u32(a, b, p), (a as u64 + b as u64) as u32 % p);
+                }
+            }
+        }
+    }
 
     #[test]
     fn portable_jobs_are_deterministic() {
