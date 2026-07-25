@@ -4,8 +4,11 @@
 import { instantiate, loadModule, putString, putBytes, takePacket, bytesToBigInt } from "./abi.js";
 import { trialDivide, isPrime, perfectPower, pollardBrent, groupFactors, rsaNumber, bitLength } from "./numtheory.js";
 
-const WASM_URL = new URL("./rusqsieve.wasm", import.meta.url);
-const BATCH = 4; // polynomial families dispatched per sieve job
+const SIMD_WASM_URL = new URL("./rusqsieve-simd.wasm", import.meta.url);
+const SCALAR_WASM_URL = new URL("./rusqsieve.wasm", import.meta.url);
+// Small jobs reduce the tail after the relation target is reached. Two
+// families was consistently best in Node/V8 from 192 through 256 bits.
+const BATCH = 2;
 const MAX_FAMILIES = 2_000_000;
 
 const els = {
@@ -25,10 +28,20 @@ const els = {
 let coord = null; // coordinator wasm instance (main thread)
 let workers = []; // sieve worker pool
 let gen = 0; // generation token so stale worker messages are ignored
-const nWorkers = Math.max(1, navigator.hardwareConcurrency || 4);
+let wasmFlavor = "scalar";
+// Scaling remains positive through 32–48 workers on the 96-thread reference
+// host, while 96 workers regress from startup, memory traffic, and job overshoot.
+const nWorkers = Math.max(1, Math.min(48, navigator.hardwareConcurrency || 4));
 
 async function boot() {
-  const module = await loadModule(WASM_URL);
+  let module;
+  try {
+    module = await loadModule(SIMD_WASM_URL);
+    wasmFlavor = "SIMD";
+  } catch {
+    // Older engines can still use the portable artifact.
+    module = await loadModule(SCALAR_WASM_URL);
+  }
   coord = await instantiate(module);
   workers = await Promise.all(
     Array.from({ length: nWorkers }, () => {
@@ -44,7 +57,8 @@ async function boot() {
       });
     }),
   );
-  els.workers.textContent = `${nWorkers} worker${nWorkers === 1 ? "" : "s"} · ABI v${coord.qs_abi_version()}`;
+  els.workers.textContent =
+    `${nWorkers} worker${nWorkers === 1 ? "" : "s"} · ${wasmFlavor} · ABI v${coord.qs_abi_version()}`;
   els.go.disabled = false;
   els.status.textContent = "Ready.";
 }

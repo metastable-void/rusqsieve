@@ -25,6 +25,12 @@ the same deterministic polynomial-family work across persistent workers.
 (enable Pages on the `docs/` folder). It factors a number you type using the same
 crate compiled to `wasm32-unknown-unknown`, sieving in parallel across a pool of Web
 Workers sized to `navigator.hardwareConcurrency`, and renders the result in power
-notation. `make serve` previews it locally at <http://localhost:8000/>.
+notation. Modern browsers use the scoped `simd128` linear-algebra kernel; a portable
+scalar artifact is selected automatically on older engines. `make serve` previews it
+locally at <http://localhost:8000/>.
+
+See [BENCHMARKING.md](BENCHMARKING.md) for the fixed 192–256-bit corpus, reproducible
+Node/V8 harness, current measurements, and the evidence required before making a
+cross-project “fastest general browser factorizer” claim.
 
 Licensed under `Apache-2.0 OR MPL-2.0`; see `LICENSE-APACHE` and `LICENSE-MPL`.

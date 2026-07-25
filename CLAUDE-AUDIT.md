@@ -686,3 +686,49 @@ All outputs were product-verified by the CLI. The full native suite passes and t
 `wasm32-unknown-unknown` build passes. This achieves the audit's per-thread goal on every measured
 head-to-head tier from 160 through 240 bits; FLINT still aborts on the reference host's 256-bit
 case, where rusqsieve remains functional.
+
+## Session 2026-07-25: 256-bit and browser linear algebra
+
+The previous upper-tier parameters were stale: at 256 bits, bound 200k / half-width 131,072 spent
+42.48 s of a 43.37 s eight-thread native run collecting relations while LA was only 0.84 s. A sweep
+over factor-base bound and interval selected **bound 500k / half-width 327,680**. The larger base
+raises the matrix to about 20.8k columns but cuts relation collection enough to win overall.
+
+That exposed the next crossover and led to three linear-algebra changes:
+
+- structured sparse Gaussian elimination now handles rows through weight six, choosing a
+  minimum-column-weight pivot to control fill and replaying substitutions backward;
+- the residual dense solve uses compact row echelon equations instead of carrying equally large
+  parity and provenance vectors through column elimination;
+- it emits the conventional maximum of 64 verified dependencies, solving only the vectors useful
+  to factor extraction. Every expanded dependency is checked against the original matrix.
+
+On the fixed 256-bit semiprime
+`98877949376972157840865984674312121822345015130827118595228756728313751597271`, sparse filtering
+reduces approximately 20,740×20,803 to 10,877×11,343. The original filtered dense solve took 4.69 s
+inside a 5.19 s extraction; compact row echelon takes 2.43 s inside a 2.93 s extraction, a 44%
+end-to-end LA reduction. The final native eight-thread run is 27.83 s wall. This is still dense
+Gaussian elimination, not a true block-Lanczos recurrence, but it moves the practical crossover
+well beyond the current 256-bit matrix.
+
+A real Node/V8 Worker benchmark now mirrors the browser topology: one coordinator Wasm instance,
+eight independent worker instances, serialized relation packets, and no shared memory. Reducing
+jobs from four polynomial families to two trims the relation-collection tail. A scoped Wasm
+`simd128` XOR kernel only in row reduction succeeds where whole-program `+simd128` regressed:
+
+| bits | V8/Wasm, 8 workers | sieve | filter/LA/extract |
+|-----:|--------------------:|------:|------------------:|
+| 192 | **0.72 s** | 0.54 s | 0.18 s |
+| 224 | **5.04 s** | 3.95 s | 1.09 s |
+| 256 | **37.86 s** | 32.08 s | 5.78 s |
+
+All three results are factor-verified single measurements under Node 24.15. The browser build ships
+both SIMD and scalar Wasm and falls back at module compilation on engines without `simd128`.
+Worker scaling at 256 bits is 22.26 s / 14.71 s / 13.96 s for 16 / 32 / 48 workers. At 224 bits,
+48 workers take 2.59 s, while 96 regress to 3.45 s; the browser pool is therefore capped at 48.
+
+Competitive-claim caveat: these results justify continued work toward a fastest browser SIQS claim,
+not yet “fastest general factorizer.” Alpertron uses ECM before SIQS, while rusqsieve currently jumps
+from bounded Pollard-Brent to SIQS. Medium factors in unbalanced 192–256-bit composites are therefore
+a known algorithmic gap. `BENCHMARKING.md` defines the balanced and unbalanced corpus and same-browser
+competitor protocol required before publishing the broader claim.

@@ -176,6 +176,75 @@ impl SparseBinaryMatrix {
         DependencySet { vectors: deps }
     }
 
+    /// Compute a bounded nullspace basis by row-reducing the parity matrix.
+    ///
+    /// The column-oriented reference solver above carries both a parity vector
+    /// and a full provenance vector through every elimination.  Once sparse
+    /// filtering has made the residual matrix fairly dense, reducing rows uses
+    /// half as much live bitset data.  The echelon rows themselves are equations
+    /// in the original column variables, so dependencies can be recovered by
+    /// back-substitution without maintaining provenance during elimination.
+    fn row_echelon_dependencies(&self, limit: usize) -> DependencySet {
+        let cols = self.columns();
+        if cols == 0 || limit == 0 {
+            return DependencySet::default();
+        }
+        let words = cols.div_ceil(64);
+        let mut basis: Vec<Option<Box<[u64]>>> = vec![None; cols];
+
+        for row in 0..self.rows() {
+            let a = self.csr_offsets[row] as usize;
+            let b = self.csr_offsets[row + 1] as usize;
+            if a == b {
+                continue;
+            }
+            let highest_column = self.csr_columns[a..b].iter().copied().max().unwrap() as usize;
+            let mut equation = vec![0u64; highest_column / 64 + 1];
+            for &column in &self.csr_columns[a..b] {
+                equation[column as usize / 64] ^= 1 << (column % 64);
+            }
+            while let Some(pivot) = highest_bit(&equation) {
+                if let Some(prior) = &basis[pivot] {
+                    xor(&mut equation[..=pivot / 64], &prior[..=pivot / 64]);
+                } else {
+                    equation.truncate(pivot / 64 + 1);
+                    basis[pivot] = Some(equation.into_boxed_slice());
+                    break;
+                }
+            }
+        }
+
+        let mut dependencies = Vec::new();
+        for free in (0..cols)
+            .filter(|&column| basis[column].is_none())
+            .take(limit)
+        {
+            let mut dependency = vec![0u64; words];
+            dependency[free / 64] |= 1 << (free % 64);
+            // A pivot row has no set bits above its pivot.  Ascending
+            // substitution therefore has every right-hand-side value ready.
+            for pivot in 0..cols {
+                let Some(equation) = &basis[pivot] else {
+                    continue;
+                };
+                let last = pivot / 64;
+                let odd = equation[..=last]
+                    .iter()
+                    .zip(&dependency[..=last])
+                    .fold(0u32, |parity, (&a, &b)| parity ^ ((a & b).count_ones() & 1));
+                if odd != 0 {
+                    dependency[last] ^= 1 << (pivot % 64);
+                }
+            }
+            if self.verify_dependency(&dependency) {
+                dependencies.push(dependency.into_boxed_slice());
+            }
+        }
+        DependencySet {
+            vectors: dependencies,
+        }
+    }
+
     /// Nullspace via SPEC §15.3 filtering — iterative singleton-row elimination
     /// (a prime occurring in one live column forces that column out of every
     /// dependency) — followed by dense elimination on the much smaller reduced
@@ -186,6 +255,8 @@ impl SparseBinaryMatrix {
     /// the O(n³) dense step, turning the linear-algebra phase from a bottleneck
     /// into a small fraction of the run at large input sizes.
     pub fn filtered_dependencies(&self) -> DependencySet {
+        #[cfg(any(unix, windows))]
+        let filter_started = std::time::Instant::now();
         let nrows = self.rows();
         let ncols = self.columns();
         if ncols == 0 {
@@ -206,57 +277,52 @@ impl SparseBinaryMatrix {
             })
             .collect();
         let mut col_alive = vec![true; ncols];
-        let mut provenance: Vec<Vec<usize>> = (0..ncols).map(|c| vec![c]).collect();
-        let mut stack: Vec<usize> = (0..nrows).filter(|&r| row_cols[r].len() <= 2).collect();
+        // Each eliminated pivot satisfies x[pivot] = XOR(x[other] for other in rhs).
+        // Replaying these records backwards expands a dependency of the reduced matrix into the
+        // original column space without carrying dense provenance through the sparse phase.
+        let mut eliminations: Vec<(usize, Vec<usize>)> = Vec::new();
+        const MAX_STRUCTURED_WEIGHT: usize = 6;
+        let mut stack: Vec<usize> = (0..nrows)
+            .filter(|&r| (1..=MAX_STRUCTURED_WEIGHT).contains(&row_cols[r].len()))
+            .collect();
 
         while let Some(r) = stack.pop() {
-            match row_cols[r].len() {
-                0 => {}
-                1 => {
-                    // A singleton equation forces its sole variable (and its whole merged
-                    // provenance group) to zero in every dependency.
-                    let c = *row_cols[r].iter().next().unwrap();
-                    let affected: Vec<usize> = col_rows[c].iter().copied().collect();
-                    for rr in affected {
-                        row_cols[rr].remove(&c);
-                        if row_cols[rr].len() <= 2 {
-                            stack.push(rr);
-                        }
-                    }
-                    col_rows[c].clear();
-                    col_alive[c] = false;
-                }
-                2 => {
-                    // x_a + x_b = 0, hence x_a = x_b. Merge b into a, XORing their
-                    // incidence in every other row. Selecting the reduced variable later selects
-                    // both provenance groups in the original column space.
-                    let mut it = row_cols[r].iter();
-                    let a = *it.next().unwrap();
-                    let b = *it.next().unwrap();
-                    row_cols[r].clear();
-                    col_rows[a].remove(&r);
-                    col_rows[b].remove(&r);
-                    let affected: Vec<usize> = col_rows[b].iter().copied().collect();
-                    for rr in affected {
-                        row_cols[rr].remove(&b);
-                        col_rows[b].remove(&rr);
-                        if row_cols[rr].remove(&a) {
-                            col_rows[a].remove(&rr);
-                        } else {
-                            row_cols[rr].insert(a);
-                            col_rows[a].insert(rr);
-                        }
-                        if row_cols[rr].len() <= 2 {
-                            stack.push(rr);
-                        }
-                    }
-                    col_rows[b].clear();
-                    col_alive[b] = false;
-                    let merged = core::mem::take(&mut provenance[b]);
-                    provenance[a].extend(merged);
-                }
-                _ => {}
+            let weight = row_cols[r].len();
+            if weight == 0 || weight > MAX_STRUCTURED_WEIGHT {
+                continue;
             }
+            let equation: Vec<usize> = row_cols[r].iter().copied().collect();
+            // Markowitz-style choice: eliminate the column occurring in the fewest other rows,
+            // minimizing fill. Ties are stable because the equation is sorted.
+            let pivot = *equation
+                .iter()
+                .min_by_key(|&&c| (col_rows[c].len(), c))
+                .unwrap();
+            let rhs: Vec<usize> = equation.iter().copied().filter(|&c| c != pivot).collect();
+
+            row_cols[r].clear();
+            for &c in &equation {
+                col_rows[c].remove(&r);
+            }
+            let affected: Vec<usize> = col_rows[pivot].iter().copied().collect();
+            for rr in affected {
+                row_cols[rr].remove(&pivot);
+                col_rows[pivot].remove(&rr);
+                for &c in &rhs {
+                    if row_cols[rr].remove(&c) {
+                        col_rows[c].remove(&rr);
+                    } else {
+                        row_cols[rr].insert(c);
+                        col_rows[c].insert(rr);
+                    }
+                }
+                if (1..=MAX_STRUCTURED_WEIGHT).contains(&row_cols[rr].len()) {
+                    stack.push(rr);
+                }
+            }
+            col_rows[pivot].clear();
+            col_alive[pivot] = false;
+            eliminations.push((pivot, rhs));
         }
 
         let alive_cols: Vec<usize> = (0..ncols).filter(|&c| col_alive[c]).collect();
@@ -296,20 +362,40 @@ impl SparseBinaryMatrix {
         let Ok(reduced) = SparseBinaryMatrix::from_columns(reduced_rows, &reduced_cols) else {
             return self.dense_dependencies();
         };
+        #[cfg(any(unix, windows))]
+        let dense_started = std::time::Instant::now();
         let words = ncols.div_ceil(64);
         let mut out = Vec::new();
-        for dep in reduced.dense_dependencies().iter() {
+        // Block solvers conventionally return up to 64 independent QS
+        // dependencies. This gives ample deterministic headroom while avoiding
+        // hundreds of unnecessary back-substitutions.
+        for dep in reduced.row_echelon_dependencies(64).iter() {
             let mut full = vec![0u64; words];
-            for (j, &reduced_col) in alive_cols.iter().enumerate() {
+            for (j, &original_col) in alive_cols.iter().enumerate() {
                 if (dep[j / 64] >> (j % 64)) & 1 != 0 {
-                    for &orig in &provenance[reduced_col] {
-                        full[orig / 64] |= 1 << (orig % 64);
-                    }
+                    full[original_col / 64] |= 1 << (original_col % 64);
+                }
+            }
+            for (pivot, rhs) in eliminations.iter().rev() {
+                let value = rhs
+                    .iter()
+                    .fold(false, |v, &c| v ^ ((full[c / 64] >> (c % 64)) & 1 != 0));
+                if value {
+                    full[pivot / 64] |= 1 << (pivot % 64);
                 }
             }
             if self.verify_dependency(&full) {
                 out.push(full.into_boxed_slice());
             }
+        }
+        #[cfg(any(unix, windows))]
+        if std::env::var_os("RUSQSIEVE_PROFILE").is_some() {
+            eprintln!(
+                "PROFILE f2_filter={:.3}s f2_dense={:.3}s dependencies={}",
+                dense_started.duration_since(filter_started).as_secs_f64(),
+                dense_started.elapsed().as_secs_f64(),
+                out.len()
+            );
         }
         DependencySet { vectors: out }
     }
@@ -319,9 +405,38 @@ fn highest_bit(v: &[u64]) -> Option<usize> {
         .rposition(|&x| x != 0)
         .map(|i| i * 64 + 63 - v[i].leading_zeros() as usize)
 }
+#[cfg(not(all(feature = "wasm-simd128", target_arch = "wasm32")))]
 fn xor(a: &mut [u64], b: &[u64]) {
     for (x, y) in a.iter_mut().zip(b) {
         *x ^= *y
+    }
+}
+
+#[cfg(all(feature = "wasm-simd128", target_arch = "wasm32"))]
+fn xor(a: &mut [u64], b: &[u64]) {
+    // The feature explicitly opts the whole wasm artifact into the simd128
+    // baseline, so calling the specialized function is valid.
+    unsafe { xor_wasm_simd(a, b) }
+}
+
+#[cfg(all(feature = "wasm-simd128", target_arch = "wasm32"))]
+#[target_feature(enable = "simd128")]
+unsafe fn xor_wasm_simd(a: &mut [u64], b: &[u64]) {
+    use core::arch::wasm32::{v128, v128_load, v128_store, v128_xor};
+    let len = a.len().min(b.len());
+    let mut i = 0;
+    while i + 2 <= len {
+        // SAFETY: the loop condition proves that both slices contain the two
+        // u64 lanes loaded here. WebAssembly v128 loads/stores are unaligned.
+        unsafe {
+            let av = v128_load(a.as_ptr().add(i).cast::<v128>());
+            let bv = v128_load(b.as_ptr().add(i).cast::<v128>());
+            v128_store(a.as_mut_ptr().add(i).cast::<v128>(), v128_xor(av, bv));
+        }
+        i += 2;
+    }
+    if i < len {
+        a[i] ^= b[i];
     }
 }
 #[derive(Clone, Debug, Default)]
@@ -440,16 +555,27 @@ mod tests {
             let columns: Vec<Vec<u32>> = (0..cols)
                 .map(|_| {
                     let weight = 1 + (rng() as usize % 5);
-                    (0..weight).map(|_| (rng() as usize % rows) as u32).collect()
+                    (0..weight)
+                        .map(|_| (rng() as usize % rows) as u32)
+                        .collect()
                 })
                 .collect();
             let m = SparseBinaryMatrix::from_columns(rows, &columns).unwrap();
             let filtered = m.filtered_dependencies();
             for d in filtered.iter() {
-                assert!(m.verify_dependency(d), "filtered produced an invalid dependency");
+                assert!(
+                    m.verify_dependency(d),
+                    "filtered produced an invalid dependency"
+                );
+            }
+            let dense = m.dense_dependencies();
+            let echelon = m.row_echelon_dependencies(64);
+            assert_eq!(echelon.len(), dense.len());
+            for d in echelon.iter() {
+                assert!(m.verify_dependency(d));
             }
             // cols > rows guarantees a nontrivial nullspace, so both solvers find one.
-            assert!(!m.dense_dependencies().is_empty());
+            assert!(!dense.is_empty());
             assert!(
                 !filtered.is_empty(),
                 "filtered found no dependency though one exists"

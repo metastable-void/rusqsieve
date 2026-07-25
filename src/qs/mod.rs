@@ -336,7 +336,7 @@ pub mod parameters {
             193..=208 => (120_000, 131_072, 26),
             209..=224 => (250_000, 262_144, 26),
             225..=248 => (350_000, 262_144, 30),
-            _ => (200_000, 131_072, 34),
+            _ => (500_000, 327_680, 34),
         };
         // Tuning overrides (experimentation only; unset in production builds).
         #[cfg(any(unix, windows))]
