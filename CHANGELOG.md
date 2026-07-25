@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0
+## 0.2.0 — 2026-07-25
 
 - Replaced the broad implementation-facing Rust API with a documented,
   high-level factorization surface.
@@ -16,3 +16,9 @@
 - Added cooperative cancellation to the native SIQS engine.
 - Enabled `deny(missing_docs)` for the complete public Rust API.
 - Kept the decimal-string C ABI and opaque result ownership model unchanged.
+- Replaced the aspirational implementation specification and historical
+  performance audit with documentation of the shipped 0.2 architecture,
+  verified results, and remaining work.
+- Added complete crates.io metadata and an explicit publish allowlist containing
+  the Rust/C/Wasm sources, production browser frontend, release tooling,
+  licenses, and supporting documentation.

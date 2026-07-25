@@ -2,33 +2,60 @@
 
 `rusqsieve` is a speed-first, portable Rust/WebAssembly implementation of the
 self-initializing quadratic sieve. Its primary target is balanced, RSA-style
-semiprimes from **192 through 256 bits**, scheduled across browser Web Workers
-without shared memory.
+semiprimes from **192 through 256 bits**, including browser execution across
+independent Web Workers without shared memory.
 
-On the fixed, factor-verified corpus, rusqsieve currently:
+Version 0.2 exposes a deliberately small, safe Rust API and an opaque native C
+ABI. SIQS relations, matrix kernels, worker packets, scheduler state, primality
+policy, and mutable limbs remain private implementation details.
 
-- beats FLINT's single-threaded quadratic sieve on every measured native tier
-  from 160 through 240 bits;
-- factors the 192-, 224-, and 256-bit browser cases in 0.72 s, 5.04 s, and
-  37.86 s under Node 24.15/V8 with eight workers;
+## Performance status
+
+On the fixed, factor-verified corpus and reference host, rusqsieve currently:
+
+- beats FLINT's single-threaded QSieve on every measured native tier from 160
+  through 240 bits;
+- factors the 192-, 224-, and 256-bit browser-shaped cases in 0.72 s, 5.04 s,
+  and 37.86 s under Node 24.15/V8 with eight workers;
 - scales the fixed 256-bit case to 13.96 s with 48 workers on the 96-thread
   reference host.
 
 These results make rusqsieve a **plausibly fastest-class browser integer
-factorizer for balanced 192–256-bit semiprimes**, and a particularly strong
-candidate for the fastest browser SIQS in that range. This is deliberately not
-an unqualified world-record claim: current Alpertron, Msieve-Wasm, and other
-browser implementations still need to be run on the same browser, hardware, and
-fixed corpus. See [BENCHMARKING.md](BENCHMARKING.md) for inputs, factors,
-commands, measurement scope, and the competitor protocol.
+factorizer for balanced 192–256-bit semiprimes**, and a strong candidate for the
+fastest browser SIQS in that range. This is intentionally not an unqualified
+world-record or "fastest general factorizer" claim: current competitor
+implementations still need same-browser, same-hardware measurements.
 
-The default `Natural<16>` has a 1024-bit storage capacity. That is not a promise
-that hard 1024-bit semiprimes are practical; NFS is the appropriate algorithm at
-that scale.
+[BENCHMARKING.md](BENCHMARKING.md) contains the inputs, factors, commands,
+measurement scope, and competitor protocol. The crate is not constant-time and
+must not be used where operand-dependent timing reveals a secret.
 
-The crate is not constant-time and must not be used where operand-dependent timing is secret.
+## Installation
 
-## Native API
+Add the Rust library:
+
+```sh
+cargo add rusqsieve@0.2.0
+```
+
+Install the native CLI:
+
+```sh
+cargo install rusqsieve --version 0.2.0
+```
+
+Or build the optimized native library and CLI from source:
+
+```sh
+make
+```
+
+The library is emitted as an `rlib`, static library, and platform shared
+library.
+
+## Rust API
+
+The blocking factorization functions are available on Unix and Windows:
 
 ```rust
 use rusqsieve::{FactorConfig, Natural, Parallelism, factor_with};
@@ -41,123 +68,171 @@ let factors = factor_with(input.clone(), config).unwrap();
 
 assert_eq!(factors.distinct_len(), 3);
 assert_eq!(factors.total_len(), 6);
+assert_eq!(
+    factors
+        .expanded()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>(),
+    ["2", "2", "2", "3", "3", "5"],
+);
 assert!(factors.verify_product(&input));
 ```
 
-The 0.2 Rust API deliberately exposes only the safe blocking interface,
-configuration builders, progress snapshots, fixed-capacity input type, and
-owned factorization result. SIQS relations, matrix kernels, worker packets, and
-scheduler state are private implementation details. This keeps invalid
-relations or mismatched worker contexts from being representable through the
-supported Rust API and lets those internals evolve without breaking callers.
-All public items are covered by rustdoc, enforced during the build with the
-`missing_docs` lint.
+Use `factor` for defaults, `factor_with` for configuration, or
+`factor_with_progress` for read-only progress snapshots and cooperative
+cancellation. The ordinary no-observer path is separately monomorphized so
+callback and progress-clock machinery is compiled out.
 
-### C API
+The default `Natural` has a 1024-bit storage capacity. This is not a claim that
+hard 1024-bit semiprimes are practical; NFS is the appropriate algorithm at
+that scale. Arithmetic operators on `Natural` wrap at capacity, while
+`checked_*` methods report overflow.
 
-Native Unix and Windows builds export a minimal owning C interface from the
-`cdylib` and `staticlib`. The ABI uses standard C `size_t` for Rust `usize` and
-NUL-terminated decimal strings for all integers.
+All supported public items are covered by rustdoc, enforced with
+`deny(missing_docs)`. The complete 0.2 contract and implementation architecture
+are documented in [SPEC.md](SPEC.md); breaking changes from 0.1 are summarized
+in [CHANGELOG.md](CHANGELOG.md).
 
-`make` builds the optimized native library and `qs-factor` CLI. Installation
-defaults to `/usr/local`:
+## Native C API
+
+Unix and Windows builds export a minimal decimal-string interface from the
+static and shared libraries:
+
+```c
+#include <stdio.h>
+#include "rusqsieve.h"
+
+int main(void) {
+    rusqsieve_factors *factors = rusqsieve_factors_new();
+    if (factors == NULL)
+        return 1;
+
+    int status = rusqsieve_factor("360", 0, factors);
+    if (status == RUSQSIEVE_OK) {
+        for (size_t i = 0; i < rusqsieve_factors_len(factors); ++i)
+            puts(rusqsieve_factors_get(factors, i));
+    }
+
+    rusqsieve_factors_free(factors);
+    return status;
+}
+```
+
+The result type is completely opaque and Rust-owned. Factor strings are
+borrowed until the next call using that result or until
+`rusqsieve_factors_free`; callers must not free individual strings.
+`threads == 0` selects available parallelism capped at 48.
+
+Install libraries, CLI, header, and pkg-config metadata under `/usr/local`:
 
 ```sh
 sudo make install
-# Packaging/staging example:
+```
+
+The prefix and staging root are overridable:
+
+```sh
 make install PREFIX=/usr DESTDIR="$pkgdir"
 ```
 
-`BINDIR`, `LIBDIR`, `INCLUDEDIR`, and `PKGCONFIGDIR` are independently
-overridable. Installation includes the shared and static C libraries,
-`rusqsieve.h`, the CLI, and `rusqsieve.pc`.
+`BINDIR`, `LIBDIR`, `INCLUDEDIR`, and `PKGCONFIGDIR` may also be overridden.
+See [rusqsieve.h](rusqsieve.h) for the complete ownership, status, and
+thread-safety contract.
 
-`./build-release.sh` creates versioned `.tar.gz` archives for the supported
-Linux GNU/musl, FreeBSD, Windows MSVC, Apple arm64, and WebAssembly targets.
-It uses cross-rs for Linux and FreeBSD, xwin for MSVC, zigbuild for Apple
-(`SDKROOT` is required), and Cargo directly for Wasm. Native archives contain
-the target-appropriate libraries, CLI, header, pkg-config metadata, licenses,
-and an elevation-aware installer. The Wasm archive is directly deployable and
-contains both scalar and SIMD128 builds. Pass target triples as arguments to
-build only a subset; run `./build-release.sh --help` for the full list.
+## Browser and WebAssembly
 
-```c
-#include "rusqsieve.h"
+Build the self-contained browser demo:
 
-rusqsieve_factors *factors = rusqsieve_factors_new();
-if (factors == NULL)
-    return 1;
-
-int status = rusqsieve_factor("360", 0, factors);
-if (status == RUSQSIEVE_OK) {
-    for (size_t i = 0; i < rusqsieve_factors_len(factors); ++i)
-        puts(rusqsieve_factors_get(factors, i)); /* 2, 2, 2, 3, 3, 5 */
-}
-
-rusqsieve_factors_free(factors);
+```sh
+make docs
+make serve
 ```
 
-`threads == 0` selects available parallelism capped at 48. The opaque output
-owns sorted decimal prime factors, repeated according to multiplicity and
-borrowed through `rusqsieve_factors_get`. C callers must release the complete
-result with `rusqsieve_factors_free`; individual strings must not be freed. See
-[`rusqsieve.h`](rusqsieve.h) for the full lifetime and error contract.
+The generated `docs/` directory can be deployed directly to GitHub Pages. It
+contains scalar and SIMD128 Wasm modules; the frontend attempts SIMD first and
+falls back to scalar on older engines.
 
-## Why it is fast in browsers
+The browser architecture uses one coordinator Wasm instance and an independent
+Wasm instance in each Web Worker. Workers rebuild the same deterministic SIQS
+context and return serialized polynomial-family relations. The coordinator
+merges families deterministically, filters the matrix, solves for dependencies,
+and extracts a verified nontrivial factor.
 
-- Numerically target-fitted SIQS polynomials and a double-large-prime relation
-  graph reduce the amount of sieving needed.
-- Translated, sorted roots and paired stride loops keep division out of the
-  score-write hot path.
-- Low-weight sparse elimination shrinks the matrix before a compact row-echelon
-  dependency solve.
-- A scoped Wasm `simd128` XOR kernel accelerates linear algebra without applying
-  whole-program SIMD transformations that regress the sieve.
-- Two-family Worker jobs limit end-of-run overshoot. The pool follows
-  `navigator.hardwareConcurrency` up to a measured cap of 48 workers.
-- The deployment preserves Rust/LLVM's speed-optimized Wasm. Binaryen 120
-  `wasm-opt -O3` and `-Oz` were both measured and rejected because they slowed
-  the 192-bit sieve by roughly 50%.
+Notable performance work includes:
 
-## Browser demo
+- target-fitted SIQS polynomials and Gray-code root updates;
+- translated, sorted roots and a paired root-difference stride loop;
+- byte logarithmic scores with word-at-a-time candidate rejection;
+- multiply-shift-gated survivor division;
+- single/double-large-prime relation combination;
+- deterministic low-weight sparse matrix elimination;
+- compact residual row-echelon solving;
+- scoped Wasm SIMD128 XOR acceleration;
+- two-family jobs and a measured 48-worker cap.
 
-`make docs` builds a self-contained WebAssembly demo into `docs/` for GitHub Pages
-(enable Pages on the `docs/` folder). It factors a number you type using the same
-crate compiled to `wasm32-unknown-unknown`, sieving in parallel across a pool of Web
-Workers, and renders the result in power
-notation. Modern browsers use the scoped `simd128` linear-algebra kernel; a portable
-scalar artifact is selected automatically on older engines. `make serve` previews it
-locally at <http://localhost:8000/>.
+Whole-program Wasm SIMD and Binaryen `wasm-opt -O3`/`-Oz` are not used because
+they regressed the measured sieve.
+
+## Command-line interface
+
+`qs-factor` reads one unsigned decimal integer from standard input and prints
+the sorted prime factors, including repetitions, one per stdout line:
+
+```sh
+printf '%s\n' 360 | qs-factor --threads auto --progress auto
+```
+
+Progress and elapsed time are written only to stderr, keeping stdout
+machine-readable. The factorization of one succeeds with no factor lines; zero
+and malformed input are errors.
 
 ## RSA challenge proof-of-work
 
 The balanced-semiprime SIQS path is the performance-critical deployment target
-for sign-in proof-of-work. Server-generated challenges should use similarly
-sized random primes and enter the SIQS coordinator directly through the
-low-level engine/Worker API. The returned factor must be nontrivial, divide the
-challenge, and reconstruct the original challenge with its cofactor.
+for sign-in proof-of-work. Challenges must use fresh, similarly sized random
+primes, be bound to the intended session, expire, and be replay-protected. A
+returned factor must be nontrivial, divide the challenge, and reconstruct it
+with its cofactor.
 
-ECM is not currently part of this path. If ECM is added for unbalanced,
-general-purpose composites, the project policy is:
+Proof-of-work is resource pricing, not authentication. Retain the normal
+authentication mechanism, and never use a modulus belonging to a real RSA key.
 
-1. ECM is opt-in behind a non-default feature and a separate general-purpose
-   Wasm artifact.
-2. The balanced-RSA artifact contains no ECM code or initialization.
-3. The fixed 192/224/256-bit corpus is an A/B regression gate for native time,
-   browser time, Wasm size, and module startup.
+ECM is not part of the 0.2 default path. If added later, it must be opt-in
+behind a non-default feature and shipped in a separate general-purpose Wasm
+artifact. The balanced-RSA artifact must contain no ECM code or initialization;
+the fixed 192/224/256-bit corpus remains an A/B gate for runtime, download size,
+compilation, startup, and code-cache footprint.
 
-This separation is intentional: merely skipping ECM at runtime would still let
-its additional Wasm download and compilation cost slow a sign-in challenge.
+## Scope and limitations
 
-Proof-of-work is resource pricing, not authentication. Bind each challenge to
-the intended session, expire it, reject replay, and retain the normal
-authentication mechanism. Never use a modulus belonging to a real RSA key.
+The current pipeline combines trial division, Pollard–Brent rho, primality and
+perfect-power checks, and SIQS. It is strongest on balanced semiprimes.
+Unbalanced 192–256-bit composites with medium-size factors remain the main
+general-factorization gap because ECM is absent.
 
-## Scope
+The current linear algebra uses structured sparse elimination followed by a
+compact row-echelon solve; it is not a true block-Lanczos recurrence. That
+becomes a future concern for matrices beyond the current practical range.
 
-The current pipeline combines trial division, Pollard-Brent rho, primality and
-perfect-power checks, and SIQS. It does not yet include ECM, so the fastest-class
-claim is specifically for balanced semiprimes. Unbalanced 192–256-bit composites
-with medium-size factors remain the main general-factorization gap.
+## Release builds
 
-Licensed under `Apache-2.0 OR MPL-2.0`; see `LICENSE-APACHE` and `LICENSE-MPL`.
+`build-release.sh` creates versioned archives for Linux GNU/musl, FreeBSD,
+Windows MSVC, Apple arm64, and WebAssembly:
+
+```sh
+SDKROOT=../MacOSX15.4.sdk ./build-release.sh
+```
+
+It uses cross-rs for Linux and FreeBSD, xwin for MSVC, cargo-zigbuild for Apple,
+and native Cargo for Wasm. Native archives contain the target-appropriate
+libraries, CLI, C header, pkg-config metadata, licenses, changelog, and an
+elevation-aware installer. The Wasm archive contains the deployable frontend
+and both scalar and SIMD128 modules.
+
+Pass target triples as arguments to build a subset. Run
+`./build-release.sh --help` for the supported list and environment overrides.
+
+## License
+
+Licensed under `Apache-2.0 OR MPL-2.0`; see [LICENSE-APACHE](LICENSE-APACHE) and
+[LICENSE-MPL](LICENSE-MPL).

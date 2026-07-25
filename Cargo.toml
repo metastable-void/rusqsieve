@@ -2,9 +2,33 @@
 name = "rusqsieve"
 version = "0.2.0"
 edition = "2024"
-description = "The frontier of pure-Rust Quadratic Sieve integer factorization, portable to WASM (wasm32-unknown-unknown)."
+description = "High-performance SIQS integer factorization for native Rust and WebAssembly"
 license = "Apache-2.0 OR MPL-2.0"
 authors = ["metastable-void"]
+repository = "https://github.com/metastable-void/rusqsieve"
+homepage = "https://github.com/metastable-void/rusqsieve"
+documentation = "https://docs.rs/rusqsieve"
+readme = "README.md"
+keywords = ["factorization", "quadratic-sieve", "number-theory", "wasm", "rsa"]
+categories = ["algorithms", "mathematics", "command-line-utilities", "wasm"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/web/**",
+    "/tools/**",
+    "/release/**",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/BENCHMARKING.md",
+    "/SPEC.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MPL",
+    "/Makefile",
+    "/build-release.sh",
+    "/rusqsieve.h",
+    "/rusqsieve.pc.in",
+]
 
 [lib]
 crate-type = ["rlib", "cdylib", "staticlib"]

@@ -1,651 +1,157 @@
-# Quadratic Sieve Rust Crate — Complete Implementation Specification
+# rusqsieve 0.2 implementation specification
 
-## 1. Purpose
+This document specifies the supported behavior and current architecture of
+rusqsieve 0.2. It describes the implementation that is shipped, not an
+aspirational module layout or a compatibility promise for private internals.
 
-Implement a production-quality Rust crate named `rusqsieve` that factors positive integers using a highly optimized, portable, parallelized Self-Initializing Quadratic Sieve (SIQS) implementation.
+Normative requirements use **must**. Descriptions of tuning and implementation
+strategy document the 0.2 release and may change in later compatible releases
+when observable behavior is preserved.
 
-The crate must provide:
+## 1. Purpose and scope
 
-1. A fixed-capacity custom unsigned big-integer type optimized for factorization workloads.
-2. A high-level blocking factorization API on supported native targets.
-3. A scheduler-independent low-level API for parallel sieving and sparse linear algebra over `F_2`.
-4. A raw `wasm32-unknown-unknown` C ABI with no `wasm-bindgen` dependency.
-5. Independent JavaScript glue that creates Web Workers and executes Rust worker kernels concurrently.
-6. A native CLI that reads one positive decimal integer from standard input and prints prime factors, including repetitions, one per line.
-7. A structured progress-reporting system covering factor-base construction, relation collection, matrix processing, and linear algebra.
+rusqsieve is a high-performance integer-factorization package written in Rust.
+Its performance-critical workload is a balanced, RSA-style semiprime between
+192 and 256 bits. It supports:
 
-The implementation must be contained in one Cargo package and one Rust library crate. Platform-specific behavior must be selected with `cfg` gates.
+- a safe native Rust API;
+- an opaque decimal-string C API on Unix and Windows;
+- a native command-line program;
+- a raw `wasm32-unknown-unknown` module;
+- a browser frontend that distributes SIQS polynomial families across
+  independent Web Workers without shared memory.
 
-The result is intended to be implementation-ready, benchmarkable, testable, and suitable for later architecture-specific optimization.
+The factorization pipeline combines trial division, probable-prime testing,
+perfect-power detection, Pollard–Brent rho, and a self-initializing quadratic
+sieve (SIQS).
 
----
+The following are explicitly outside the 0.2 scope:
 
-## 2. Scope and expectations
+- ECM and the General Number Field Sieve;
+- constant-time or side-channel-resistant arithmetic;
+- factoring hard semiprimes near the `Natural` storage limit;
+- a public Rust API for relations, matrices, scheduler state, or worker
+  packets;
+- a stable ABI for Rust types;
+- Rust threads, shared Wasm memory, or `SharedArrayBuffer` on
+  `wasm32-unknown-unknown`.
 
-### 2.1 Required factorization strategy
+The absence of ECM is intentional for the balanced-semiprime proof-of-work
+artifact. Any future ECM implementation must be opt-in and must not add runtime,
+download, compilation, initialization, or code-cache cost to the default
+balanced-RSA path.
 
-Use SIQS as the main large-composite factorization algorithm.
+## 2. Release and compatibility boundaries
 
-The high-level factorization pipeline must also include inexpensive preprocessing:
+### 2.1 Supported public interfaces
 
-- validation of the input;
-- trial division by embedded small primes;
-- probable-prime testing using Miller–Rabin;
-- perfect-square and perfect-power detection;
-- optional bounded Pollard rho for composites with an easily discoverable factor;
-- recursive factorization until every returned factor passes the configured probable-prime test.
+The supported interfaces in 0.2 are:
 
-### 2.2 Practical range
+1. the items re-exported from `src/lib.rs`;
+2. the five functions and opaque type declared in `rusqsieve.h`;
+3. the `qs-factor` command-line behavior documented below;
+4. the Wasm exports used by `web/abi.js`, `web/index.js`, and `web/worker.js`.
 
-The default `Natural<16>` stores up to 1024 bits. This is a capacity limit, not a claim that arbitrary 1024-bit semiprimes are practically factorable with SIQS.
+Everything else in `src/` is private implementation detail even when an
+internal item uses Rust's `pub` visibility inside its private module.
 
-The implementation must not artificially restrict SIQS to a fixed decimal-digit range, but parameter heuristics, resource limits, and documentation must make clear that SIQS is not intended to replace the Number Field Sieve for very large hard semiprimes.
+Minor 0.2 releases may retune parameters, change internal representations, add
+non-exhaustive error/progress variants, or replace private algorithms. They
+must not expose invalid relation, matrix, pointer, or scheduler states through
+the safe Rust API.
 
-### 2.3 Non-goals for the initial implementation
+### 2.2 Targets
 
-The initial implementation does not need:
-
-- General Number Field Sieve.
-- ECM.
-- Tokio or any asynchronous Rust runtime.
-- `wasm-bindgen`.
-- Rust-native multithreading inside `wasm32-unknown-unknown`.
-- Shared WebAssembly memory or `SharedArrayBuffer` support.
-- Arbitrary-precision signed integers as a public type.
-- Stable ABI compatibility across unrelated crate major versions.
-- Constant-time cryptographic behavior.
-
----
-
-## 3. Package and target structure
-
-Use one Cargo package with one library target and one CLI binary target.
-
-Recommended layout:
+The safe blocking Rust API and C ABI are built on Unix and Windows. The raw
+browser ABI is built only for:
 
 ```text
-rusqsieve/
-├── Cargo.toml
-├── README.md
-├── LICENSE-APACHE
-├── LICENSE-MPL
-├── benches/
-│   ├── natural.rs
-│   ├── sieve.rs
-│   └── linear_algebra.rs
-├── js/
-│   ├── index.js
-│   ├── coordinator.js
-│   ├── worker.js
-│   └── protocol.js
-├── src/
-│   ├── lib.rs
-│   ├── progress.rs
-│   ├── primality.rs
-│   ├── factors.rs
-│   ├── natural/
-│   │   ├── mod.rs
-│   │   ├── add_sub.rs
-│   │   ├── mul.rs
-│   │   ├── div.rs
-│   │   ├── gcd.rs
-│   │   ├── sqrt.rs
-│   │   ├── modular.rs
-│   │   ├── parse.rs
-│   │   └── format.rs
-│   ├── factor/
-│   │   ├── mod.rs
-│   │   ├── config.rs
-│   │   ├── coordinator.rs
-│   │   ├── preprocessing.rs
-│   │   ├── recursive.rs
-│   │   └── state.rs
-│   ├── qs/
-│   │   ├── mod.rs
-│   │   ├── config.rs
-│   │   ├── parameters.rs
-│   │   ├── multiplier.rs
-│   │   ├── factor_base.rs
-│   │   ├── polynomial.rs
-│   │   ├── sieve.rs
-│   │   ├── relation.rs
-│   │   ├── partials.rs
-│   │   ├── matrix.rs
-│   │   └── extract.rs
-│   ├── f2/
-│   │   ├── mod.rs
-│   │   ├── dense.rs
-│   │   ├── sparse.rs
-│   │   ├── filter.rs
-│   │   ├── provenance.rs
-│   │   └── block_lanczos.rs
-│   ├── work/
-│   │   ├── mod.rs
-│   │   ├── job.rs
-│   │   ├── result.rs
-│   │   ├── context.rs
-│   │   └── kernel.rs
-│   ├── native/
-│   │   ├── mod.rs
-│   │   ├── pool.rs
-│   │   └── driver.rs
-│   ├── wasm/
-│   │   ├── mod.rs
-│   │   ├── abi.rs
-│   │   ├── handles.rs
-│   │   └── wire.rs
-│   ├── arch/
-│   │   ├── mod.rs
-│   │   ├── portable.rs
-│   │   ├── x86_64.rs
-│   │   ├── aarch64.rs
-│   │   └── wasm32.rs
-│   └── bin/
-│       └── qs-factor.rs
-└── tests/
-    ├── natural_properties.rs
-    ├── primality.rs
-    ├── relations.rs
-    ├── matrix.rs
-    ├── factorization.rs
-    ├── determinism.rs
-    └── cli.rs
+wasm32-unknown-unknown
 ```
 
-### 3.1 Cargo configuration
+The release builder supports:
 
-Use Rust edition 2024.
+```text
+x86_64-unknown-linux-gnu
+x86_64-unknown-linux-musl
+aarch64-unknown-linux-musl
+aarch64-unknown-linux-gnu
+x86_64-unknown-freebsd
+x86_64-pc-windows-msvc
+aarch64-apple-darwin
+wasm32-unknown-unknown
+```
 
-The library must emit both `rlib` and `cdylib`:
+The musl archives contain the CLI and static library. Other native archives
+contain the CLI, static library, shared library, header, pkg-config metadata,
+and an installer. The Wasm archive contains scalar and SIMD128 modules plus the
+deployable browser frontend.
+
+## 3. Package structure
+
+rusqsieve is one Cargo package with one library and one optional CLI:
+
+```text
+src/
+├── lib.rs              public Rust surface and target selection
+├── native.rs           safe blocking native driver
+├── capi.rs             native C ownership/pointer boundary
+├── engine.rs           optimized SIQS engine and portable jobs
+├── qs/mod.rs           reference SIQS types and relation invariants
+├── f2/mod.rs           sparse filtering and dependency solving
+├── natural/mod.rs      fixed-capacity unsigned arithmetic
+├── smallfactor.rs      cached small primes and u64 Pollard–Brent
+├── primality.rs        probable-prime testing
+├── factor.rs           recursive policy and internal session types
+├── factors.rs          owned factor result
+├── progress.rs         public progress vocabulary
+├── work/mod.rs         private portable work packets
+├── wasm.rs             raw Wasm ABI and handle registries
+└── bin/qs-factor.rs    native CLI
+```
+
+The library emits:
 
 ```toml
-[lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 ```
 
-The CLI must be gated behind a feature:
+The default Cargo feature enables the CLI. The `wasm-simd128` feature enables
+only the scoped SIMD128 linear-algebra kernel. The `limit-to-512-bits` feature
+changes the default `Natural`/engine capacity from 16 to 8 limbs. The remaining
+features are internal development or portability switches and do not widen the
+supported public API.
 
-```toml
-[features]
-default = ["cli"]
-cli = []
-relation-checks = []
-arch-optimized = []
-wasm-simd128 = []
-reference-qs = []
-```
+## 4. Public Rust API
 
-```toml
-[[bin]]
-name = "qs-factor"
-path = "src/bin/qs-factor.rs"
-required-features = ["cli"]
-```
+### 4.1 Exported surface
 
-Recommended profiles:
-
-```toml
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-
-[profile.bench]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-```
-
-Native build:
-
-```sh
-cargo build --release
-```
-
-WebAssembly build:
-
-```sh
-cargo build \
-  --release \
-  --target wasm32-unknown-unknown \
-  --lib \
-  --no-default-features
-```
-
-### 3.2 Conditional compilation
-
-Use the following target groups:
-
-```rust
-#[cfg(any(unix, windows))]
-mod native;
-
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-mod wasm;
-```
-
-Do not use only `not(target_arch = "wasm32")` to define native support. The blocking threaded API should be exposed only on explicitly supported native OS families.
-
-The CLI source must contain:
-
-```rust
-#[cfg(target_arch = "wasm32")]
-compile_error!("the qs-factor CLI is unavailable on wasm32 targets");
-```
-
----
-
-## 4. Crate-level design principles
-
-1. The mathematical core must not create threads.
-2. Parallel work must be represented as deterministic bounded jobs.
-3. Native threads and Web Workers must execute the same Rust kernels.
-4. The factorization coordinator must own global state and user-visible progress.
-5. Workers must return results and metrics, not mutate coordinator state.
-6. All cross-Wasm ABI data must be serialized; Rust layouts are not an ABI.
-7. Wrapping big-integer operators must never silently contaminate mathematical algorithms that require exact arithmetic.
-8. Every accepted QS relation must be verifiable through an explicit invariant.
-9. Every matrix dependency must be verified before factor extraction.
-10. Public APIs must be documented and designed for forward compatibility using `#[non_exhaustive]` where appropriate.
-
----
-
-## 5. Public crate API
-
-As of 0.2, the supported Rust API is intentionally narrow:
+The crate root exports only:
 
 ```rust
 pub use factor::{
-    FactorConfig,
-    FactorError,
-    Parallelism,
-    ProgressAction,
-    ResourceLimitKind,
+    FactorConfig, FactorError, Parallelism, ProgressAction, ResourceLimitKind,
 };
 pub use factors::PrimeFactors;
-pub use natural::{BufferTooSmall, CapacityError, Natural, ParseNaturalError};
-pub use progress::{
-    ProgressAmount,
-    ProgressPhase,
-    ProgressSnapshot,
-    ProgressTotal,
-    ProgressUnit,
+pub use natural::{
+    BufferTooSmall, CapacityError, Natural, ParseNaturalError,
 };
+pub use progress::{
+    ProgressAmount, ProgressPhase, ProgressSnapshot, ProgressTotal, ProgressUnit,
+};
+
 #[cfg(any(unix, windows))]
 pub use native::{factor, factor_with, factor_with_progress};
 ```
 
-SIQS relations, factor bases, sparse matrices, work packets, engine sessions,
-and primality policy are crate-private. The WebAssembly C ABI uses those types
-only behind validated integer handles and serialized packets. They are not
-Rust layout or semantic compatibility commitments.
+It also exports the `natural!` compile-time decimal literal macro.
 
----
+All public items must have rustdoc. The crate enforces this with
+`#![deny(missing_docs)]`.
 
-## 6. `Natural` fixed-capacity big integer
+### 4.2 Blocking factorization
 
-### 6.1 Representation
-
-```rust
-#[repr(transparent)]
-#[derive(Clone, Eq, PartialEq, Hash)]
-pub struct Natural<const PARTS_64: usize = 16> {
-    parts: [u64; PARTS_64],
-}
-```
-
-Representation rules:
-
-- Limb order is little-endian.
-- `parts[0]` is the least-significant limb.
-- Capacity is exactly `PARTS_64 * 64` bits.
-- Unused high limbs must be zero.
-- The type represents unsigned integers only.
-- `Natural` should not implement `Copy` by default. Explicit cloning avoids accidental copying of large values.
-
-### 6.2 Constants and basic access
-
-```rust
-impl<const P: usize> Natural<P> {
-    pub const BITS: usize = P * 64;
-    pub const ZERO: Self;
-    pub const ONE: Self;
-    pub const MAX: Self;
-
-    pub const fn from_u64(value: u64) -> Self;
-    pub const fn as_parts(&self) -> &[u64; P];
-    pub fn as_mut_parts(&mut self) -> &mut [u64; P];
-
-    pub fn is_zero(&self) -> bool;
-    pub fn is_one(&self) -> bool;
-    pub fn is_even(&self) -> bool;
-    pub fn is_odd(&self) -> bool;
-    pub fn bit_len(&self) -> usize;
-    pub fn trailing_zeros(&self) -> usize;
-    pub fn bit(&self, index: usize) -> bool;
-}
-```
-
-### 6.3 Parsing
-
-Provide a const-compatible decimal parser:
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ParseNaturalError {
-    Empty,
-    InvalidDigit { index: usize, byte: u8 },
-    Overflow,
-}
-```
-
-```rust
-impl<const P: usize> Natural<P> {
-    pub const fn from_decimal(value: &str) -> Result<Self, ParseNaturalError>;
-}
-```
-
-Implement `FromStr` by delegating to `from_decimal`:
-
-```rust
-impl<const P: usize> core::str::FromStr for Natural<P> {
-    type Err = ParseNaturalError;
-}
-```
-
-Parsing requirements:
-
-- Accept only ASCII decimal digits.
-- Reject empty strings.
-- Do not accept leading `+` or `-`.
-- Leading zeroes are allowed.
-- Overflow must be detected exactly.
-- Parsing must not allocate.
-
-### 6.4 Compile-time literal macro
-
-Export:
-
-```rust
-natural!("966680312498850986629904881784491804947363701071", 16)
-```
-
-Recommended implementation:
-
-```rust
-#[macro_export]
-macro_rules! natural {
-    ($value:literal, $parts:literal) => {{
-        const VALUE: $crate::Natural<$parts> =
-            match $crate::Natural::<$parts>::from_decimal($value) {
-                Ok(value) => value,
-                Err(_) => panic!("invalid or overflowing Natural literal"),
-            };
-        VALUE
-    }};
-}
-```
-
-Malformed or overflowing literals must fail at compile time.
-
-### 6.5 Formatting
-
-Implement:
-
-- `Display` as canonical decimal without leading zeroes.
-- `Debug` as a capacity-qualified hexadecimal representation.
-- `LowerHex` and `UpperHex`.
-
-Suggested `Debug` form:
-
-```text
-Natural<16>(0x1234abcd)
-```
-
-Decimal formatting should repeatedly divide a scratch copy by `10^19`, storing `u64` chunks.
-
-### 6.6 Byte conversion
-
-```rust
-pub fn from_be_bytes(bytes: &[u8]) -> Result<Self, CapacityError>;
-pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, CapacityError>;
-
-pub fn write_be_bytes(&self, out: &mut [u8]) -> Result<usize, BufferTooSmall>;
-pub fn write_le_bytes(&self, out: &mut [u8]) -> Result<usize, BufferTooSmall>;
-```
-
-Also provide fixed-width byte serialization if useful internally.
-
-### 6.7 Operator semantics
-
-Ordinary arithmetic operators use fixed-width wrapping semantics modulo `2^(64 * P)`:
-
-- `Add`, `AddAssign`
-- `Sub`, `SubAssign`
-- `Mul`, `MulAssign`
-- `BitAnd`, `BitAndAssign`
-- `BitOr`, `BitOrAssign`
-- `BitXor`, `BitXorAssign`
-- `Not`
-- `Shl`, `ShlAssign`
-- `Shr`, `ShrAssign`
-- `Div`, `DivAssign`
-- `Rem`, `RemAssign`
-
-Preferred operand implementations:
-
-```rust
-&Natural + &Natural -> Natural
-Natural += &Natural
-```
-
-Owned forms may delegate to borrowed forms.
-
-Division by zero must panic for operator traits, matching ordinary Rust integer operator behavior. Fallible methods must return `None` or a typed error.
-
-### 6.8 Exact and overflow-aware arithmetic
-
-Provide:
-
-```rust
-pub fn overflowing_add(&self, rhs: &Self) -> (Self, bool);
-pub fn overflowing_sub(&self, rhs: &Self) -> (Self, bool);
-pub fn overflowing_mul(&self, rhs: &Self) -> (Self, bool);
-
-pub fn checked_add(&self, rhs: &Self) -> Option<Self>;
-pub fn checked_sub(&self, rhs: &Self) -> Option<Self>;
-pub fn checked_mul(&self, rhs: &Self) -> Option<Self>;
-
-pub fn wrapping_add(&self, rhs: &Self) -> Self;
-pub fn wrapping_sub(&self, rhs: &Self) -> Self;
-pub fn wrapping_mul(&self, rhs: &Self) -> Self;
-```
-
-Mathematical algorithms must use checked, widening, or modular operations as appropriate. Do not rely on wrapping operator behavior internally where overflow would invalidate a proof or invariant.
-
-### 6.9 Widening multiplication
-
-Stable generic const expressions cannot be assumed for `[u64; 2 * P]`. Use:
-
-```rust
-#[derive(Clone, Eq, PartialEq)]
-pub struct WideNatural<const P: usize> {
-    low: [u64; P],
-    high: [u64; P],
-}
-```
-
-Provide:
-
-```rust
-pub fn widening_mul(&self, rhs: &Self) -> WideNatural<P>;
-pub fn widening_square(&self) -> WideNatural<P>;
-
-impl<const P: usize> WideNatural<P> {
-    pub fn low(&self) -> Natural<P>;
-    pub fn high(&self) -> Natural<P>;
-    pub fn overflowing_narrow(self) -> (Natural<P>, bool);
-}
-```
-
-### 6.10 Division and number-theoretic methods
-
-Provide:
-
-```rust
-pub fn div_rem(&self, divisor: &Self) -> Option<(Self, Self)>;
-pub fn div_rem_u64(&self, divisor: u64) -> Option<(Self, u64)>;
-
-pub fn gcd(&self, rhs: &Self) -> Self;
-pub fn extended_gcd(&self, rhs: &Self) -> ExtendedGcdResult<P>;
-
-pub fn sqrt_rem(&self) -> (Self, Self);
-pub fn floor_sqrt(&self) -> Self;
-pub fn ceil_sqrt(&self) -> Self;
-pub fn is_square(&self) -> bool;
-
-pub fn checked_pow_u32(&self, exponent: u32) -> Option<Self>;
-pub fn perfect_power(&self) -> Option<(Self, u32)>;
-```
-
-A signed internal type may be used privately for extended GCD coefficients, but it need not be public.
-
-### 6.11 Limb kernels
-
-Portable arithmetic primitives should be slice-oriented:
-
-```rust
-fn add_n(out: &mut [u64], a: &[u64], b: &[u64]) -> u64;
-fn sub_n(out: &mut [u64], a: &[u64], b: &[u64]) -> u64;
-fn add_word(out: &mut [u64], word: u64) -> u64;
-fn mul_word(out: &mut [u64], a: &[u64], word: u64) -> u64;
-fn mul_schoolbook(out: &mut [u64], a: &[u64], b: &[u64]);
-fn square_schoolbook(out: &mut [u64], a: &[u64]);
-fn shl_bits(out: &mut [u64], input: &[u64], shift: u32) -> u64;
-fn shr_bits(out: &mut [u64], input: &[u64], shift: u32) -> u64;
-```
-
-Use `u128` as the portable multiply-accumulate primitive.
-
-Begin with schoolbook multiplication, specialized squaring, and normalized long division. Add Karatsuba only after benchmarks show a benefit at relevant operand sizes.
-
-### 6.12 Modular arithmetic
-
-Use a reusable Montgomery context for odd moduli:
-
-```rust
-pub struct Montgomery<const P: usize> {
-    modulus: Natural<P>,
-    n0_inverse: u64,
-    r2: Natural<P>,
-    one: Natural<P>,
-}
-```
-
-Required operations:
-
-```rust
-impl<const P: usize> Montgomery<P> {
-    pub fn new(modulus: Natural<P>) -> Result<Self, MontgomeryError>;
-    pub fn encode(&self, value: &Natural<P>) -> Natural<P>;
-    pub fn decode(&self, value: &Natural<P>) -> Natural<P>;
-    pub fn mul(&self, lhs: &Natural<P>, rhs: &Natural<P>) -> Natural<P>;
-    pub fn square(&self, value: &Natural<P>) -> Natural<P>;
-    pub fn pow(&self, base: &Natural<P>, exponent: &Natural<P>) -> Natural<P>;
-    pub fn inv(&self, value: &Natural<P>) -> Option<Natural<P>>;
-}
-```
-
-Also provide specialized small-modulus functions for SIQS factor-base work:
-
-```rust
-pub fn jacobi_u64(a: u64, n: u64) -> i8;
-pub fn legendre_u32(n_mod_p: u32, p: u32) -> i8;
-pub fn tonelli_shanks_u32(n_mod_p: u32, p: u32) -> Option<u32>;
-```
-
----
-
-## 7. Primality testing
-
-### 7.1 API
-
-```rust
-#[derive(Clone, Debug)]
-pub struct PrimalityConfig {
-    pub rounds: NonZero<u32>,
-    pub witnesses: WitnessPolicy,
-}
-
-#[derive(Clone, Debug)]
-pub enum WitnessPolicy {
-    FirstPrimes,
-    Seeded { seed: [u8; 32] },
-}
-```
-
-```rust
-pub fn is_probable_prime<const P: usize>(
-    n: &Natural<P>,
-    config: &PrimalityConfig,
-) -> bool;
-```
-
-### 7.2 Requirements
-
-- Handle all values below 4 correctly.
-- Reject even composites immediately.
-- Perform trial division by a small fixed prime set first.
-- Use strong Miller–Rabin tests.
-- Witness generation must be reproducible with a configured seed.
-- Do not claim deterministic primality for arbitrary-width inputs unless a mathematically sufficient deterministic witness set is used for the exact range.
-- Documentation must use the term “probable prime.”
-
----
-
-## 8. Prime factor result type
-
-```rust
-pub struct PrimeFactors<const PARTS_64: usize = 16> {
-    map: BTreeMap<Natural<PARTS_64>, NonZero<usize>>,
-}
-```
-
-Required methods:
-
-```rust
-impl<const P: usize> PrimeFactors<P> {
-    pub fn new() -> Self;
-
-    pub fn iter(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (&Natural<P>, NonZero<usize>)>;
-
-    pub fn get(&self, prime: &Natural<P>) -> Option<NonZero<usize>>;
-    pub fn len(&self) -> usize;
-    pub fn is_empty(&self) -> bool;
-    pub fn into_map(self) -> BTreeMap<Natural<P>, NonZero<usize>>;
-    pub fn verify_product(&self, original: &Natural<P>) -> bool;
-}
-```
-
-Mutation should remain crate-private so these invariants hold:
-
-- every key is at least 2;
-- every exponent is nonzero;
-- every key passes the configured probable-prime policy;
-- the represented product equals the original input.
-
-The natural iteration order is ascending.
-
----
-
-## 9. High-level factorization API
-
-### 9.1 Native blocking API
-
-On `unix` and `windows`:
+On Unix and Windows:
 
 ```rust
 pub fn factor<const P: usize>(
@@ -666,2065 +172,536 @@ where
     F: FnMut(&ProgressSnapshot) -> ProgressAction;
 ```
 
-The API should consume `Natural` to avoid an unnecessary initial clone.
+Observable behavior:
 
-### 9.2 Configuration
+- zero returns `FactorError::ZeroHasNoPrimeFactorization`;
+- one succeeds with an empty `PrimeFactors`;
+- factors are sorted in ascending order;
+- multiplicities are preserved;
+- every returned factor has passed the implementation's probable-prime test;
+- the result can verify its product against the original input;
+- callback cancellation returns `FactorError::Cancelled`.
 
-```rust
-#[derive(Clone, Debug)]
-pub struct FactorConfig {
-    // private
-}
+The no-observer path must remain separately monomorphized so progress timing and
+callback machinery are compiled out of ordinary `factor` and `factor_with`
+calls.
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Parallelism {
-    Auto,
-    Threads(NonZeroUsize),
-}
-```
+### 4.3 Configuration
 
-`FactorConfig` exposes `parallelism`, `with_parallelism`,
-`progress_interval`, and `with_progress_interval`. `Parallelism::threads`
-constructs the nonzero explicit-count variant. Algorithm selection, primality
-rounds, random seeds, SIQS parameters, and memory structures remain private so
-the optimized implementation can evolve without expanding the stable API.
+`FactorConfig` is an owned, encapsulated configuration. In 0.2 its supported
+controls are:
 
-`Parallelism::Auto` resolves using `std::thread::available_parallelism()` on native targets.
+- `parallelism()` / `with_parallelism(...)`;
+- `progress_interval()` / `with_progress_interval(...)`.
 
-### 9.3 Resource limits
+Algorithm parameters, random seeds, primality witnesses, relation limits, and
+SIQS tuning remain private so the implementation can be improved without
+breaking callers.
 
-Resource budgets are implementation policy in 0.2. Exceeded limits are
-reported through the non-exhaustive `FactorError::ResourceLimit` and
-`ResourceLimitKind` types, but callers cannot create inconsistent combinations
-of partial internal limits. Cancellation is cooperatively requested by
-returning `ProgressAction::Cancel` from the progress callback.
+`Parallelism::Auto` detects available native parallelism when factorization
+begins. `Parallelism::Threads(NonZeroUsize)` requests a nonzero worker count.
+`Parallelism::threads(0)` returns `None`.
 
-### 9.4 Recursive pipeline
+### 4.4 Factor results
 
-The coordinator must implement this conceptual algorithm:
+`PrimeFactors<P>` owns a sorted map from factor to nonzero multiplicity. Its
+public operations provide:
 
-```text
-factor_node(n):
-    if n == 0: error
-    if n == 1: return
+- iteration over distinct `(factor, multiplicity)` pairs;
+- multiplicity lookup;
+- expanded iteration with repetitions;
+- distinct and total cardinality;
+- empty-result detection;
+- checked product verification.
 
-    divide out configured small primes
+Callers cannot construct or mutate the internal map directly.
 
-    if n == 1: return
-    if is_probable_prime(n): insert n; return
+### 4.5 Progress
 
-    if n is a perfect power a^k:
-        factor a recursively
-        multiply exponents by k
-        return
+`ProgressSnapshot` and `ProgressAmount` are read-only values. A snapshot exposes:
 
-    try bounded Pollard rho if enabled
+- a monotonically increasing revision;
+- the input bit length;
+- a non-exhaustive high-level phase;
+- phase-specific completed/total/unit counters.
 
-    if no factor found:
-        factor = SIQS(n)
+Totals distinguish exact, estimated, and unknown values. Estimated totals may
+change and fractions are informational. Progress callbacks run on the calling
+thread, must not run while worker locks are held, and should return quickly.
 
-    recursively factor factor
-    recursively factor n / factor
-```
+Returning `ProgressAction::Cancel` is cooperative. During parallel sieving the
+driver sets a shared atomic cancellation flag, stops queueing jobs, asks workers
+to abandon queued work, joins them, and returns `FactorError::Cancelled`.
 
-Returned factors must be sorted by `Natural` order through `BTreeMap`.
+## 5. `Natural`
 
----
+`Natural<const P: usize>` is a `repr(transparent)`, inline, fixed-capacity
+unsigned integer containing `P` little-endian `u64` limbs.
 
-## 10. Internal factorization session and scheduler coordination
+The default capacity is:
 
-This section describes crate-private machinery, not supported Rust API.
+- `Natural<16>` / 1024 bits normally;
+- `Natural<8>` / 512 bits with `limit-to-512-bits`.
 
-### 10.1 Session type
+This is a storage limit, not a practical factorization claim. NFS is appropriate
+for hard composites substantially beyond this project's SIQS range.
 
-```rust
-pub(crate) struct FactorSession<const P: usize = 16> {
-    // private coordinator state
-}
-```
+Public behavior:
 
-Internal API:
+- decimal parsing accepts ASCII digits and leading zeroes;
+- signs, whitespace, separators, and empty input are rejected;
+- overflow is reported exactly;
+- big- and little-endian decoding reject nonzero excess bytes;
+- serialization writes the shortest unsigned encoding, with zero represented by
+  zero bytes;
+- arithmetic operators wrap modulo `2^(64P)`;
+- `checked_add`, `checked_sub`, and `checked_mul` report overflow;
+- division by zero is represented by `None` in `div_rem`;
+- formatting is canonical unsigned decimal;
+- `natural!` rejects malformed or overflowing literals at compile time.
 
-```rust
-impl<const P: usize> FactorSession<P> {
-    pub fn new(
-        input: Natural<P>,
-        config: FactorConfig,
-    ) -> Result<Self, FactorError>;
+The public type exposes no mutable limb slice. Internal arithmetic uses
+significant-limb-aware operations, widening multiplication, normalized limb
+division, binary GCD, and modular helpers. Mathematical code must use checked,
+widening, or modular operations wherever wrapping would invalidate an
+invariant.
 
-    pub fn phase(&self) -> SessionPhase;
-    pub fn progress(&self) -> &ProgressSnapshot;
-    pub fn progress_revision(&self) -> u64;
+## 6. Native factorization pipeline
 
-    pub fn advance_local(
-        &mut self,
-        budget: LocalWorkBudget,
-    ) -> Result<AdvanceOutcome, FactorError>;
+The optimized blocking engine performs:
 
-    pub fn take_jobs(
-        &mut self,
-        maximum: usize,
-    ) -> Result<Vec<WorkJob>, FactorError>;
+1. reject zero;
+2. divide by cached primes through 10,000;
+3. use deterministic machine-word primality and Pollard–Brent for cofactors
+   fitting `u64`;
+4. run probable-prime testing on larger cofactors;
+5. detect perfect powers and recursively factor the base;
+6. run SIQS to recover a nontrivial divisor;
+7. recursively factor divisor and cofactor;
+8. sort the complete factor list.
 
-    pub fn submit(
-        &mut self,
-        result: WorkResult,
-    ) -> Result<SubmitOutcome, FactorError>;
+For input capacities at or below the compiled engine width, the high-level API
+converts into the optimized engine without changing the value. Wider
+user-selected capacities retain a private reference fallback. This distinction
+is not a separate public API.
 
-    pub fn is_finished(&self) -> bool;
+The implementation is deterministic for a fixed version, input, configuration,
+and relevant tuning environment. Parallel workers do not choose random
+polynomials. Relation results are merged by family number rather than arrival
+order.
 
-    pub fn take_factors(
-        self,
-    ) -> Result<PrimeFactors<P>, FactorError>;
-}
-```
+## 7. SIQS engine
 
-### 10.2 Session phases
+### 7.1 Parameters and multiplier
 
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SessionPhase {
-    Preprocessing,
-    BuildingFactorBase,
-    RelationCollection,
-    CombiningRelations,
-    MatrixConstruction,
-    MatrixFiltering,
-    MatrixSolving,
-    FactorExtraction,
-    PrimalityTesting,
-    Complete,
-    Failed,
-}
-```
+Bit-size tiers in `qs::parameters::engine_params` select the factor-base bound,
+sieve half-width, and large-prime allowance. Environment overrides are
+development tuning aids and are not stable public configuration.
 
-### 10.3 Bounded local work
+The engine chooses a deterministic Knuth–Schroeppel multiplier `k` and sieves
+against `kN`. Extraction still computes GCDs against `N`; because `kN` is zero
+modulo `N`, the square congruence remains valid for factoring `N`.
 
-Coordinator-only phases must be incremental:
+### 7.2 Factor base
 
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct LocalWorkBudget {
-    pub factor_base_candidates: usize,
-    pub relations_to_combine: usize,
-    pub matrix_items: usize,
-    pub elimination_steps: usize,
-    pub primality_steps: usize,
-}
-```
+The factor base contains 2, primes dividing the multiplier where applicable,
+and odd primes for which the sieved value is a quadratic residue. Modular
+square roots are computed with Tonelli–Shanks. Each entry stores the prime,
+root, and rounded logarithmic weight.
 
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdvanceOutcome {
-    Progressed,
-    NeedsWorkers,
-    Complete,
-}
-```
+Lemire fast-mod constants and `interval mod p` are precomputed once per engine
+context. They eliminate hardware division from candidate root tests and
+per-polynomial root translation.
 
-The WebAssembly coordinator must be able to yield back to JavaScript frequently. No local coordinator method should perform an unbounded multi-second task without returning.
+### 7.3 Polynomial families
 
----
-
-## 11. Progress reporting
-
-### 11.1 Principles
-
-- Progress state is owned by `FactorSession`.
-- Worker threads and Web Workers return metrics with results.
-- Only the coordinator updates `ProgressSnapshot`.
-- Frontends decide when and how to render progress.
-- Progress snapshots must contain counters, not preformatted strings.
-- Exact, estimated, and unknown totals must be distinguished.
-- Phase transitions must always increment the revision.
-
-### 11.2 Snapshot
-
-```rust
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct ProgressSnapshot {
-    pub revision: u64,
-    pub task_id: u64,
-    pub input_bits: usize,
-    pub phase: ProgressPhase,
-    pub amount: ProgressAmount,
-    pub detail: ProgressDetail,
-}
-```
-
-### 11.3 Generic progress amount
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProgressAmount {
-    pub completed: u64,
-    pub total: ProgressTotal,
-    pub unit: ProgressUnit,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProgressTotal {
-    Exact(u64),
-    Estimated(u64),
-    Unknown,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProgressUnit {
-    Candidates,
-    Primes,
-    Polynomials,
-    SievePositions,
-    Relations,
-    MatrixRows,
-    MatrixColumns,
-    MatrixNonzeros,
-    Iterations,
-    MatrixProducts,
-    Tasks,
-}
-```
-
-`fraction()` must return `None` for unknown or zero totals. It must not clamp values above 1.0 when an estimate is exceeded.
-
-### 11.4 Progress phases
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ProgressPhase {
-    Preprocessing,
-    BuildingFactorBase,
-    Sieving,
-    CombiningRelations,
-    BuildingMatrix,
-    FilteringMatrix,
-    LinearAlgebra,
-    ExtractingFactor,
-    PrimalityTesting,
-    Complete,
-}
-```
-
-### 11.5 Factor-base progress
-
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct FactorBaseProgress {
-    pub bound: u32,
-    pub searched_through: u32,
-    pub primes_tested: u64,
-    pub primes_accepted: u64,
-    pub nonresidue_primes: u64,
-}
-```
-
-Primary meter:
+Each deterministic family selects a numerically target-fitted squarefree `A`
+from factor-base primes. `B` is represented as the smaller signed CRT
+coefficient and satisfies:
 
 ```text
-completed = searched_through
-total = Exact(bound)
-unit = Candidates
+B² ≡ kN (mod A)
 ```
 
-### 11.6 Sieving progress
+Related `B` values are visited in Gray-code order. Per-prime
+`2 B_j A⁻¹ mod p` increments are precomputed, so roots advance with one modular
+add/subtract per prime. Roots remain sorted and are represented directly as
+score-array positions.
 
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct SievingProgress {
-    pub polynomial_families_completed: u64,
-    pub polynomials_completed: u64,
-    pub sieve_positions_processed: u64,
-    pub candidates_tested: u64,
+### 7.4 Logarithmic sieve
 
-    pub full_relations: u64,
-    pub single_large_prime_relations: u64,
-    pub double_large_prime_relations: u64,
-    pub usable_relations: u64,
-    pub target_relations: u64,
+Workers reuse score, root, increment, candidate, and blocked-sieve buffers across
+polynomials.
 
-    pub active_workers: usize,
-    pub outstanding_jobs: usize,
-}
-```
+The sieve uses byte scores and:
 
-Primary meter:
+1. initializes scores with the threshold bias;
+2. skips selected very small primes and accounts for them with threshold slack;
+3. adds rounded `log2(p)` weights at both sorted modular roots;
+4. uses the paired root-difference stride loop;
+5. uses a cache-blocked carried-position loop only at intervals where it wins;
+6. scans score words with a high-bit test before scalar candidate extraction;
+7. factors only surviving positions.
+
+For each survivor, `g(x) = Q(x)/A` is reconstructed directly as a signed value.
+Candidate division is gated by a precomputed multiply-shift residue test and
+stops when confirmed factor weights account for the stored sieve score.
+
+### 7.5 Relations and large primes
+
+An accepted relation represents:
 
 ```text
-completed = usable_relations
-total = Estimated(target_relations)
-unit = Relations
+t² ≡ (-1)^sign × product(p_i ^ e_i) × large_parts (mod N)
 ```
 
-The target may increase after filtering or rank analysis.
+where `t = Ax + B` reduced modulo `N`.
 
-### 11.7 Relation-combination progress
+Full relations have no large-prime cofactor. Partial relations may carry one or
+two probable-prime large factors according to the bit-size policy. The
+coordinator treats partials as edges in a large-prime graph. A cycle combines
+relations only when every large-prime exponent cancels to even parity; the
+corresponding square-root factors are retained for extraction.
 
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct RelationProgress {
-    pub partial_relations_examined: u64,
-    pub partial_relations_total: u64,
-    pub graph_vertices: u64,
-    pub graph_edges: u64,
-    pub cycles_found: u64,
-    pub combined_relations: u64,
-}
-```
+The relation collector buffers out-of-order families and merges them in
+ascending family order. Native workers and Web Workers execute the same
+`sieve_family` kernel through different schedulers.
 
-### 11.8 Matrix progress
+## 8. Linear algebra and extraction
 
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct MatrixProgress {
-    pub stage: MatrixStage,
+Matrix columns correspond to combined relations. Rows correspond to the sign
+and factor-base-prime exponent parities.
 
-    pub original_rows: u64,
-    pub original_columns: u64,
-    pub original_nonzeros: u64,
+The 0.2 solver is:
 
-    pub current_rows: u64,
-    pub current_columns: u64,
-    pub current_nonzeros: u64,
+1. sparse structured elimination, including singleton removal and deterministic
+   low-weight row elimination through weight six;
+2. exact provenance tracking back to original relation columns;
+3. a compact row-echelon solve on the residual matrix;
+4. expansion of at most 64 useful dependencies;
+5. verification of every expanded dependency against the original parity
+   matrix.
 
-    pub items_processed: u64,
-    pub items_total: Option<u64>,
+Despite retained internal naming, 0.2 does **not** implement a Montgomery
+block-Lanczos recurrence. Documentation and performance planning must call the
+current residual solver compact dense Gaussian/row-echelon elimination.
 
-    pub singleton_rows_removed: u64,
-    pub duplicate_columns_removed: u64,
-    pub structured_eliminations: u64,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MatrixStage {
-    CountingParities,
-    ConstructingCsr,
-    ConstructingCsc,
-    RemovingSingletons,
-    RemovingDuplicates,
-    StructuredElimination,
-    Finalizing,
-}
-```
-
-### 11.9 Linear-algebra progress
-
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct LinearAlgebraProgress {
-    pub solver: LinearAlgebraSolver,
-    pub stage: LinearAlgebraStage,
-
-    pub matrix_rows: u64,
-    pub matrix_columns: u64,
-    pub matrix_nonzeros: u64,
-
-    pub iteration: u64,
-    pub estimated_iterations: Option<u64>,
-
-    pub matrix_products_completed: u64,
-    pub matrix_products_estimated: Option<u64>,
-
-    pub dependencies_found: u32,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LinearAlgebraSolver {
-    DenseGaussian,
-    BlockLanczos,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LinearAlgebraStage {
-    Initializing,
-    Iterating,
-    RecoveringDependencies,
-    VerifyingDependencies,
-    Complete,
-}
-```
-
-### 11.10 Progress detail enum
-
-```rust
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub enum ProgressDetail {
-    None,
-    FactorBase(FactorBaseProgress),
-    Sieving(SievingProgress),
-    Relations(RelationProgress),
-    Matrix(MatrixProgress),
-    LinearAlgebra(LinearAlgebraProgress),
-    Complete(CompleteProgress),
-}
-```
-
-### 11.11 Native observer contract
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProgressAction {
-    Continue,
-    Cancel,
-}
-```
-
-The observer:
-
-- runs only on the caller/coordinator thread;
-- is never invoked by worker threads;
-- is never invoked while an internal mutex is held;
-- is invoked immediately on phase changes;
-- is throttled for repeated same-phase updates;
-- receives one final `Complete` snapshot before success;
-- can cancel by returning `ProgressAction::Cancel`.
-
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct ProgressReportingConfig {
-    pub minimum_interval: Duration,
-}
-```
-
-A 100 ms default is appropriate on native targets.
-
-Portable snapshots must not contain `Instant` or wall-clock timestamps. Frontends calculate rates and ETAs.
-
----
-
-## 12. SIQS design
-
-### 12.1 Configuration
-
-```rust
-#[derive(Clone, Debug)]
-pub struct QsConfig {
-    pub multiplier: MultiplierChoice,
-    pub factor_base_bound: AutoOr<u32>,
-    pub sieve_half_width: AutoOr<u32>,
-    pub polynomial_batch_size: u32,
-    pub large_primes: LargePrimeConfig,
-    pub relation_surplus: RelationSurplus,
-    pub sieve_score_scale: u8,
-    pub candidate_slack: u8,
-    pub matrix: MatrixConfig,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug)]
-pub enum AutoOr<T> {
-    Auto,
-    Value(T),
-}
-```
-
-```rust
-#[derive(Clone, Debug)]
-pub struct LargePrimeConfig {
-    pub single_limit: AutoOr<u64>,
-    pub double_product_limit: AutoOr<u64>,
-    pub enable_double: bool,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct RelationSurplus {
-    pub absolute: usize,
-    pub percent: u8,
-}
-```
-
-Parameter heuristics must live in a versioned module such as `qs/parameters.rs`, not be scattered throughout the implementation.
-
-### 12.2 Multiplier selection
-
-Implement a small multiplier search that scores candidate square-free multipliers using:
-
-- resulting residue properties modulo small primes;
-- expected factor-base density;
-- bit-length growth penalty;
-- special handling of powers of two.
-
-If a candidate multiplier shares a nontrivial GCD with `n`, return that GCD immediately as a factor.
-
-### 12.3 Factor base
-
-Do not use a fixed prime table as the complete factor base.
-
-Requirements:
-
-- Embed a compact small-prime table for trial division and bootstrap prime generation.
-- Dynamically generate primes up to the selected factor-base bound.
-- For each odd prime `p`:
-  - if `n mod p == 0`, return `p` as a factor;
-  - otherwise retain `p` only if the working value is a quadratic residue modulo `p`;
-  - compute and store a modular square root.
-- Handle `p = 2` separately.
-
-```rust
-pub struct FactorBaseEntry {
-    pub prime: u32,
-    pub log_prime: u8,
-    pub sqrt_n: u32,
-}
-```
-
-```rust
-pub struct FactorBase {
-    entries: Box<[FactorBaseEntry]>,
-}
-```
-
-Factor-base construction must be incremental:
-
-```rust
-pub struct FactorBaseBuilder<const P: usize> {
-    // private state
-}
-```
-
-```rust
-impl<const P: usize> FactorBaseBuilder<P> {
-    pub fn new(
-        n: Natural<P>,
-        bound: u32,
-    ) -> Result<Self, FactorBaseError>;
-
-    pub fn step(
-        &mut self,
-        candidate_budget: usize,
-    ) -> Result<FactorBaseBuildStatus, FactorBaseError>;
-
-    pub fn progress(&self) -> FactorBaseProgress;
-    pub fn finish(self) -> Result<FactorBase, FactorBaseError>;
-}
-```
-
-### 12.4 SIQS context
-
-```rust
-pub struct SieveContext<const P: usize> {
-    pub(crate) n: Natural<P>,
-    pub(crate) working_n: Natural<P>,
-    pub(crate) multiplier: u32,
-    pub(crate) factor_base: FactorBase,
-    pub(crate) polynomial_plan: PolynomialPlan,
-    pub(crate) config: QsConfig,
-    pub(crate) context_id: u64,
-}
-```
-
-Preparation API:
-
-```rust
-pub fn prepare_siqs<const P: usize>(
-    n: &Natural<P>,
-    config: &QsConfig,
-) -> Result<SieveContext<P>, QsError>;
-```
-
-### 12.5 Polynomial generation
-
-Use SIQS polynomial families. Polynomial identifiers must deterministically derive all coefficients from:
-
-- input;
-- factor base;
-- configured seed;
-- family number;
-- polynomial index.
-
-Workers must not make independent random choices.
-
-The polynomial representation must support efficient root updates between related polynomials.
-
-### 12.6 Sieving
-
-Use a byte score array:
-
-```rust
-pub struct SieveScratch {
-    scores: Vec<u8>,
-    candidates: Vec<u32>,
-    factor_scratch: Vec<(u32, u16)>,
-    bucket_storage: Vec<BucketEntry>,
-}
-```
-
-For each polynomial:
-
-1. Initialize or approximate `log |Q(x)|` scores.
-2. Add scaled `log(p)` at both modular roots.
-3. Include selected prime-power contributions where profitable.
-4. Use direct stepping for small factor-base primes.
-5. Use bucket sieving for large-stride primes.
-6. Scan candidates above a configurable threshold.
-7. Trial-divide candidate values.
-8. Classify full, single-large-prime, and double-large-prime relations.
-9. Emit metrics and relations.
-
-Do not begin with handwritten SIMD. First implement a correct scalar path with data layouts friendly to auto-vectorization. Add target-specific optimizations only behind dispatch after benchmarks identify real hot spots.
-
-### 12.7 Relation invariant
-
-```rust
-pub struct RawRelation<const P: usize> {
-    pub square_root: Natural<P>,
-    pub sign: bool,
-    pub factors: Box<[PrimePower]>,
-    pub large_primes: LargePrimePart,
-    pub source: RelationSource,
-}
-```
-
-```rust
-pub struct PrimePower {
-    pub factor_base_index: u32,
-    pub exponent: u16,
-}
-```
-
-```rust
-pub enum LargePrimePart {
-    None,
-    One(u64),
-    Two(u64, u64),
-}
-```
-
-Every relation must satisfy:
+For a verified dependency, extraction constructs:
 
 ```text
-square_root^2 congruent to
-    (-1)^sign
-    * product(factor_base[index]^exponent)
-    * product(large_primes)
-mod n
+x = product(relation roots) mod N
+y = square root of the combined factor-base and large-prime product mod N
 ```
 
-Provide:
-
-```rust
-pub fn verify_relation<const P: usize>(
-    context: &SieveContext<P>,
-    relation: &RawRelation<P>,
-) -> bool;
-```
-
-Enable verification in tests and under the `relation-checks` feature.
-
-### 12.8 Large-prime relation combination
-
-Use a graph:
-
-- vertices are large primes;
-- one-large-prime relations connect a distinguished root vertex to the prime;
-- two-large-prime relations connect their two primes;
-- cycles create combinations in which every large-prime exponent is even.
-
-Preserve provenance rather than immediately multiplying all values.
-
-```rust
-pub struct CombinedRelation {
-    pub sources: Box<[RelationId]>,
-    pub parity: SparseParity,
-}
-```
-
-Resource-limit graph growth and partial-relation retention.
-
-### 12.9 Relation collection stopping rule
-
-The collection target must be based on:
-
-- matrix row count;
-- configured absolute and percentage surplus;
-- observed filtering losses;
-- any rank deficiencies found later.
-
-If filtering or linear algebra reveals insufficient independent relations, the session must return to relation collection with a higher estimated target and a new work generation.
-
----
-
-## 13. Parallel work-unit API
-
-### 13.1 Job identity
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct JobHeader {
-    pub job_id: u64,
-    pub generation: u64,
-    pub context_id: u64,
-}
-```
-
-- `job_id` uniquely identifies a job within the session.
-- `generation` identifies the current scheduling generation.
-- `context_id` identifies the immutable worker context.
-- Late results from obsolete generations must be ignored safely.
-
-### 13.2 Jobs
-
-```rust
-#[derive(Clone, Debug)]
-pub enum WorkJob {
-    Sieve(SieveJob),
-    MatrixMultiply(MatrixMultiplyJob),
-}
-```
-
-```rust
-#[derive(Clone, Debug)]
-pub struct SieveJob {
-    pub header: JobHeader,
-    pub family: u64,
-    pub first_polynomial: u32,
-    pub polynomial_count: u32,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MatrixOperation {
-    Matrix,
-    Transpose,
-}
-```
-
-```rust
-#[derive(Clone, Debug)]
-pub struct MatrixMultiplyJob {
-    pub header: JobHeader,
-    pub operation: MatrixOperation,
-    pub output_start: u32,
-    pub output_end: u32,
-    pub input: Box<[u64]>,
-}
-```
-
-### 13.3 Results and metrics
-
-```rust
-#[derive(Debug)]
-pub enum WorkResult {
-    Sieve(SieveResult),
-    MatrixMultiply(MatrixMultiplyResult),
-    Failed(WorkFailure),
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SieveJobMetrics {
-    pub polynomial_families: u64,
-    pub polynomials: u64,
-    pub sieve_positions: u64,
-    pub candidates_tested: u64,
-    pub full_relations: u64,
-    pub single_large_prime_relations: u64,
-    pub double_large_prime_relations: u64,
-}
-```
-
-```rust
-pub struct SieveResult<const P: usize = 16> {
-    pub header: JobHeader,
-    pub relations: Vec<RawRelation<P>>,
-    pub metrics: SieveJobMetrics,
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MatrixJobMetrics {
-    pub output_items: u64,
-    pub nonzeros_visited: u64,
-}
-```
-
-```rust
-pub struct MatrixMultiplyResult {
-    pub header: JobHeader,
-    pub output_start: u32,
-    pub words: Box<[u64]>,
-    pub metrics: MatrixJobMetrics,
-}
-```
-
-### 13.4 Worker kernel
-
-```rust
-pub struct WorkerScratch {
-    pub sieve: SieveScratch,
-    pub matrix: MatrixScratch,
-    pub arithmetic: ArithmeticScratch,
-}
-```
-
-```rust
-pub fn execute_job<const P: usize>(
-    contexts: &KernelContexts<P>,
-    job: WorkJob,
-    scratch: &mut WorkerScratch,
-) -> Result<WorkResult, KernelError>;
-```
-
-Native worker threads and Wasm worker exports must call this function or its direct sub-kernels.
-
----
-
-## 14. Native parallel driver
-
-### 14.1 Thread pool
-
-Create long-lived worker threads once per factorization call or session driver.
-
-Do not spawn a thread for each polynomial batch or matrix multiplication.
-
-```rust
-struct NativePool {
-    workers: Vec<Worker>,
-    command_tx: Sender<WorkerCommand>,
-    result_rx: Receiver<WorkResult>,
-    outstanding: usize,
-}
-```
-
-Each worker owns `WorkerScratch` and reuses allocated memory.
-
-### 14.2 Driver loop
-
-The blocking driver must:
-
-1. Create the session.
-2. Resolve parallelism.
-3. Create the worker pool.
-4. Run bounded local coordinator work.
-5. Drain completed results before blocking.
-6. Request jobs up to available worker capacity.
-7. Dispatch jobs.
-8. Submit results to the session.
-9. Render or publish progress on the coordinator thread.
-10. Stop workers and return factors or an error.
-
-Callbacks must never run while holding pool or session locks.
-
-### 14.3 Cancellation
-
-Cancellation may come from:
-
-- `ProgressAction::Cancel`;
-- resource-limit exhaustion;
-- a native deadline implemented by the driver;
-- explicit future session APIs.
-
-When cancelled:
-
-- stop creating jobs;
-- signal workers to stop after the current bounded job;
-- drain or discard late results;
-- return `FactorError::Cancelled`.
-
----
-
-## 15. Sparse linear algebra over `F_2`
-
-### 15.1 Matrix definition
-
-Rows:
-
-- row 0 represents the sign `-1`;
-- one row per factor-base prime.
-
-Columns:
-
-- one per usable full or combined relation.
-
-A matrix bit is 1 when the corresponding exponent is odd.
-
-### 15.2 Storage
-
-```rust
-pub struct SparseBinaryMatrix {
-    rows: u32,
-    columns: u32,
-
-    csr_offsets: Box<[u32]>,
-    csr_columns: Box<[u32]>,
-
-    csc_offsets: Box<[u32]>,
-    csc_rows: Box<[u32]>,
-
-    provenance: Box<[CombinationId]>,
-}
-```
-
-Maintain both CSR and CSC forms to support efficient `M*x` and `M^T*x` kernels.
-
-Validate index sizes before converting from `usize` to `u32`.
-
-### 15.3 Filtering
-
-Perform, at minimum:
-
-1. Remove zero columns.
-2. Repeatedly remove singleton rows and their only columns.
-3. Remove duplicate columns.
-4. Optionally perform bounded structured elimination on low-weight rows.
-5. Preserve provenance for every transformed column.
-
-Use a provenance DAG:
-
-```rust
-enum CombinationNode {
-    Raw(RelationId),
-    Xor(CombinationId, CombinationId),
-}
-```
-
-Do not store a full original-relation bit vector for every intermediate column.
-
-### 15.4 Block vectors
-
-Represent 64 parallel binary vectors with one `u64` per matrix position:
-
-```rust
-pub struct F2BlockVector {
-    words: Box<[u64]>,
-}
-```
-
-### 15.5 Sparse multiplication
-
-```rust
-impl SparseBinaryMatrix {
-    pub fn mul_m_rows(
-        &self,
-        input_by_column: &[u64],
-        row_range: Range<usize>,
-        output_by_row: &mut [u64],
-    );
-
-    pub fn mul_mt_columns(
-        &self,
-        input_by_row: &[u64],
-        column_range: Range<usize>,
-        output_by_column: &mut [u64],
-    );
-}
-```
-
-Partition by disjoint output ranges. Workers must not need atomics for output accumulation.
-
-### 15.6 Solvers
-
-```rust
-#[derive(Clone, Copy, Debug)]
-pub enum MatrixSolver {
-    Auto,
-    DenseGaussian,
-    BlockLanczos,
-}
-```
-
-Dense Gaussian elimination is required for:
-
-- small matrices;
-- tests;
-- reference behavior;
-- debugging block Lanczos.
-
-Production sparse matrices should use block Lanczos.
-
-### 15.7 Block Lanczos state machine
-
-```rust
-pub struct BlockLanczos {
-    // private state
-}
-```
-
-```rust
-pub enum LanczosRequest<'a> {
-    MultiplyM { input: &'a [u64] },
-    MultiplyMt { input: &'a [u64] },
-    Complete,
-}
-```
-
-```rust
-impl BlockLanczos {
-    pub fn begin(matrix: &SparseBinaryMatrix) -> Self;
-    pub fn request(&self) -> LanczosRequest<'_>;
-
-    pub fn submit_product(
-        &mut self,
-        product: &[u64],
-    ) -> Result<LanczosProgress, LinearAlgebraError>;
-
-    pub fn dependencies(&self) -> Option<&DependencySet>;
-}
-```
-
-Implement a published, mathematically sound block-Lanczos recurrence. Do not invent an informal variation.
-
-Every returned dependency must be checked by multiplying it through the original parity matrix.
-
-### 15.8 Factor extraction
-
-For each verified dependency:
-
-1. Reconstruct the selected original relations through provenance.
-2. Compute the congruence of squares.
-3. Form `x` and `y` modulo `n`.
-4. Try `gcd(|x-y|, n)` and `gcd(x+y, n)`.
-5. Reject trivial factors 1 and `n`.
-6. Continue with more dependencies if necessary.
-
-Use exact or modular arithmetic that cannot silently wrap incorrectly.
-
----
-
-## 16. WebAssembly architecture
-
-### 16.1 General model
-
-The portable baseline uses independent Wasm instances:
-
-```text
-main page
-  └── coordinator worker
-        ├── compute worker 0
-        ├── compute worker 1
-        ├── ...
-        └── compute worker N
-```
-
-Each compute worker:
-
-- instantiates the same `.wasm` module;
-- has independent linear memory;
-- imports an immutable phase context;
-- receives serialized jobs;
-- executes the common Rust kernel;
-- returns serialized results.
-
-The coordinator worker:
-
-- owns `FactorSession<16>`;
-- performs bounded local work;
-- exports worker contexts;
-- schedules jobs;
-- merges results;
-- publishes progress;
-- returns factors.
-
-### 16.2 Wasm capacity
-
-The raw ABI uses one concrete type:
-
-```rust
-pub(crate) const WASM_PARTS_64: usize = 16;
-pub(crate) type WasmNatural = Natural<WASM_PARTS_64>;
-```
-
-The Rust library API remains generic.
-
-### 16.3 No Rust threads on Wasm
-
-Do not call `std::thread::spawn` on `wasm32-unknown-unknown`.
-
-JavaScript creates Web Workers and selects concurrency using:
-
-```javascript
-const parallelism = Math.max(
-  1,
-  Math.min(
-    options.parallelism ?? Number.MAX_SAFE_INTEGER,
-    navigator.hardwareConcurrency || 1,
-  ),
+It tries `gcd(|x-y|, N)` and `gcd(x+y, N)` and accepts only a factor strictly
+between one and `N`.
+
+## 9. Native scheduling
+
+The native engine creates persistent worker threads for a factor attempt and
+uses bounded channels of deterministic polynomial-family identifiers.
+
+Small inputs cap the effective worker count to avoid startup overhead. The
+automatic C path caps detected parallelism at 48. The browser similarly caps
+its Web Worker pool at 48 based on measured scaling on the reference host.
+
+The coordinator:
+
+- owns relation and matrix state;
+- keeps at most a bounded multiple of the worker count in flight;
+- merges families deterministically;
+- stops dispatching once the relation target is met;
+- joins every worker before returning;
+- never calls user progress code from worker threads.
+
+## 10. C API and ABI
+
+The native C ABI is declared by `rusqsieve.h`. It uses `size_t` and
+NUL-terminated decimal strings:
+
+```c
+typedef struct rusqsieve_factors rusqsieve_factors;
+
+rusqsieve_factors *rusqsieve_factors_new(void);
+void rusqsieve_factors_free(rusqsieve_factors *factors);
+size_t rusqsieve_factors_len(const rusqsieve_factors *factors);
+const char *rusqsieve_factors_get(
+    const rusqsieve_factors *factors,
+    size_t index
+);
+int rusqsieve_factor(
+    const char *n,
+    size_t threads,
+    rusqsieve_factors *factors
 );
 ```
 
-Treat this value as a hint and allow an explicit cap.
+Ownership and lifetime rules:
 
-### 16.4 Raw ABI requirements
+- only the constructor creates a result object;
+- every non-null result must be freed exactly once;
+- freeing null is allowed;
+- returned factor strings are borrowed and must not be freed;
+- strings remain valid until the next factorization into that result or its
+  destruction;
+- factorization clears the previous result before reporting success or failure;
+- the implementation copies `n` before clearing, so a borrowed factor may be
+  reused as the next input on the same result;
+- operations on the same result must not overlap across threads;
+- independent result objects may be used concurrently;
+- unwinding builds catch Rust panics inside `rusqsieve_factor` and map them to
+  `RUSQSIEVE_INTERNAL_ERROR`; the release profile uses `panic = "abort"`, so
+  internal invariants must be defended before the ABI call can reach them.
 
-- Use only `extern "C"` exports.
-- Use Rust 2024 `#[unsafe(no_mangle)]` syntax.
-- Use `u32`, `i32`, and carefully documented `u64` values.
-- Do not expose Rust structs, slices, `Vec`, `BTreeMap`, or enum layouts.
-- Use opaque handles and serialized packets.
-- Validate every pointer, length, handle, version, and index.
-- Never trust JavaScript-provided memory ranges.
+`threads == 0` uses available parallelism capped at 48. Positive values request
+that worker count, subject to internal small-input caps.
 
-### 16.5 Memory and buffers
-
-Required exports:
-
-```rust
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_abi_version() -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_alloc(size: u32, align: u32) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_dealloc(
-    pointer: u32,
-    size: u32,
-    align: u32,
-);
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_buffer_pointer(handle: u32) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_buffer_length(handle: u32) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_buffer_free(handle: u32);
-```
-
-After an export that may grow Wasm memory, JavaScript must recreate typed-array views before reading data.
-
-### 16.6 Session ABI
-
-```rust
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_new(
-    input_pointer: u32,
-    input_length: u32,
-    config_pointer: u32,
-    config_length: u32,
-) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_free(session: u32);
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_phase(session: u32) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_advance_local(
-    session: u32,
-    budget_pointer: u32,
-    budget_length: u32,
-) -> i32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_export_context(session: u32) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_take_jobs(
-    session: u32,
-    maximum_jobs: u32,
-) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_submit(
-    session: u32,
-    result_pointer: u32,
-    result_length: u32,
-) -> i32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_take_factors(session: u32) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_error(session: u32) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_progress(session: u32) -> u32;
-```
-
-A returned `u32` is an object or buffer handle unless explicitly documented otherwise.
-
-### 16.7 Worker ABI
-
-```rust
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_worker_context_import(
-    pointer: u32,
-    length: u32,
-) -> u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_worker_context_free(context: u32);
-
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_worker_execute(
-    context: u32,
-    job_pointer: u32,
-    job_length: u32,
-) -> u32;
-```
-
-The worker ABI must only decode, validate, dispatch, serialize, and return. It must contain no independent factorization policy.
-
-### 16.8 Handle registry
-
-Use generation-checked handles.
-
-```rust
-struct Slot<T> {
-    generation: u16,
-    value: Option<T>,
-}
-```
-
-Pack generation and slot index into `u32` where practical. Keep typed registries for sessions, contexts, and buffers to prevent type confusion.
-
-### 16.9 Wire format
-
-Every packet begins with:
-
-```rust
-#[repr(C)]
-struct PacketHeader {
-    magic: [u8; 4],
-    kind: u16,
-    version: u16,
-    payload_length: u32,
-}
-```
-
-Use magic `b"QSV1"` for ABI version 1.
-
-Rules:
-
-- all multibyte fields are little-endian;
-- no unaligned Rust pointer casting;
-- decode field by field;
-- validate payload length and offset arithmetic;
-- reject unknown mandatory enum values;
-- allow forward-compatible optional trailing data only when version rules explicitly permit it;
-- define maximum packet sizes.
-
-### 16.10 JavaScript API
-
-`js/index.js` should expose a high-level function:
-
-```javascript
-export async function factor(input, options = {})
-```
-
-Accepted input should include decimal strings and byte arrays.
-
-Return a structured result preserving multiplicity, for example:
-
-```javascript
-{
-  factors: ["2", "2", "3", "5"],
-  grouped: [
-    { prime: "2", exponent: 2 },
-    { prime: "3", exponent: 1 },
-    { prime: "5", exponent: 1 },
-  ],
-}
-```
-
-Support:
-
-- `options.parallelism`;
-- `options.onProgress(snapshot)`;
-- cancellation through `AbortSignal`;
-- resource-limit configuration;
-- deterministic seed configuration.
-
-The JS coordinator must call progress updates:
-
-- after bounded local work;
-- after each submitted worker result;
-- periodically while jobs are outstanding.
-
----
-
-## 17. CLI specification
-
-### 17.1 Behavior
-
-Binary name:
+The shared library must export only:
 
 ```text
-qs-factor
+rusqsieve_factor
+rusqsieve_factors_free
+rusqsieve_factors_get
+rusqsieve_factors_len
+rusqsieve_factors_new
 ```
 
-The CLI:
+## 11. WebAssembly architecture
 
-1. Reads all of standard input as UTF-8 text.
-2. Trims surrounding whitespace.
-3. Requires exactly one unsigned decimal integer.
-4. Parses it as `Natural<16>`.
-5. Factors it using the native blocking API.
-6. Prints prime factors in ascending order, repeated according to multiplicity, one per line.
-7. Writes progress only to standard error.
-8. Writes errors only to standard error.
-9. Returns exit status 0 on success and nonzero on failure.
+### 11.1 Execution model
 
-Example:
+The browser frontend uses:
 
-Input:
+- one coordinator Wasm instance on the main thread;
+- one independent Wasm instance per Web Worker;
+- transferable serialized relation packets;
+- no shared Wasm memory and no atomics.
+
+Each worker rebuilds the immutable deterministic sieve context from the decimal
+input. The coordinator assigns disjoint family ranges, buffers results by family
+number, combines relations, runs linear algebra, and extracts a factor.
+
+JavaScript performs inexpensive recursive preprocessing with `BigInt`: trial
+division, Miller–Rabin, perfect powers, and bounded Pollard–Brent. Hard
+composites are sent to the Wasm SIQS coordinator.
+
+The production frontend is `web/`. The older `js/` prototype is not part of the
+published crate or release archives.
+
+### 11.2 Active raw ABI
+
+The browser frontend relies on:
 
 ```text
-360
+qs_abi_version
+qs_alloc
+qs_dealloc
+qs_buffer_pointer
+qs_buffer_length
+qs_buffer_free
+
+qs_worker_prepare
+qs_worker_sieve
+qs_worker_free
+
+qs_coord_new
+qs_coord_target
+qs_coord_relations
+qs_coord_submit
+qs_coord_extract
+qs_coord_free
 ```
 
-Output on stdout:
+Handles contain a slot and generation, so stale handles do not alias newly
+allocated objects. Incoming pointers and lengths are checked with checked
+arithmetic against current Wasm memory and a 16 MiB packet limit.
+
+Owned result packets use a `QSV1` envelope:
 
 ```text
-2
-2
-2
-3
-3
-5
+magic[4] = "QSV1"
+kind: u16 little-endian
+version: u16 little-endian
+payload_length: u32 little-endian
+payload[payload_length]
 ```
 
-### 17.2 Edge cases
+JavaScript must copy a payload before freeing its buffer handle and must recreate
+typed-array views after any export that can grow Wasm memory.
 
-- Input `0`: error and nonzero exit.
-- Input `1`: success with no stdout output.
-- Prime input: one line.
-- Prime power: repeated identical lines.
-- Leading and trailing whitespace: accepted.
-- Internal whitespace or multiple numbers: rejected.
-- `+123`, `-123`, and `1_000`: rejected.
-- Values above 1024 bits: rejected with a clear message.
+`qs_coord_extract` returns one engine-validated nontrivial factor as a
+fixed-width little-endian `Natural` payload. The browser recursively factors the
+two parts and verifies the complete product before presenting success.
 
-### 17.3 Progress mode
+### 11.3 SIMD selection
 
-Support:
+Release packaging builds:
 
-```text
---progress auto|always|never
-```
+- a scalar module with no default features;
+- a module with `-C target-feature=+simd128` and `wasm-simd128`.
 
-Default: `auto`.
+The frontend attempts to compile the SIMD module first and falls back to scalar.
+SIMD is intentionally scoped to the XOR-heavy row-reduction kernel. Applying
+whole-program Wasm SIMD or Binaryen post-optimization has measured regressions
+and is not part of the release pipeline.
 
-- `auto`: show progress only if stderr is a terminal.
-- `always`: always show progress.
-- `never`: never show progress.
+## 12. CLI
 
-Use `std::io::IsTerminal`.
+`qs-factor` is available with the default `cli` feature on native targets.
 
-Do not require a heavy CLI parsing dependency unless justified. A small manual parser is acceptable.
+It:
 
-### 17.4 Progress rendering
+- reads one unsigned decimal integer from standard input;
+- accepts `--threads auto|N`;
+- accepts `--progress auto|always|never`;
+- prints prime factors in ascending order, one per stdout line, including
+  repetitions;
+- writes progress and elapsed time only to stderr;
+- rejects zero, malformed input, unknown options, and multiple input tokens;
+- prints nothing for the successful factorization of one;
+- returns a nonzero exit status on failure.
 
-Progress output must remain on stderr so stdout is machine-readable.
+Stdout must remain machine-readable.
 
-Suggested forms:
+## 13. Build, installation, and release packaging
 
-```text
-building factor base  [================>----------]  62.4%
-                      31,842 primes tested, 15,911 accepted
-```
-
-```text
-sieving               [=============>-------------]  9,421/~15,250 relations
-                      48,192 polynomials, 3,811 partials, 16 workers
-```
-
-```text
-linear algebra        [=========>-----------------]  iteration 118/~275
-                      14,208 x 15,463, 1,184,992 nonzeros
-```
-
-For unknown totals, use a spinner and counters rather than a fake percentage.
-
-The CLI may calculate elapsed time, throughput, and ETA from snapshot deltas, but these values do not belong in the portable core snapshot.
-
-### 17.5 Terminal hygiene
-
-- Avoid progress control sequences when stderr is not a terminal unless `always` is selected.
-- Finish or clear the current progress line before printing an error.
-- Finish progress rendering before printing factors.
-- Handle broken pipe on stdout gracefully where practical.
-
----
-
-## 18. Errors
-
-```rust
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum FactorError {
-    ZeroHasNoPrimeFactorization,
-    CapacityExceeded,
-    ResourceLimit(ResourceLimitKind),
-    NoNontrivialFactor,
-    InsufficientRelations,
-    LinearAlgebra(LinearAlgebraError),
-    InvalidRelation,
-    InvalidDependency,
-    Cancelled,
-    Stalled,
-    InternalInvariant(&'static str),
-}
-```
-
-All public error types should implement `Display` and `std::error::Error` when `std` is available.
-
-Use typed errors for parsing, arithmetic capacity, SIQS setup, worker decoding, matrix construction, and ABI validation.
-
-Do not use panics for ordinary malformed input, resource exhaustion, or unlucky factorization failure.
-
-Panics are reserved for internal programming errors and operator semantics such as division by zero.
-
----
-
-## 19. Architecture-specific optimization
-
-### 19.1 Portable baseline
-
-The complete crate must work correctly without architecture-specific features.
-
-### 19.2 Dispatch structure
-
-```rust
-mod arch {
-    mod portable;
-
-    #[cfg(all(feature = "arch-optimized", target_arch = "x86_64"))]
-    mod x86_64;
-
-    #[cfg(all(feature = "arch-optimized", target_arch = "aarch64"))]
-    mod aarch64;
-
-    #[cfg(all(feature = "wasm-simd128", target_arch = "wasm32"))]
-    mod wasm32;
-}
-```
-
-### 19.3 Candidate optimizations
-
-Only implement after profiling:
-
-- x86-64 BMI2/ADX Montgomery multiplication;
-- AVX2 or AVX-512 XOR and score scanning;
-- AArch64 carry-chain and NEON kernels;
-- Wasm `simd128` score scanning and XOR;
-- cache-blocked sparse matrix traversal;
-- improved bucket-sieve layouts;
-- prefetching for sparse products.
-
-Every optimized path must have randomized differential tests against the portable implementation.
-
-Runtime feature detection is required where one native binary supports multiple CPU generations.
-
----
-
-## 20. Determinism
-
-With identical:
-
-- input;
-- configuration;
-- seed;
-- parallelism-independent job generation policy;
-
-The implementation should produce deterministic mathematical results and deterministic job contents.
-
-Relation arrival order may vary under parallel execution. Therefore:
-
-- assign deterministic relation IDs at coordinator acceptance time or canonicalize relation ordering before matrix construction;
-- sort or canonicalize partial-relation graph inputs where needed;
-- ensure tests do not depend on nondeterministic thread completion order;
-- ensure returned prime factors are always ordered through `BTreeMap`.
-
-The exact progress timing need not be deterministic.
-
----
-
-## 21. Memory management
-
-### 21.1 Reuse
-
-- Reuse sieve arrays per worker.
-- Reuse candidate buffers.
-- Reuse arithmetic scratch buffers.
-- Reuse block-Lanczos vectors.
-- Avoid per-prime heap allocation.
-- Batch relation submissions to reduce synchronization overhead.
-
-### 21.2 Limits
-
-Before large allocations:
-
-- compute sizes with checked arithmetic;
-- enforce configured memory limits;
-- reject matrix dimensions exceeding index representation;
-- avoid attempting allocations that obviously exceed addressable Wasm memory.
-
-### 21.3 Relation storage
-
-Store parity sparsely and full exponents compactly. Avoid storing redundant large `Natural` values when a relation can be represented by polynomial identity plus a modular square-root contribution.
-
-Preserve enough information to reconstruct the congruence of squares exactly.
-
----
-
-## 22. Testing requirements
-
-### 22.1 `Natural`
-
-Test:
-
-- exhaustive `Natural<1>` arithmetic against `u64` where feasible;
-- randomized `Natural<2>` through `Natural<8>` against `num-bigint` in dev-dependencies;
-- carry and borrow chains;
-- all-`u64::MAX` limbs;
-- multiplication and squaring;
-- normalized division edge cases;
-- decimal round trips;
-- byte-order round trips;
-- shifts around 0, 63, 64, capacity-1, capacity, and above capacity;
-- GCD and extended GCD identities;
-- square root and remainder;
-- perfect-power detection;
-- Montgomery multiplication and exponentiation;
-- exact overflow flags.
-
-`num-bigint` may be a dev-dependency only and must not be used by the production implementation.
-
-### 22.2 Primality
-
-Test:
-
-- values 0 through a large small range against a simple sieve;
-- primes and composites near limb boundaries;
-- Carmichael numbers;
-- strong pseudoprimes to early bases;
-- deterministic seeded witness generation;
-- known large primes and composites.
-
-### 22.3 Relations
-
-For every generated test relation, verify the relation invariant modulo `n`.
-
-Create deterministic fixtures containing:
-
-- `n`;
-- multiplier;
-- factor base;
-- polynomial identifier;
-- coefficients;
-- modular roots;
-- candidate positions;
-- factorizations;
-- emitted relations.
-
-Native and Wasm worker kernels should produce byte-identical serialized results for the same fixture where architecture-independent serialization is expected.
-
-### 22.4 Partial relation graph
-
-Test:
-
-- one-large-prime pairing;
-- double-large-prime cycles;
-- duplicate edges;
-- disconnected components;
-- cycle provenance;
-- resource limits;
-- deterministic combination results.
-
-### 22.5 Matrix
-
-Generate random sparse matrices and verify:
-
-```text
-M * dependency = 0
-```
-
-Compare dense Gaussian and block Lanczos on small matrices.
-
-Include pathological matrices:
-
-- zero rows;
-- zero columns;
-- duplicate columns;
-- all singleton rows;
-- rank zero;
-- rank one;
-- rectangular matrices;
-- dimensions 63, 64, and 65;
-- extremely sparse rows;
-- dense small matrices.
-
-### 22.6 End-to-end factorization
-
-Test:
-
-- prime inputs;
-- products of two similarly sized primes;
-- highly unbalanced semiprimes;
-- repeated prime powers;
-- perfect squares;
-- Carmichael numbers;
-- numbers with many tiny factors;
-- values near capacity boundaries;
-- `0`, `1`, and `2`;
-- deterministic results across parallelism settings.
-
-For every success:
-
-1. Verify every returned factor is probable prime under the configured policy.
-2. Multiply factors with exponents using checked/widening arithmetic.
-3. Verify exact equality with the original input.
-
-### 22.7 Progress tests
-
-Test:
-
-- revision monotonically increases;
-- phase transitions occur in valid order;
-- exact totals are never contradicted;
-- estimated totals may be raised;
-- stale job results do not affect progress;
-- cancellation through observer works;
-- completion snapshot is emitted exactly once;
-- callbacks execute only on the coordinator thread.
-
-### 22.8 CLI tests
-
-Integration tests must cover:
-
-- factorization of 360;
-- prime input;
-- input 1;
-- input 0;
-- invalid characters;
-- multiple numbers;
-- overflow;
-- progress disabled when redirected in auto mode;
-- progress never contaminates stdout;
-- `--progress never` and `--progress always`.
-
-### 22.9 Wasm tests
-
-Provide browser or Node-compatible tests for:
-
-- ABI version;
-- allocation and buffer lifetime;
-- invalid handles;
-- stale handles;
-- malformed packets;
-- session creation;
-- context import;
-- worker execution;
-- progress packet decoding;
-- multi-worker factorization;
-- cancellation;
-- deterministic result grouping.
-
----
-
-## 23. Benchmarks
-
-Add benchmarks for:
-
-### 23.1 Arithmetic
-
-- addition and subtraction by limb count;
-- schoolbook multiplication;
-- squaring;
-- division;
-- Montgomery multiplication;
-- modular exponentiation;
-- GCD.
-
-### 23.2 SIQS
-
-- factor-base construction;
-- root generation;
-- direct sieve stepping;
-- bucket sieve;
-- candidate scanning;
-- candidate trial division;
-- relation serialization.
-
-### 23.3 Linear algebra
-
-- CSR `M*x`;
-- CSC `M^T*x`;
-- filtering;
-- dense elimination;
-- block-Lanczos iteration.
-
-### 23.4 End-to-end
-
-Use a curated set of composites with increasing difficulty. Record:
-
-- total time;
-- relation collection time;
-- matrix time;
-- memory use where measurable;
-- scaling from 1 to available cores.
-
-Benchmarks must not become correctness tests with fragile timing assertions.
-
----
-
-## 24. Documentation
-
-The crate documentation and README must include:
-
-- what SIQS is;
-- practical limitations;
-- the distinction between storage capacity and feasible factorization size;
-- native usage;
-- progress callback usage;
-- CLI usage;
-- raw Wasm build instructions;
-- JS worker usage;
-- deterministic seed behavior;
-- probable-prime semantics;
-- low-level scheduler API;
-- safety and resource-limit notes.
-
-Every public item must have rustdoc.
-
-Include at least these examples:
-
-### 24.1 Native factorization
-
-```rust
-use rusqsieve::{factor, Natural};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let n: Natural<16> =
-        "966680312498850986629904881784491804947363701071".parse()?;
-
-    let factors = factor(n)?;
-
-    for (prime, exponent) in factors.iter() {
-        println!("{prime}^{exponent}");
-    }
-
-    Ok(())
-}
-```
-
-### 24.2 Progress observer
-
-```rust
-use rusqsieve::{
-    factor_with_progress,
-    FactorConfig,
-    Natural,
-    ProgressAction,
-};
-
-let n: Natural<16> = "360".parse()?;
-
-let factors = factor_with_progress(
-    n,
-    FactorConfig::default(),
-    |snapshot| {
-        eprintln!("{:?}: {:?}", snapshot.phase, snapshot.amount);
-        ProgressAction::Continue
-    },
-)?;
-```
-
-### 24.3 Compile-time literal
-
-```rust
-use rusqsieve::{natural, Natural};
-
-const RSA_160: Natural<16> = natural!(
-    "966680312498850986629904881784491804947363701071",
-    16
-);
-```
-
----
-
-## 25. Safety requirements
-
-- Use `#![forbid(unsafe_op_in_unsafe_fn)]`.
-- Keep unsafe code isolated in small architecture or ABI modules.
-- Document every unsafe block with a concrete safety argument.
-- No unsafe code is needed for portable arithmetic.
-- Wasm pointer validation must use checked arithmetic and memory bounds.
-- Architecture-specific intrinsics must be gated by compile-time or runtime feature checks.
-- Do not use `transmute` for wire decoding.
-- Do not create references from untrusted Wasm pointers until bounds and alignment are validated.
-
----
-
-## 26. Code-quality requirements
-
-- Format with `rustfmt`.
-- Pass `cargo clippy --all-targets --all-features` with no unjustified warnings.
-- Avoid giant functions; separate policy, math kernels, scheduling, and serialization.
-- Use explicit typed state machines rather than boolean flag collections.
-- Avoid hidden global mutable state.
-- No random behavior without an explicit deterministic seed source.
-- No terminal or JS concerns inside mathematical modules.
-- No threading code inside SIQS or linear-algebra kernels.
-- No platform-specific code in public mathematical types.
-- Keep dependencies minimal and justified.
-
-Suggested production dependencies: ideally none initially. Development dependencies may include property-testing, benchmarking, and a reference bigint implementation.
-
----
-
-## 27. Implementation sequence
-
-Codex should implement in the following order and keep the crate compiling after each phase.
-
-### Phase 1: crate skeleton
-
-- Cargo configuration.
-- Module layout.
-- Public error and config stubs.
-- Native and Wasm cfg gates.
-- CLI target skeleton.
-
-Acceptance:
-
-- native `cargo check` passes;
-- Wasm `cargo check --target wasm32-unknown-unknown --lib --no-default-features` passes.
-
-### Phase 2: `Natural`
-
-- representation;
-- parsing;
-- formatting;
-- comparison;
-- bit operations;
-- add/subtract;
-- shifts;
-- widening multiply and square;
-- division;
-- GCD;
-- square root;
-- perfect powers;
-- Montgomery arithmetic.
-
-Acceptance:
-
-- property tests against reference bigint pass;
-- const literal macro works;
-- no production bigint dependency.
-
-### Phase 3: primality and result type
-
-- Miller–Rabin;
-- deterministic seeded witnesses;
-- `PrimeFactors`;
-- product verification.
-
-Acceptance:
-
-- pseudoprime and Carmichael tests pass.
-
-### Phase 4: high-level preprocessing
-
-- trial division;
-- perfect powers;
-- optional Pollard rho;
-- recursive factor tree;
-- session state machine skeleton;
-- progress snapshots.
-
-Acceptance:
-
-- easy composites factor without SIQS;
-- progress and cancellation tests pass.
-
-### Phase 5: reference QS
-
-Behind `reference-qs`:
-
-- simple polynomial QS;
-- full relations only;
-- dense elimination;
-- serial execution.
-
-Acceptance:
-
-- small semiprimes factor;
-- relations verify.
-
-### Phase 6: SIQS relation collection
-
-- multiplier selection;
-- dynamic factor base;
-- SIQS polynomial families;
-- logarithmic sieving;
-- deterministic sieve jobs;
-- single-large-prime support;
-- relation metrics.
-
-Acceptance:
-
-- serial SIQS factors moderate fixtures;
-- relation invariants pass.
-
-### Phase 7: native parallelism
-
-- persistent thread pool;
-- job scheduling;
-- reusable worker scratch;
-- coordinator-only progress callback;
-- cancellation.
-
-Acceptance:
-
-- factors are identical for parallelism 1 and N;
-- no callback executes on a worker thread;
-- speedup is measurable on suitable fixtures.
-
-### Phase 8: double-large-prime graph and matrix filtering
-
-- partial graph;
-- cycle extraction;
-- sparse parity matrix;
-- CSR and CSC;
-- singleton filtering;
-- duplicate removal;
-- provenance DAG.
-
-Acceptance:
-
-- combined relations verify;
-- filtered dependency reconstruction is correct.
-
-### Phase 9: block Lanczos
-
-- serial state machine;
-- dense oracle comparisons;
-- dependency verification;
-- factor extraction;
-- parallel sparse products.
-
-Acceptance:
-
-- random sparse matrix tests pass;
-- end-to-end SIQS succeeds with block Lanczos.
-
-### Phase 10: Wasm ABI and JS glue
-
-- raw ABI;
-- generation-checked handles;
-- packet codec;
-- coordinator session exports;
-- worker context and execution exports;
-- JS worker pool;
-- progress callback;
-- cancellation.
-
-Acceptance:
-
-- browser/Node integration tests factor the same fixtures as native;
-- malformed packets fail safely;
-- multi-worker execution works.
-
-### Phase 11: CLI
-
-- stdin parser;
-- factor output;
-- progress modes;
-- terminal rendering;
-- integration tests.
-
-Acceptance:
+Default native build:
 
 ```sh
-printf '360\n' | qs-factor --progress never
+make
 ```
 
-prints exactly:
+Equivalent Cargo build:
 
-```text
-2
-2
-2
-3
-3
-5
+```sh
+cargo build --release
 ```
 
-### Phase 12: optimization
+Native installation:
 
-- benchmark;
-- profile;
-- optimize demonstrated bottlenecks;
-- add optional architecture-specific paths;
-- retain portable differential tests.
+```sh
+sudo make install
+make install PREFIX=/usr DESTDIR="$staging_root"
+```
 
----
+`PREFIX`, `DESTDIR`, `BINDIR`, `LIBDIR`, `INCLUDEDIR`, and `PKGCONFIGDIR` are
+overridable.
 
-## 28. Final acceptance criteria
+Browser build and preview:
 
-The implementation is complete when all of the following hold:
+```sh
+make docs
+make serve
+```
 
-1. One Cargo package builds as an `rlib` on native and a raw `cdylib` Wasm module.
-2. Native builds expose blocking factorization APIs.
-3. `wasm32-unknown-unknown` builds expose only the intended raw ABI and do not attempt Rust thread creation.
-4. `Natural<16>` correctly stores and operates on 1024-bit unsigned integers.
-5. Compile-time decimal literals reject invalid or overflowing input.
-6. High-level factorization returns probable-prime factors in a `BTreeMap` wrapper.
-7. Repeated factors are represented through nonzero exponents.
-8. SIQS relation collection can run serially or as deterministic parallel jobs.
-9. Native execution uses persistent worker threads up to configured parallelism.
-10. JavaScript creates independent Web Workers and executes common Rust worker kernels.
-11. Sparse matrix construction and filtering preserve relation provenance.
-12. Dense elimination works for small matrices.
-13. Block Lanczos works for production sparse matrices.
-14. Every accepted relation and dependency can be verified.
-15. Progress snapshots cover factor-base construction, sieving, relation processing, matrix construction/filtering, and linear algebra.
-16. Native progress callbacks run only on the coordinator thread.
-17. The CLI prints only factors on stdout and progress/errors on stderr.
-18. Input `1` succeeds with empty factor output; input `0` fails.
-19. Native and Wasm factorizations produce equivalent grouped prime factors.
-20. Tests, clippy, formatting, and documentation checks pass.
+Release archives:
 
----
+```sh
+SDKROOT=../MacOSX15.4.sdk ./build-release.sh
+```
 
-## 29. Instructions to Codex
+The release script uses cross-rs for Linux and FreeBSD, xwin for MSVC,
+cargo-zigbuild for Apple arm64, and native Cargo for Wasm. `SDKROOT` is required
+for Apple and may be relative or absolute. Archives are reproducible when
+`SOURCE_DATE_EPOCH` is fixed.
 
-Implement the full crate described above, not a toy demonstration.
+## 14. crates.io package contents
 
-Important constraints:
+The package manifest must explicitly include:
 
-- Do not replace the custom `Natural` type with `num-bigint` or another production bigint dependency.
-- Do not replace SIQS with trial division or Pollard rho alone.
-- Do not use Tokio.
-- Do not use `wasm-bindgen`.
-- Do not create Rust threads on `wasm32-unknown-unknown`.
-- Do not split the implementation into multiple Cargo packages.
-- Do not expose Rust object layouts through the Wasm ABI.
-- Do not omit relation verification, provenance, or dependency verification.
-- Do not fake progress percentages when totals are unknown.
-- Do not call user progress observers from worker threads.
-- Do not silently use wrapping arithmetic in exact mathematical code.
-- Do not add architecture-specific unsafe code before the portable implementation and tests are complete.
+- Rust sources and tests;
+- `README.md`, `CHANGELOG.md`, `BENCHMARKING.md`, and this specification;
+- both license files;
+- the C header and pkg-config template;
+- the Makefile and release builder;
+- release installer templates;
+- the production `web/` frontend;
+- the Node/V8 benchmark harness.
 
-When a full optimized implementation cannot be completed in one pass, preserve this architecture and implement coherent compiling phases rather than substituting simplified incompatible APIs.
+Generated `docs/`, release archives, local agent state, the historical audit,
+and the obsolete `js/` prototype must not be published.
 
-At each phase:
+`cargo package --list` is the authoritative package-content check.
+`cargo package` must successfully compile the packaged source before release.
 
-1. Keep native and Wasm library builds compiling.
-2. Add tests before moving to the next subsystem.
-3. Document invariants in code.
-4. Prefer correctness and verifiability over premature micro-optimization.
-5. Leave clear `TODO` markers only for optimizations, not for required correctness behavior.
+## 15. Safety and invariants
+
+Native code denies unsafe Rust except in the isolated C ABI module. Wasm unsafe
+is limited to allocator calls and bounds-checked raw memory views. Every unsafe
+block must have a concrete safety comment, and
+`unsafe_op_in_unsafe_fn` is denied.
+
+The following invariants are mandatory:
+
+1. accepted relations satisfy their square congruence;
+2. combined large-prime cycles have even large-prime parity;
+3. matrix indices are bounds-checked during construction/deserialization;
+4. every dependency is verified against the original matrix;
+5. every returned nontrivial divisor divides the composite being split;
+6. every final factor passes probable-prime testing;
+7. multiplying factors with multiplicity reconstructs the input;
+8. stale Wasm handles and obsolete worker generations are rejected or ignored;
+9. malformed C/Wasm inputs produce errors rather than unwinding across an ABI.
+
+The crate is not constant-time and must not be used where operand-dependent
+timing reveals a secret.
+
+## 16. Testing and performance gates
+
+Required release checks:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+cargo check --locked --all-targets --all-features
+cargo package --list --allow-dirty
+cargo package --allow-dirty
+```
+
+Tests cover:
+
+- randomized arithmetic differential checks against dev-only `num-bigint`;
+- fixed arithmetic, modular, primality, and perfect-power cases;
+- relation and dependency validity;
+- deterministic portable job output;
+- out-of-order relation submission;
+- native parallel engine factorization;
+- factor ordering and multiplicity;
+- zero/one and invalid input behavior;
+- progress completion and cooperative cancellation;
+- CLI stdout/stderr behavior;
+- C ownership, reuse, null, and bounds behavior.
+
+Performance comparisons must:
+
+- use release builds;
+- use fixed, published inputs and verify returned factors;
+- report worker/thread counts;
+- avoid concurrent builds and benchmarks;
+- compare saved binaries in interleaved order when machine load can vary;
+- keep timing assertions out of correctness tests.
+
+The fixed 192/224/256-bit balanced-semiprime corpus in `BENCHMARKING.md` is the
+regression gate for native time, browser time, Wasm size, and startup. Broader
+"general factorizer" claims require the unbalanced/multi-prime corpus and
+same-browser competitor protocol described there.
+
+## 17. Current limitations and future work
+
+The 0.2 release is optimized for balanced semiprimes. Its principal known gaps
+are:
+
+- no ECM for medium factors in unbalanced composites;
+- no true sparse block-Lanczos recurrence for matrices beyond the current
+  practical range;
+- cache-blocked/bucket tuning still needs representative small-L2 mobile
+  measurements;
+- parameter tables need multi-input rather than single-sample sweeps at every
+  tier;
+- fastest-browser claims still require same-browser measurements against
+  current competitor implementations.
+
+Future optimization must preserve the safety and correctness invariants above
+and must not slow the default balanced-RSA artifact.
