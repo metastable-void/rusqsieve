@@ -732,3 +732,8 @@ not yet “fastest general factorizer.” Alpertron uses ECM before SIQS, while 
 from bounded Pollard-Brent to SIQS. Medium factors in unbalanced 192–256-bit composites are therefore
 a known algorithmic gap. `BENCHMARKING.md` defines the balanced and unbalanced corpus and same-browser
 competitor protocol required before publishing the broader claim.
+
+RSA challenge constraint (2026-07-25): ECM is acceptable only in an opt-in, separate general-purpose
+artifact. The balanced-semiprime native and Wasm builds must not contain or initialize ECM, so adding
+general-factorization coverage cannot increase their execution time, download size, compilation
+time, or code-cache footprint. The fixed 192/224/256-bit corpus is the required A/B regression gate.

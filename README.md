@@ -1,11 +1,34 @@
 # rusqsieve
 
-`rusqsieve` is a portable Rust factorization crate built around a fixed-capacity unsigned
-integer, deterministic work packets, and quadratic-sieve relation/matrix primitives.  The default
-`Natural<16>` has a 1024-bit capacity; that is a storage limit, not a promise that hard 1024-bit
-semiprimes are practical (use NFS for such inputs).
+`rusqsieve` is a speed-first, portable Rust/WebAssembly implementation of the
+self-initializing quadratic sieve. Its primary target is balanced, RSA-style
+semiprimes from **192 through 256 bits**, scheduled across browser Web Workers
+without shared memory.
+
+On the fixed, factor-verified corpus, rusqsieve currently:
+
+- beats FLINT's single-threaded quadratic sieve on every measured native tier
+  from 160 through 240 bits;
+- factors the 192-, 224-, and 256-bit browser cases in 0.72 s, 5.04 s, and
+  37.86 s under Node 24.15/V8 with eight workers;
+- scales the fixed 256-bit case to 13.96 s with 48 workers on the 96-thread
+  reference host.
+
+These results make rusqsieve a **plausibly fastest-class browser integer
+factorizer for balanced 192–256-bit semiprimes**, and a particularly strong
+candidate for the fastest browser SIQS in that range. This is deliberately not
+an unqualified world-record claim: current Alpertron, Msieve-Wasm, and other
+browser implementations still need to be run on the same browser, hardware, and
+fixed corpus. See [BENCHMARKING.md](BENCHMARKING.md) for inputs, factors,
+commands, measurement scope, and the competitor protocol.
+
+The default `Natural<16>` has a 1024-bit storage capacity. That is not a promise
+that hard 1024-bit semiprimes are practical; NFS is the appropriate algorithm at
+that scale.
 
 The crate is not constant-time and must not be used where operand-dependent timing is secret.
+
+## Native API
 
 ```rust
 use rusqsieve::{Natural, factor};
@@ -19,18 +42,61 @@ Custom schedulers, including Web Workers, can use `engine::prepare`,
 The portable job kernel never creates threads; the native blocking API schedules
 the same deterministic polynomial-family work across persistent workers.
 
+## Why it is fast in browsers
+
+- Numerically target-fitted SIQS polynomials and a double-large-prime relation
+  graph reduce the amount of sieving needed.
+- Translated, sorted roots and paired stride loops keep division out of the
+  score-write hot path.
+- Low-weight sparse elimination shrinks the matrix before a compact row-echelon
+  dependency solve.
+- A scoped Wasm `simd128` XOR kernel accelerates linear algebra without applying
+  whole-program SIMD transformations that regress the sieve.
+- Two-family Worker jobs limit end-of-run overshoot. The pool follows
+  `navigator.hardwareConcurrency` up to a measured cap of 48 workers.
+- The deployment preserves Rust/LLVM's speed-optimized Wasm. Binaryen 120
+  `wasm-opt -O3` and `-Oz` were both measured and rejected because they slowed
+  the 192-bit sieve by roughly 50%.
+
 ## Browser demo
 
 `make docs` builds a self-contained WebAssembly demo into `docs/` for GitHub Pages
 (enable Pages on the `docs/` folder). It factors a number you type using the same
 crate compiled to `wasm32-unknown-unknown`, sieving in parallel across a pool of Web
-Workers sized to `navigator.hardwareConcurrency`, and renders the result in power
+Workers, and renders the result in power
 notation. Modern browsers use the scoped `simd128` linear-algebra kernel; a portable
 scalar artifact is selected automatically on older engines. `make serve` previews it
 locally at <http://localhost:8000/>.
 
-See [BENCHMARKING.md](BENCHMARKING.md) for the fixed 192–256-bit corpus, reproducible
-Node/V8 harness, current measurements, and the evidence required before making a
-cross-project “fastest general browser factorizer” claim.
+## RSA challenge proof-of-work
+
+The balanced-semiprime SIQS path is the performance-critical deployment target
+for sign-in proof-of-work. Server-generated challenges should use similarly
+sized random primes and enter the SIQS coordinator directly through the
+low-level engine/Worker API. The returned factor must be nontrivial, divide the
+challenge, and reconstruct the original challenge with its cofactor.
+
+ECM is not currently part of this path. If ECM is added for unbalanced,
+general-purpose composites, the project policy is:
+
+1. ECM is opt-in behind a non-default feature and a separate general-purpose
+   Wasm artifact.
+2. The balanced-RSA artifact contains no ECM code or initialization.
+3. The fixed 192/224/256-bit corpus is an A/B regression gate for native time,
+   browser time, Wasm size, and module startup.
+
+This separation is intentional: merely skipping ECM at runtime would still let
+its additional Wasm download and compilation cost slow a sign-in challenge.
+
+Proof-of-work is resource pricing, not authentication. Bind each challenge to
+the intended session, expire it, reject replay, and retain the normal
+authentication mechanism. Never use a modulus belonging to a real RSA key.
+
+## Scope
+
+The current pipeline combines trial division, Pollard-Brent rho, primality and
+perfect-power checks, and SIQS. It does not yet include ECM, so the fastest-class
+claim is specifically for balanced semiprimes. Unbalanced 192–256-bit composites
+with medium-size factors remain the main general-factorization gap.
 
 Licensed under `Apache-2.0 OR MPL-2.0`; see `LICENSE-APACHE` and `LICENSE-MPL`.

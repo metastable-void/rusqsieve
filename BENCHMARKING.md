@@ -51,4 +51,6 @@ The current engine has trial division, Pollard-Brent rho, and SIQS, but no ECM. 
 strong candidate for the fastest browser **SIQS / balanced-semiprime** implementation in this range;
 it is not yet defensible to call it the fastest **general** implementation. An ECM stage is the main
 algorithmic prerequisite because it changes the complexity for unbalanced composites with
-medium-size factors.
+medium-size factors. ECM must be delivered as an opt-in feature and separate general-purpose Wasm
+artifact: the balanced-RSA build remains ECM-free, and its fixed-corpus runtime, artifact size, and
+module startup are regression gates.
