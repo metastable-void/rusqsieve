@@ -191,9 +191,6 @@ impl SparseBinaryMatrix {
         }
         let words = cols.div_ceil(64);
         let mut basis: Vec<Option<Box<[u64]>>> = vec![None; cols];
-        const M4RI_BITS: usize = 4;
-        let mut m4ri_tables: Vec<Option<Vec<Box<[u64]>>>> =
-            (0..cols.div_ceil(M4RI_BITS)).map(|_| None).collect();
 
         for row in 0..self.rows() {
             let a = self.csr_offsets[row] as usize;
@@ -206,29 +203,20 @@ impl SparseBinaryMatrix {
             for &column in &self.csr_columns[a..b] {
                 equation[column as usize / 64] ^= 1 << (column % 64);
             }
+            // Reduce against the basis one pivot at a time, XORing only up to the pivot word: the
+            // basis row's higher words are all zero by construction, so a truncated XOR is exact.
+            // A Gray-code (M4RI) table over 4-column blocks was implemented and measured here and
+            // was 75% SLOWER (f2_dense 2.34 s -> 4.08 s at 256-bit): pivots are installed
+            // incrementally, so every insertion invalidates its block's 16-row table and the
+            // rebuild cost dominates the XORs it saves. See CHANGELOG 0.2.1.
             while let Some(pivot) = highest_bit(&equation) {
-                if basis[pivot].is_none() {
+                if let Some(prior) = &basis[pivot] {
+                    xor(&mut equation[..=pivot / 64], &prior[..=pivot / 64]);
+                } else {
                     equation.truncate(pivot / 64 + 1);
                     basis[pivot] = Some(equation.into_boxed_slice());
-                    m4ri_tables[pivot / M4RI_BITS] = None;
                     break;
                 }
-                let block = pivot / M4RI_BITS;
-                let start = block * M4RI_BITS;
-                let table =
-                    m4ri_tables[block].get_or_insert_with(|| m4ri_table(&basis, start, M4RI_BITS));
-                let mut mask = 0usize;
-                for offset in 0..M4RI_BITS {
-                    let column = start + offset;
-                    if column < cols
-                        && basis[column].is_some()
-                        && equation[column / 64] >> (column % 64) & 1 != 0
-                    {
-                        mask |= 1 << offset;
-                    }
-                }
-                debug_assert_ne!(mask, 0);
-                xor(&mut equation, &table[mask]);
             }
         }
 
@@ -260,7 +248,7 @@ impl SparseBinaryMatrix {
         }
     }
 
-    /// Nullspace via SPEC §15.3 filtering — iterative singleton-row elimination
+    /// Nullspace via SPEC §8 filtering — iterative low-weight row elimination
     /// (a prime occurring in one live column forces that column out of every
     /// dependency) — followed by dense elimination on the much smaller reduced
     /// matrix. Dependencies are returned in the ORIGINAL column space (eliminated
@@ -306,7 +294,7 @@ impl SparseBinaryMatrix {
             if weight == 0 || weight > MAX_STRUCTURED_WEIGHT {
                 continue;
             }
-            let equation: Vec<usize> = row_cols[r].iter().copied().collect();
+            let equation: Vec<usize> = row_cols[r].to_vec();
             // Markowitz-style choice: eliminate the column occurring in the fewest other rows,
             // minimizing fill. Ties are stable because the equation is sorted.
             let pivot = *equation
@@ -319,7 +307,7 @@ impl SparseBinaryMatrix {
             for &c in &equation {
                 sorted_remove(&mut col_rows[c], r);
             }
-            let affected: Vec<usize> = col_rows[pivot].iter().copied().collect();
+            let affected: Vec<usize> = col_rows[pivot].to_vec();
             for rr in affected {
                 sorted_remove(&mut row_cols[rr], pivot);
                 sorted_remove(&mut col_rows[pivot], rr);
@@ -418,24 +406,6 @@ impl SparseBinaryMatrix {
         }
         Ok(DependencySet { vectors: out })
     }
-}
-
-fn m4ri_table(basis: &[Option<Box<[u64]>>], start: usize, width: usize) -> Vec<Box<[u64]>> {
-    let words = (start + width).div_ceil(64);
-    let mut table = Vec::with_capacity(1 << width);
-    for mask in 0usize..1 << width {
-        let mut row = vec![0u64; words];
-        for offset in 0..width {
-            if mask >> offset & 1 == 0 {
-                continue;
-            }
-            if let Some(source) = basis.get(start + offset).and_then(Option::as_deref) {
-                xor(&mut row, source);
-            }
-        }
-        table.push(row.into_boxed_slice());
-    }
-    table
 }
 
 fn sorted_remove(values: &mut Vec<usize>, value: usize) -> bool {

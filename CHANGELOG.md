@@ -2,38 +2,264 @@
 
 ## 0.2.1 — 2026-07-25
 
-Patch release: correctness fixes and internal-only performance/resource work;
-no public Rust signatures changed.
+Patch release: correctness fixes and internal-only performance/resource work.
+Every change is behind a private item or a function body; no public Rust
+signature, C ABI symbol, or Wasm export changed, and no Cargo feature was added
+or removed.
 
-- Fixed factorization of balanced 65–100-bit semiprimes, including
-  `18446744400127067027`, by making SIQS `A`-coefficient selection satisfiable
-  and adding a bounded, cancellable big-integer Pollard–Brent preprocessing
-  stage.
-- Distinguished deterministic polynomial-coefficient famine internally,
-  stopped retrying it for 100,000 families, made the small-factor path
-  cancellable, recovered poisoned worker locks, and preserved the first worker
-  panic message.
-- Added Baillie–PSW (base-2 Miller–Rabin plus strong Selfridge Lucas) to final
-  primality decisions above 64 bits in Rust and browser RSA generation. The
-  proven deterministic 64-bit witness path is unchanged.
-- Added the independently verified 309-entry, 7–256-bit factorization corpus
-  and dead-zone size sweep.
-- Replaced discarded-quotient reductions, redundant modular reductions, and
-  hot division allocations; cached small primes and segmented factor-base
-  generation.
-- Added twice-log2 sieve weights with slack derived from the skipped primes,
-  recorded sparse-tail resieve hits, a 256× factor-base single-large-prime
-  limit, allocation reuse, index-only partial-relation forests, and
-  Montgomery/batched-GCD cofactor splitting.
-- `find_factor` now uses the shared `prepare` path. The pinned interval
-  translation is `sieve_half_width % prime`; the formerly duplicated native
-  expression was numerically equivalent only while the interval remained
-  positive and unchanged.
-- Moved browser relation coordination and GF(2) extraction off the main thread,
-  flattened filtering storage, added Four-Russians residual reduction and
-  unrolled dependency back-substitution, and guarded oversized dense fallback.
-- Double-large-prime collection remains disabled: it did not demonstrate a net
-  wall-time win with the bounded large-prime policy.
+### Correctness (behaviour changes)
+
+- **Balanced semiprimes from 65 to 85 bits now factor.** They failed
+  deterministically before, including `18446744400127067027 = 4294967311 ×
+  4294967357`, and so did any larger input whose cofactor landed in that band.
+  `choose_a` drew coefficient factors from factor-base primes above 1000 (10
+  bits and up) while accepting only primes within one bit of `ideal_bits`, which
+  is 6 there, so the candidate pool was empty for every polynomial family and no
+  polynomial was ever built. The lower bound is now derived from `ideal_bits`,
+  the acceptance window widens when the pool comes up short, and a
+  `debug_assert` fails loudly if the constraint set is ever empty again.
+- **A polynomial-coefficient famine is reported as a parameter-selection
+  failure, not as "no factor found".** It is detected once in `prepare`, the
+  single point both the native and the Wasm/session schedulers pass through, and
+  names the factor-base size, the target `A` width, and the candidate count.
+  With the fix above reverted locally the minimum reproducer fails in under a
+  millisecond instead of sieving 100 000 families for ~1.6 s.
+- **`EngineSession::take_jobs` no longer spins forever** when `choose_a`
+  declines every family; it shares the native scheduler's 100 000-family bound,
+  which was previously two uncoordinated constants. The unbounded loop also grew
+  its buffered-result map without limit.
+- **Baillie–PSW is the final primality decision above 2^64** — trial division,
+  a base-2 Miller–Rabin, then a strong Lucas test with Selfridge Method A
+  parameters — in both the library and the browser RSA generator. The 16
+  Miller–Rabin rounds remain as an extra layer but no longer carry the
+  guarantee: they draw bases from a fixed 32-entry table, so they are
+  deterministic rather than probabilistic and a strong pseudoprime to all of
+  bases 2..53 would be a guaranteed false positive. Below 2^64 the seven-base
+  Jaeschke/Sinclair witness set is proven exact and is unchanged. The
+  perfect-square test in front of Selfridge's `D` search is load-bearing, not an
+  optimization: that search does not terminate for a square.
+- **Cofactors of 64 bits or less are cancellable.** `smallfactor::factor_u64`
+  and its Pollard–Brent loop polled nothing and could not be interrupted.
+- **One panicking worker no longer masks the cause.** The job mutex is recovered
+  with `unwrap_or_else(|e| e.into_inner())` instead of poisoning every other
+  worker with `PoisonError`, and the first panic payload is propagated instead of
+  discarded by `let _ = h.join()`.
+- **A bounded, cancellable Pollard–Brent stage runs before SIQS at every size.**
+  See the note on its budget below.
+- Oversized dense linear-algebra fallbacks return a resource-limit error instead
+  of silently taking the O(n³) path on the unfiltered matrix, which on Wasm
+  permanently inflated the tab's heap.
+
+### Tests
+
+- Added the independently verified 309-entry, 7–256-bit factorization corpus at
+  `tests/data/`. `cargo test` factors all 280 entries through 128 bits, including
+  all 117 in the 65–85-bit regression band, in ~23 s; the 29 larger ones run from
+  `supplied_factorization_corpus_above_128_bits` under
+  `cargo test --profile release-test -- --ignored`, also ~23 s. All 309 entries
+  are verified — product equals `n`, and every listed factor is itself accepted as
+  a single prime.
+- The dead zone is pinned against the sieve directly, by asserting that
+  `prepare` yields a non-empty coefficient pool and that family 0 produces
+  polynomials at 65, 70, 75, 80, 85 and 90 bits, and that SIQS alone recovers a
+  factor there. An end-to-end `factor()` test would no longer catch a
+  regression: the new Pollard–Brent stage splits that whole band first.
+- Added a `#[profile.release-test]` profile. `cargo test --release` cannot link
+  this crate from a cold cache — `crate-type = ["rlib", "cdylib", "staticlib"]`
+  collides on `librusqsieve.rlib` and combines badly with `panic = "abort"` and
+  fat LTO — so the slow tiers had no way to run optimized.
+- Extended primality coverage to 12 Carmichael numbers and 8 base-2 strong
+  pseudoprimes below 2^64, plus, above it, the two smallest strong pseudoprimes
+  to all bases through 37 and 41, and a Carmichael number above 2^64. A test
+  asserts the strong Lucas step actually executed: no Baillie–PSW pseudoprime is
+  known, so every one of these tests would also pass if that step were dead code.
+  The counter is thread-local, because `cargo test` runs test functions
+  concurrently and a process-wide counter let one test satisfy another's
+  assertion.
+- Added a test pinning the sieve-root translation, which `find_factor`'s
+  duplicate of `prepare` had already diverged on.
+
+### Performance
+
+Measured on a 48-core Xeon Platinum 8259CL @2.50GHz (L1d 32 KiB, L2 1 MiB/core,
+L3 71.5 MiB shared), release build, 4 threads, interleaved A/B against the
+published 0.2.0 binary, three repetitions, run-to-run spread under 2%. Balanced
+corpus semiprimes at 192, 224 and 256 bits.
+
+Sieve and linear algebra, seconds (0.2.0 → 0.2.1): 192-bit 0.70 → 0.68,
+224-bit 5.07 → 4.87, 256-bit 37.6 → 36.7. End-to-end wall time is a wash,
+because the new Pollard–Brent stage and Baillie–PSW spend 0.5–1.5% of it.
+**This is well short of the 10% the remediation brief asked for, and several of
+the changes it prescribed were measured to be losses and were not kept** — see
+"Measured and rejected".
+
+Kept:
+
+- Sieve-threshold retune. The threshold's large-prime term is now `log2` of the
+  large-prime acceptance bound rather than an independent per-tier constant:
+  admitting a cofactor the relation collector will reject costs a full trial
+  division for nothing. The small-prime give-back is derived from the skipped set
+  (`Σ w(p)/(p−1)`, ≈4–6 bits) instead of a hardcoded 8. The remaining offset is
+  a measured per-tier value — 0 at 192 bits, −2 at 224, −4 at 256 — replacing a
+  single global constant; deeper thresholds trade survivors for polynomials and
+  the optimum deepens with size. Worth ~5% at 224 bits over the shipped default.
+- Candidate scan. Scores are biased by `128 − threshold` so the scan is one
+  masked compare per eight positions. A byte-at-a-time scan had replaced this and
+  cost 13.8% of sieve time at 224 bits against 2.5%; note that computing the bias
+  inside the scan is not enough, since a runtime bias costs an add and an or per
+  word and measured 2.7× slower than the masked test.
+- Wrapping rather than saturating score writes, guarded by a bound proved from
+  the smallest scored prime instead of assumed. Forcing saturating writes
+  everywhere measured +1.5 cpu-s on 12.3 at 224 bits, about 7% of sieve time.
+  This is the invariant `RUSQSIEVE_SMALL_SKIP` could previously break silently
+  into wrapping overflow and false negatives.
+- FLINT's `extra_bits < sieve[i]` stopping rule for trial division, which had
+  been dropped. It ends the gated scan once the primes divided out account for
+  the recorded score, cutting it to ~64% of the factor base on average.
+- Cheap arithmetic: `mod_u64` no longer materializes a discarded 128-byte
+  quotient; `mul_mod` drops two of three Knuth divisions and documents plus
+  `debug_assert`s the reduced-operand precondition; `knuth_divmod` uses inline
+  buffers instead of four heap `Vec`s per call; `WideNatural::rem_natural` and
+  `overflowing_mul` no longer round-trip through 256-byte temporaries;
+  `EngineJobResult::to_bytes` presizes; `primes_to` uses the cached sieve instead
+  of rebuilding 1 229 primes per node; the factor base comes from a segmented
+  sieve of Eratosthenes instead of O(√p) trial division per odd number
+  (`fb_build` 0.066 s → 0.031 s at 256 bits, and it is paid per Web Worker at
+  browser startup).
+- Per-family setup: binary shift-subtract xgcd replaces the extended Euclid with
+  a hardware divide per iteration.
+- The `nvar` cap is `min(9)`, not `min(6)`, so a 256-bit family amortizes its
+  setup over all 128 polynomials rather than half of them. Per-family setup fell
+  from 19.0 to 10.2 cpu-s at 256 bits, the single largest measured win here.
+  `bainv` grows to ~585 KiB at that size; check that against L2 on a target
+  before raising the cap further.
+- `choose_a` quality: rejection sampling with bounded retry keeps `A` within
+  ±25% of target instead of accepting the first draw, `A` values are
+  de-duplicated across families, the candidate pool is hoisted into the context
+  instead of rescanning the factor base per family, and the residual conversion
+  to `u64` is checked rather than truncating to the low limb.
+- Large-prime acceptance is `256 × factor_base_bound`, replacing
+  `1 << lp_allowance` — which reached 34 360× the factor-base bound at 256 bits,
+  against msieve's 100–200. Retained partials at 256 bits fell from 263 024 to
+  117 878 and cycle yield rose from 3.7% to 8.2%. The partial-relation forest
+  stores relation indices, so re-rooting no longer clones a 16-limb `Natural` and
+  a `Vec` along every tree path on every ingest.
+- `pollard_u64` is Brent with Montgomery multiplication and a batched GCD every
+  128 steps, replacing Floyd with a `u128 %` and a GCD on every iteration.
+- `find_factor` calls `prepare` instead of carrying a near-line-for-line copy of
+  it. The pinned interval translation is `sieve_half_width % prime`; the
+  duplicate's `interval as u32 % prime` was numerically equal only because
+  `interval` is that same positive half width, and a test now pins it.
+- Browser: relation collection and the GF(2) solve run in a dedicated
+  coordinator Worker. Before, `coord.qs_coord_extract` ran on the main thread
+  with no `await tick()` after reporting the phase, so the page froze on a stale
+  status for the ~8 s serial term — over half of a 48-worker 256-bit run.
+- The unreachable second sieve kernel is deleted. `score_polynomial_blocked` was
+  gated at 1 MiB of scores while the largest shipped interval produces 640 KiB,
+  so no tier could reach it, and forcing it on was slower.
+
+Measured and rejected — each was implemented, measured, and removed:
+
+- **msieve-style resieving** (brief §2.1). Replaying the sparse tail's root
+  progressions over a candidate bitmap cut the gated scan from 2.40 to 1.49
+  cpu-s at 224 bits and from 26.5 to 12.0 at 256, but the resieve pass itself
+  cost 1.59 and 17.1 cpu-s — a net loss at every size and at every cutoff swept
+  (interval/2 down to interval/32, and off). The reason is structural, not a
+  tuning failure: the multiply-shift gate it competes against is only ~9 cycles
+  per prime, and the resieve's cost falls per *polynomial* while its saving
+  accrues per *survivor* — this engine sees about 5 survivors per polynomial.
+  The brief's ≥10× per-survivor target is not reachable on that ratio.
+- **Four Russians / M4RI for the dense residual** (brief §2.11c). Gray-code
+  tables over 4-column blocks made `f2_dense` 75% *slower* at 256 bits (2.34 s →
+  4.08 s). Pivots are installed incrementally, so every insertion invalidates its
+  block's 16-row table and the rebuild cost dominates the XORs saved. A real
+  M4RI needs the basis materialized densely first.
+- **Twice-log2 sieve weights** (brief §2.3). Finer log resolution requires
+  saturating score writes, since a smooth value's score then exceeds a byte, and
+  that cost ~7% of sieve time while buying no measurable reduction in survivors.
+  Weights are `ceil(log2 p)` with the resolution error absorbed by the tuned
+  offset.
+- **Raising the tiny-prime skip.** Swept 100/200/400/800/1600/3200 against the
+  threshold offset at 224 bits; the flat optimum stays at 100. Each additional
+  skipped prime widens the gap between a smooth value's score and its true log,
+  so more smooth values fall under the threshold and polynomial count rises
+  faster than score-write traffic falls.
+- **Retuning the factor base and interval.** The table's own comment claimed the
+  optimum above 224 bits was ≈9k primes at 256, against the 20 911 it builds.
+  Re-measured at 256 bits (sieve + linear algebra, seconds): 150k → 79.6,
+  250k → 50.8, 350k → 39.9, 500k → 35.9 (shipped), 700k → 37.2, 1M → 45.7;
+  half-widths 327 680 → 35.9, 458 752 → 37.8, 655 360 → 43.8. The table is
+  right and the comment was wrong; the comment is fixed.
+- **Raising the number of `A` factors** to amortize per-family setup further.
+  At 224 bits, 12-bit factors cut setup from 1.73 to 0.98 cpu-s and 11-bit to
+  0.56, but wall time did not improve (4.48 / 4.47 / 4.62 s): `A` quality
+  degrades and `bainv` grows.
+- **Double large primes** (brief §2.6) remain disabled. The gate was satisfied
+  by no shipped tier, and with it correctly parameterized it did not show a net
+  wall-time win against the bounded single-large-prime policy. `README.md` and
+  `SPEC.md` no longer advertise it.
+
+Not reproduced from the brief's baseline figures: the ≈14% available at 224 bits
+from threshold retuning alone. On this host, 0.2.0's shipped default measures
+4.72 s and its own optimum 4.47 s — about 5%. The brief's reference host has a
+quarter of the cores and half the L3 per thread, and the survivors-versus-
+polynomials tradeoff is cache-sensitive.
+
+Also worth recording, since it changes where the remaining time goes: the gated
+trial-division scan is memory-bound, not compute-bound. It reads ~9.4 cycles per
+factor-base prime while streaming 32 bytes per prime across four separate arrays
+(`FactorBaseEntry`, `pinv`, `root1`, `root2`). Packing prime, roots and weight
+into one 16-byte record would cut that to two streams and ~24 bytes and is the
+largest identified remaining win at 256 bits, where the scan is ~11% of runtime.
+It matters more on the small-L2 targets this crate aims at than on this host.
+
+### Bounded Pollard–Brent stage, and a corrected premise
+
+A bounded, cancellable Pollard–Brent stage over `Natural` now runs between the
+perfect-power test and SIQS at every size. There was previously no trial division
+and no rho above 2^64 on that path, even though a generic `pollard_rho` existed
+unused elsewhere in the crate.
+
+The brief expected this to beat SIQS outright from 65 to 100 bits. It does not,
+and shipping it that way was a large regression. Measured on balanced corpus
+semiprimes (release, single-threaded, seconds — rho with the brief's suggested
+16 M-iteration budget, against SIQS alone): 70-bit 0.03 / 0.03, 80-bit **0.56 /
+0.03**, 90-bit **2.16 / 0.01**. Rho costs `O(sqrt p)` in the smallest factor
+while SIQS at those sizes is already trivial.
+
+So the stage is budgeted rather than gated on bit length, at roughly 1% of the
+estimated sieve cost for the input's tier — 1 024 iterations up to 128 bits,
+~131 k at 224, ~328 k at 256, measured at 0.7–1.5% of total wall time. That
+covers factors to about 2^26 at 192 bits and 2^34 at 256, above the 10^4
+trial-division bound and below the 2^64 machine-word path. Where it pays is
+unbalanced inputs, which SIQS is worst at: the corpus entry
+`13695626177198106295200293487798368178679518660650179392786377544541`
+(224 bits, smallest factor 11 624 449) now splits in 0.01 s against about 5 s of
+sieving. The budget is the total across all polynomial constants tried; it was
+per-constant at first, which made the stage cost 8× its nominal budget — 27 s of
+a 64 s 256-bit run — while reporting the same number.
+
+### Documentation and naming
+
+- All eight `SPEC §x.y` citations in `src/` resolved to a wrong section or to
+  nothing (`SPEC.md` has sections 1–17; they cited §19.3, §20, §21.1, §15.3,
+  §12.5, §12.6, §6.11). All are repointed.
+- The comment citing `CLAUDE-AUDIT.md`, a file absent from the crate, is gone
+  with the blocked-sieve kernel it documented.
+- `SPEC.md` §7.4 and `README.md` described byte scores, resieving and
+  double-large-prime combination that the shipped engine does not do; both now
+  match the code, including the threshold derivation.
+- `qs::parameters`' comment claiming a smaller optimum above 224 bits than the
+  table it documents is replaced with the measurements above.
+- `smallfactor::pollard_brent` claimed `n` must be odd while handling even `n`.
+- `sieve_root_pair` claimed an overflow bound from a hardcoded minimum prime
+  that a tuning knob could invalidate; the bound is now computed and the comment
+  describes what the code does.
+
+`Montgomery`, `BlockLanczos`, `extended_gcd`, `prepare_siqs`'s SIQS-claiming
+names, `SparseBinaryMatrix::provenance`, `MatrixSolver` and the always-zero job
+metrics are untouched here: resolving them removes or renames public items, so
+they belong to 0.3.0.
 
 ## 0.2.0 — 2026-07-25
 

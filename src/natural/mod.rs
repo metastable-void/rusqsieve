@@ -612,8 +612,17 @@ fn sig_len(limbs: &[u64]) -> usize {
     limbs.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1)
 }
 
+/// Limb capacity of [`LimbBuffer`]'s inline storage: enough for `2 * PARTS + 1`, the widest
+/// normalized dividend Knuth's Algorithm D needs. Written from a literal rather than from `PARTS`
+/// because an array length computed from a const generic parameter requires `generic_const_exprs`,
+/// which is unstable, and this crate builds on stable.
 const MAX_DIV_LIMBS: usize = 2 * 16 + 1;
 
+/// Working storage for one division. Deliberately large by value: the whole point is to keep the
+/// four buffers Knuth's Algorithm D needs off the heap, since it is the workhorse of every
+/// multi-limb division. `Heap` covers the case where a caller instantiates `Natural<P>` with
+/// `P > 16`, which no shipped configuration does.
+#[allow(clippy::large_enum_variant)]
 enum LimbBuffer {
     Stack {
         limbs: [u64; MAX_DIV_LIMBS],
@@ -654,7 +663,7 @@ impl LimbBuffer {
 /// Little-endian schoolbook long division (Knuth TAOCP Alg. D) on limb slices.
 /// Returns `(quotient, remainder)` as trimmed little-endian limb vectors.
 /// `den` must be nonzero. This is the shared normalized-long-division primitive
-/// used by both `Natural::div_rem` and wide-product reduction (SPEC §6.11).
+/// used by both `Natural::div_rem` and wide-product reduction (SPEC §5).
 fn knuth_divmod(num: &[u64], den: &[u64]) -> (LimbBuffer, LimbBuffer) {
     const LOW: u128 = 0xffff_ffff_ffff_ffff;
     let num_len = sig_len(num);
@@ -729,7 +738,7 @@ fn knuth_divmod(num: &[u64], den: &[u64]) -> (LimbBuffer, LimbBuffer) {
             carry = p >> 64;
             let t = un[j + i] as i128 - borrow - (p & LOW) as i128;
             un[j + i] = t as u64;
-            borrow = -((t >> 64) as i128);
+            borrow = -(t >> 64);
         }
         let t = un[j + n] as i128 - carry as i128 - borrow;
         un[j + n] = t as u64;
@@ -1375,7 +1384,7 @@ mod tests {
 #[cfg(test)]
 mod difftests {
     //! Randomized differential tests against `num-bigint` (dev-only oracle).
-    //! Guards the fast arithmetic kernels (SPEC §19.3).
+    //! Guards the fast arithmetic kernels (SPEC §16).
     use super::*;
     use num_bigint::BigUint;
 

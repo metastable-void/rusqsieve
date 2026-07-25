@@ -61,8 +61,8 @@ struct Context {
     /// test `x mod p == root` (a ~3-instruction multiply-shift) in trial division without a
     /// hardware divide, so the whole factor base can be gated per survivor cheaply.
     pinv: Arc<[u64]>,
-    /// Twice-log2 sieve weight per factor-base prime.
-    score_weight: Arc<[u8]>,
+    /// Threshold give-back for the tiny primes the score pass skips, derived from that set.
+    small_slack: usize,
     /// `interval mod p` per factor-base prime. Sieve roots are residues of the signed polynomial
     /// coordinate `x`, while score-array positions represent `x + interval`; precomputing this
     /// fixed translation avoids two signed divisions per prime and polynomial in the sieve pass.
@@ -72,7 +72,14 @@ struct Context {
     a_all: Arc<[usize]>,
     a_pool: Arc<[usize]>,
     a_factor_count: usize,
-    lp_allowance: usize,
+    /// Sieve-threshold slack for the unfactored cofactor, in bits. This is `log2(single_limit)` and
+    /// nothing else: a survivor whose cofactor exceeds the large-prime bound is discarded by
+    /// `classify_cofactor`, so admitting it costs a full trial division for no possible relation.
+    /// v0.2.0 used an independent per-tier `lp_allowance` here, which at the 256-bit tier admitted
+    /// 34-bit cofactors against a 27-bit acceptance bound — seven bits of pure waste.
+    lp_bits: usize,
+    /// Measured per-tier sieve-threshold offset in bits (see [`crate::qs::parameters`]).
+    thresh_adj: i32,
     /// Maximum accepted single large prime (and maximum factor of a double).
     single_limit: u64,
     /// Whether double-large-prime cofactors are captured and combined.
@@ -124,7 +131,7 @@ struct FamilyResult {
     survivors: u64,
 }
 
-/// Per-worker reusable buffers (SPEC §21.1 — reuse sieve/candidate scratch).
+/// Per-worker reusable buffers (SPEC §7.4 — reuse sieve/candidate scratch).
 #[derive(Default)]
 struct EngineScratch {
     scores: Vec<u8>,
@@ -136,17 +143,10 @@ struct EngineScratch {
     root2: Vec<u32>,
     /// `2·Bⱼ·a⁻¹ mod p` for each varying B-value `j` and factor-base prime `p`
     /// (row-major `[j*nfb + i]`). Adding/subtracting this advances the roots to
-    /// the next self-initializing polynomial in O(1) per prime (SPEC §12.5).
+    /// the next self-initializing polynomial in O(1) per prime (SPEC §7.3).
     bainv: Vec<u32>,
     /// Positions surviving the score threshold, reused across polynomials.
     candidates: Vec<u32>,
-    /// Score position to survivor index for sparse-tail resieving.
-    candidate_slot: Vec<u32>,
-    candidate_epoch: Vec<u32>,
-    resieve_generation: u32,
-    hit_head: Vec<u32>,
-    hit_prime: Vec<u32>,
-    hit_next: Vec<u32>,
 }
 
 /// Immutable portable SIQS worker context.
@@ -282,6 +282,72 @@ fn deserialize_family(b: &[u8]) -> Option<FamilyResult> {
     })
 }
 
+/// Pollard-Brent iteration budget for an `n`-bit input, sized as a small fraction of what SIQS on
+/// the same input is expected to cost.
+///
+/// A fixed budget is wrong in both directions. The stage exists for inputs SIQS is bad at — an
+/// unbalanced `N`, or a recursive cofactor carrying a small factor — where SIQS pays for the size of
+/// `N` while rho pays for the size of its smallest factor. On a *balanced* semiprime rho contributes
+/// nothing, so its cost there is pure overhead and must scale with the run it is attached to.
+///
+/// The brief this work follows expected rho to beat SIQS outright from 65 to 100 bits. Measured on
+/// balanced corpus semiprimes (release, single-threaded, seconds — rho with a 16 M-iteration budget
+/// against SIQS alone): 70-bit 0.03 / 0.03, 80-bit 0.56 / 0.03, 90-bit 2.16 / 0.01. Rho costs
+/// `O(sqrt p)` in the smallest factor while SIQS at those sizes is already trivial, so the premise
+/// only holds at the very bottom of that band and the unbounded stage was a 19-216× regression above
+/// it. Hence a budget rather than a bit-length gate.
+///
+/// `factor_base_bound × sieve_half_width` from the tier table is used as the SIQS cost proxy; it
+/// tracks measured sieve time within about 3× across 90-256 bits. The divisor is calibrated against
+/// a measured ~530 ns per iteration — one `Natural::mul_mod`, which is a full Knuth division on this
+/// crate's arithmetic — to hold the stage near 1% of the estimated sieve: 1 024 iterations (the
+/// floor) up to 128 bits, ~18 k at 192, ~131 k at 224, ~328 k at 256, measured at 0.7-1.5% of total
+/// wall time on balanced semiprimes at those sizes.
+///
+/// Brent finds a factor `p` in roughly `1.2·sqrt(p)` iterations, so this covers factors up to about
+/// 2^26 at 192 bits and 2^34 at 256 — above the 10^4 trial-division bound and below the 2^64 point
+/// where the whole input would have taken the machine-word path. Raising it further buys a narrow
+/// band of larger factors for a quadratically larger cost.
+fn rho_budget(bits: usize) -> u64 {
+    let p = crate::qs::parameters::engine_params(bits);
+    (p.factor_base_bound as u64 * p.sieve_half_width as u64 / 500_000).max(1_024)
+}
+
+/// Which dispatch arm produced each split, so tests can assert that a stage ran rather than merely
+/// that the answer came out right. A stage that silently never executes passes every correctness
+/// test, so the cheap ladder stages are counted explicitly.
+/// Counters are thread-local, not global: the dispatch ladder runs entirely on the caller's thread
+/// (workers are spawned only *inside* SIQS), and `cargo test` runs test functions concurrently, so
+/// process-wide counters would see other tests' factorizations.
+#[cfg(test)]
+pub(crate) mod stage_counts {
+    use std::cell::Cell;
+    thread_local! {
+        pub(crate) static RHO: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static SIQS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
+        counter.with(|c| c.set(c.get() + 1));
+    }
+    pub(crate) fn reset() {
+        RHO.with(|c| c.set(0));
+        SIQS.with(|c| c.set(0));
+    }
+    pub(crate) fn rho() -> usize {
+        RHO.with(Cell::get)
+    }
+    pub(crate) fn siqs() -> usize {
+        SIQS.with(Cell::get)
+    }
+}
+
+/// Polynomial families any one scheduler will issue before giving up.
+///
+/// Both the native thread scheduler and [`EngineSession`] use this single bound; v0.2.0 had two
+/// uncoordinated 100 000 caps for the same job. Reaching it means the relation target was not met
+/// and surfaces as [`EngineError::InsufficientRelations`] rather than a silent wrong answer.
+const MAX_FAMILIES: u64 = 100_000;
+
 /// Prepare an immutable context without creating threads.
 pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let p = crate::qs::parameters::engine_params(n.bit_len());
@@ -297,10 +363,10 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
-    let score_weight: Arc<[u8]> = base
-        .iter()
-        .map(|e| ((e.log_prime as f64 / (4.0 * core::f64::consts::LN_2)).round() as u8).max(1))
-        .collect();
+    // Expected log weight of the tiny primes that are skipped by the score pass: `Σ log(p)/(p−1)`
+    // over the skipped set, which is what the threshold must give back. Derived once here rather
+    // than carried as a hand-tuned constant, and cheap to keep out of the per-polynomial path.
+    let small_slack = small_slack(&base, small_skip());
     let interval_mod_p: Arc<[u32]> = base.iter().map(|e| p.sieve_half_width % e.prime).collect();
     let target_a = sieve_n
         .floor_sqrt()
@@ -310,22 +376,39 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let (a_all, a_pool, a_factor_count) = build_a_candidates(&base, &target_a);
     let (single_limit, double_enabled) =
         large_prime_policy(p.factor_base_bound, p.large_prime_mult);
-    Ok(EngineContext(Arc::new(Context {
+    let context = Arc::new(Context {
         n,
         sieve_n,
         base,
         pinv,
-        score_weight,
+        small_slack,
         interval_mod_p,
         interval: p.sieve_half_width as i32,
         target_a,
         a_all,
         a_pool,
         a_factor_count,
-        lp_allowance: p.lp_allowance,
+        lp_bits: (64 - single_limit.leading_zeros()) as usize,
+        thresh_adj: p.thresh_adj + env_delta("RUSQSIEVE_THRESH_ADJ"),
         single_limit,
         double_enabled,
-    })))
+    });
+    // A famine here is a parameter-selection failure, not a search failure: if no `A` can be built
+    // for family 0 then none can be built for any family, and every scheduler would otherwise burn
+    // through its whole family budget producing nothing. Diagnose it once, at the only choke point
+    // both the native and the WASM/session schedulers pass through.
+    if choose_a(&context, 0).is_none() {
+        let message = format!(
+            "polynomial-coefficient selection has no viable A for {}-bit input \
+             (factor base {}, target A {} bits, {} candidate primes)",
+            context.n.bit_len(),
+            context.base.len(),
+            context.target_a.bit_len(),
+            context.a_pool.len(),
+        );
+        return Err(EngineError::PolynomialSelection(message));
+    }
+    Ok(EngineContext(context))
 }
 
 /// Large-prime acceptance is independent from the sieve threshold slack.
@@ -374,12 +457,18 @@ impl EngineSession {
             seen_a: HashSet::new(),
         }
     }
+    /// Hand out up to `maximum` polynomial families to sieve.
+    ///
+    /// Returns fewer than `maximum` jobs — possibly none — once the family budget is spent, which a
+    /// caller distinguishes from "done" with [`EngineSession::is_ready`]. The bound matters:
+    /// `choose_a` declines a family whenever its `A` duplicates one already issued, so without a cap
+    /// a scheduler that kept asking would spin forever and grow `buffered` without limit.
     pub fn take_jobs(&mut self, maximum: usize) -> Vec<EngineJob> {
         if self.is_ready() {
             return Vec::new();
         }
         let mut jobs = Vec::with_capacity(maximum);
-        while jobs.len() < maximum {
+        while jobs.len() < maximum && self.next_job < MAX_FAMILIES {
             let family = self.next_job;
             self.next_job += 1;
             if let Some((a, _)) = choose_a(&self.context.0, family)
@@ -599,30 +688,28 @@ fn factor_node(
         }
         return Ok(());
     }
-    let d = if n.bit_len() <= 100 {
-        match pollard_brent_natural(&n, 16 * 1024 * 1024, || {
-            progress(EngineProgress {
-                phase: EnginePhase::Preprocessing,
-                polynomials: 0,
-                relations: 0,
-                target: 0,
-                workers: threads,
-            })
-        })? {
-            Some(factor) => {
-                if std::env::var_os("RUSQSIEVE_PROFILE").is_some() {
-                    eprintln!(
-                        "PROFILE rho input_bits={} factor_bits={} siqs=false",
-                        n.bit_len(),
-                        factor.bit_len()
-                    );
-                }
-                factor
+    let d = match pollard_brent_natural(&n, rho_budget(n.bit_len()), || {
+        progress(EngineProgress {
+            phase: EnginePhase::Preprocessing,
+            polynomials: 0,
+            relations: 0,
+            target: 0,
+            workers: threads,
+        })
+    })? {
+        Some(factor) => {
+            #[cfg(test)]
+            stage_counts::bump(&stage_counts::RHO);
+            if std::env::var_os("RUSQSIEVE_PROFILE").is_some() {
+                eprintln!(
+                    "PROFILE rho input_bits={} factor_bits={} siqs=false",
+                    n.bit_len(),
+                    factor.bit_len()
+                );
             }
-            None => find_factor(n.clone(), threads, progress)?,
+            factor
         }
-    } else {
-        find_factor(n.clone(), threads, progress)?
+        None => find_factor(n.clone(), threads, progress)?,
     };
     if d.is_one() || d == n {
         return Err(EngineError::NoFactor);
@@ -656,6 +743,8 @@ fn find_factor(
     }) {
         return Err(EngineError::Cancelled);
     }
+    #[cfg(test)]
+    stage_counts::bump(&stage_counts::SIQS);
     let prof = std::env::var_os("RUSQSIEVE_PROFILE").is_some();
     let t_fb = std::time::Instant::now();
     let ctx = prepare(n.clone())?.0;
@@ -668,14 +757,6 @@ fn find_factor(
             ctx.interval,
             target,
         );
-    }
-    if choose_a(&ctx, 0).is_none() {
-        let message = format!(
-            "polynomial-coefficient selection has no viable A for {}-bit input",
-            n.bit_len()
-        );
-        eprintln!("rusqsieve: {message}");
-        return Err(EngineError::PolynomialSelection(message));
     }
     let (job_tx, job_rx) = mpsc::channel::<Option<u64>>();
     let job_rx = Arc::new(Mutex::new(job_rx));
@@ -726,8 +807,7 @@ fn find_factor(
     let mut total_survivors = 0u64;
     let mut seen_a = HashSet::new();
     let mut cancelled = false;
-    let max_families = 100_000u64;
-    while collector.columns.len() < target && next_merge < max_families && !cancelled {
+    while collector.columns.len() < target && next_merge < MAX_FAMILIES && !cancelled {
         let result = res_rx
             .recv()
             .map_err(|_| EngineError::Worker("worker result channel disconnected".into()))?;
@@ -762,7 +842,7 @@ fn find_factor(
             }
         }
         while outstanding < threads * 2
-            && next_send < max_families
+            && next_send < MAX_FAMILIES
             && collector.columns.len() < target
         {
             job_tx
@@ -798,11 +878,13 @@ fn find_factor(
     }
     if prof {
         eprintln!(
-            "PROFILE sieve+collect={:.3}s polys={} families={} survivors={} relations={}",
+            "PROFILE sieve+collect={:.3}s polys={} families={} survivors={} partials={} cycles={} relations={}",
             t_sieve.elapsed().as_secs_f64(),
             polynomials,
             next_merge,
             total_survivors,
+            collector.forest.relations.len(),
+            collector.cycles,
             collector.columns.len()
         );
     }
@@ -928,12 +1010,6 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
             &scratch.root2,
             &mut scratch.scores,
             &mut scratch.candidates,
-            &mut scratch.candidate_slot,
-            &mut scratch.candidate_epoch,
-            &mut scratch.resieve_generation,
-            &mut scratch.hit_head,
-            &mut scratch.hit_prime,
-            &mut scratch.hit_next,
             &mut relations,
         ) as u64;
         if v + 1 >= variants {
@@ -1092,23 +1168,39 @@ fn choose_a(ctx: &Context, family: u64) -> Option<(Natural, Vec<u32>)> {
     best.map(|(_, a, idx)| (a, idx))
 }
 
-/// Tiny-prime skipping (audit frontier #3): primes below `small_skip()` are not added to the byte
-/// scores. They account for a large share of the score-write traffic (∑ 2·len/p) but contribute
-/// little log weight, and they are still divided out during factoring, so skipping them only removes
-/// sieve work. The score threshold is lowered by `small_slack()` to make up for their absent
-/// contribution to a smooth `g(x)`. Both are read once per polynomial and cached locally.
-/// `RUSQSIEVE_SMALL_SKIP` / `RUSQSIEVE_SMALL_SLACK` override them for tuning.
+/// Tiny-prime skipping: primes below `small_skip()` are not added to the byte scores. They account
+/// for a large share of the score-write traffic (∑ 2·len/p) but contribute little log weight, and
+/// they are still divided out during factoring, so skipping them only removes sieve work. The score
+/// threshold gives their expected contribution back via [`small_slack`].
+///
+/// Raising the skip further was swept at 224-bit (100 / 200 / 400 / 800 / 1600 / 3200) against the
+/// threshold offset and did not win: the score pass gets cheaper but each skipped prime widens the
+/// gap between a smooth value's score and its true log, so more smooth values fall under the
+/// threshold and the polynomial count rises faster. `RUSQSIEVE_SMALL_SKIP` overrides it for tuning.
 fn small_skip() -> u32 {
     static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_default("RUSQSIEVE_SMALL_SKIP", 100) as u32)
 }
-fn small_slack(base: &[FactorBaseEntry], score_weight: &[u8], skip: u32) -> usize {
+
+/// Expected log weight the score pass loses by skipping the tiny primes: `Σ w(p)/(p−1)` over the
+/// skipped set, since `p^k` divides a random value with probability `1/(p^k)` and the exponents sum
+/// geometrically. Derived from the actual factor base rather than the hardcoded 8 bits v0.2.0 used.
+fn small_slack(base: &[FactorBaseEntry], skip: u32) -> usize {
     base.iter()
-        .zip(score_weight)
-        .filter(|(entry, _)| entry.prime < skip)
-        .map(|(entry, &weight)| weight as f64 / (entry.prime.saturating_sub(1).max(1)) as f64)
+        .filter(|entry| entry.prime < skip)
+        .map(|entry| {
+            score_weight(entry.prime) as f64 / (entry.prime.saturating_sub(1).max(1)) as f64
+        })
         .sum::<f64>()
         .round() as usize
+}
+
+/// Sieve log weight of one factor-base prime: its bit length, i.e. `ceil(log2 p)`. Computed from the
+/// prime rather than read from a parallel array, so the score pass streams one fewer array over the
+/// whole factor base for every polynomial — which matters on the small-L2 targets this crate aims at.
+#[inline(always)]
+fn score_weight(prime: u32) -> u8 {
+    (32 - prime.leading_zeros()) as u8
 }
 /// Extra score bits required above the smooth threshold. Raising the bar a few bits sharply cuts
 /// false-positive survivors (≈99% of survivors are non-smooth) at the cost of a few more
@@ -1117,6 +1209,23 @@ fn thresh_margin() -> i32 {
     static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_default("RUSQSIEVE_THRESH_MARGIN", 0) as i32)
 }
+/// Read a signed tuning delta, zero when unset or unparsable. Used to sweep a tuned parameter
+/// relative to its shipped value without editing the table.
+fn env_delta(name: &str) -> i32 {
+    #[cfg(any(unix, windows))]
+    {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = name;
+        0
+    }
+}
+
 /// Read an unsigned tuning override, defaulting when unset or non-Unix. Callers cache the result
 /// in a per-knob `OnceLock` so the hot path never touches the environment or a lock.
 fn env_default(name: &str, default: usize) -> usize {
@@ -1136,9 +1245,12 @@ fn env_default(name: &str, default: usize) -> usize {
 
 /// Add the two root strides for one factor-base prime. Interleaving the roots and unrolling two
 /// hits at a time mirrors FLINT's flat sieve kernel and cuts loop-control overhead in the dominant
-/// score-write pass. For the practical range where `g_bits <= 192`, scores cannot overflow: every
-/// scored prime is at least 23, so the sum of rounded log weights is below
-/// `g_bits * (1 + 1/log2(23))`, with ample room in a byte. Wider inputs retain saturating addition.
+/// score-write pass.
+///
+/// `SATURATING` is chosen per polynomial by the caller, which proves the no-overflow bound from the
+/// smallest scored prime instead of assuming one (see `exact_scores` in [`sieve_one_poly`]).
+/// Non-saturating writes are worth the check: forcing saturating addition everywhere measured
+/// +1.5 cpu-s on 12.3 at 224-bit, about 7% of total sieve time.
 #[inline(always)]
 fn sieve_root_pair<const SATURATING: bool>(
     scores: &mut [u8],
@@ -1197,7 +1309,7 @@ fn score_polynomial<const SATURATING: bool>(
             continue;
         }
         let pu = p as usize;
-        let weight = ctx.score_weight[idx];
+        let weight = score_weight(p);
         if root1[idx] != u32::MAX {
             sieve_root_pair::<SATURATING>(
                 scores,
@@ -1232,17 +1344,63 @@ fn score_polynomial<const SATURATING: bool>(
     }
 }
 
-/// Collect high-scoring positions.
-fn collect_candidates(
-    scores: &[u8],
-    threshold: u8,
-    _high_bit_biased: bool,
-    candidates: &mut Vec<u32>,
-) {
+/// Divide `q` by `p` as often as it goes, returning the exponent.
+///
+/// The remainder is taken first even though that means two passes over the limbs on a successful
+/// division: `rem_u64` does not materialize a quotient, while `div_rem_u64` builds and returns a
+/// whole `Natural`, and the terminating call — the one that finds a nonzero remainder — happens on
+/// every invocation. Folding the two into one `div_rem_u64` per iteration measured slower.
+#[inline]
+fn divide_out(q: &mut Natural, p: u64) -> u16 {
+    let mut count = 0;
+    while q.rem_u64(p) == 0 {
+        *q = q.div_rem_u64(p).unwrap().0;
+        count += 1;
+    }
+    count
+}
+
+/// Collect high-scoring positions, ascending.
+///
+/// Survivors are rare — a handful of positions in a 180–640 KiB score array — so this is a pure
+/// rejection loop, and the caller biases every score by `128 − threshold` precisely so that
+/// "reached the threshold" becomes "high bit set". One `and` then rejects eight positions at a time.
+/// The bias is applied by the caller rather than folded in here because a runtime bias would cost an
+/// `add` and an `or` per word, which measured 2.7× slower than the masked test on the 224-bit case.
+fn collect_candidates(scores: &[u8], threshold: u8, candidates: &mut Vec<u32>) {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    debug_assert!(
+        threshold >= 128,
+        "scores must be biased so that the threshold is the byte's high bit"
+    );
     candidates.clear();
-    for (pos, &score) in scores.iter().enumerate() {
+    let mut chunks = scores.chunks_exact(8);
+    for (word_index, chunk) in chunks.by_ref().enumerate() {
+        let word = u64::from_ne_bytes(chunk.try_into().unwrap());
+        if word & HIGH == 0 {
+            continue;
+        }
+        let start = word_index * 8;
+        // `threshold == 128` is the biased case, where the high bit alone decides and the byte
+        // compare folds away. A deeper threshold leaves the word test as a prefilter only.
+        if threshold == 128 {
+            for (offset, &score) in chunk.iter().enumerate() {
+                if score & 0x80 != 0 {
+                    candidates.push((start + offset) as u32);
+                }
+            }
+        } else {
+            for (offset, &score) in chunk.iter().enumerate() {
+                if score >= threshold {
+                    candidates.push((start + offset) as u32);
+                }
+            }
+        }
+    }
+    let start = scores.len() - chunks.remainder().len();
+    for (offset, &score) in chunks.remainder().iter().enumerate() {
         if score >= threshold {
-            candidates.push(pos as u32);
+            candidates.push((start + offset) as u32);
         }
     }
 }
@@ -1258,12 +1416,6 @@ fn sieve_one_poly(
     root2: &[u32],
     scores: &mut Vec<u8>,
     candidates: &mut Vec<u32>,
-    candidate_slot: &mut Vec<u32>,
-    candidate_epoch: &mut Vec<u32>,
-    resieve_generation: &mut u32,
-    hit_head: &mut Vec<u32>,
-    hit_prime: &mut Vec<u32>,
-    hit_next: &mut Vec<u32>,
     out: &mut Vec<Relation>,
 ) -> usize {
     let base = &ctx.base;
@@ -1277,93 +1429,64 @@ fn sieve_one_poly(
         (ctx.sieve_n.wrapping_sub(&bb).div_rem(a).unwrap().0, true)
     };
     let g_bits = ctx.sieve_n.bit_len().saturating_sub(a.bit_len());
-    // Score threshold: a survivor's sieved-prime log-weight must come within `lp_allowance` bits
-    // of g(x). SMALL_SLACK compensates for the tiny primes we no longer score; THRESH_MARGIN
-    // raises the bar to suppress false-positive survivors. Bias practical-range score bytes so
-    // the candidate comparison becomes a high-bit test, enabling a word-at-a-time scan.
-    static THRESH_ADJ: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
-    let adj = *THRESH_ADJ.get_or_init(|| {
-        std::env::var("RUSQSIEVE_THRESH_ADJ")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(-8)
-    });
-    const LOG_SCALE: i32 = 2;
-    let threshold = (LOG_SCALE * (g_bits as i32 - ctx.lp_allowance as i32)
-        - small_slack(base, &ctx.score_weight, small_skip) as i32
-        + LOG_SCALE * (thresh_margin() + adj))
+    // Score threshold: a survivor's scored-prime log weight must come within `lp_bits` of g(x), the
+    // point past which the unfactored cofactor could no longer be an acceptable large prime.
+    // `small_slack` gives back the tiny primes that are not scored, and `thresh_adj` is the measured
+    // per-tier offset trading survivors against polynomials (see `qs::parameters`).
+    let threshold = (g_bits as i32 - ctx.lp_bits as i32 - ctx.small_slack as i32
+        + thresh_margin()
+        + ctx.thresh_adj)
         .clamp(1, u8::MAX as i32) as u8;
-    let high_bit_biased = false;
-    let initial_score = 0;
+    // Factor-base entries with `prime < small_skip` occupy the low indices (the base is sorted
+    // ascending). Those tiny primes are not sieved — gating them would waste a `fastmod` where a
+    // direct divide is cheaper (they divide most survivors) — so they are divided out directly.
+    let small_end = base.partition_point(|e| e.prime < small_skip);
+    // Bias every score so that reaching `threshold` sets the byte's high bit; the candidate scan is
+    // then one masked compare per eight positions (see `collect_candidates`).
+    let bias = 128u8.saturating_sub(threshold);
+    let scan_threshold = threshold.saturating_add(bias);
+    // Wrapping score writes are one instruction cheaper than saturating ones, but they are only
+    // sound when no position can carry past 255. Every scored prime is at least
+    // `base[small_end].prime`, so at most `g_bits / floor(log2 p_min)` distinct scored primes can
+    // divide one `g(x)`, and each adds at most `log2(p) + 1` — hence the bound below. When it does
+    // not fit, fall back to saturating writes, which lose the exact-score trial-division shortcut
+    // but cannot produce a false negative. This is the invariant that `RUSQSIEVE_SMALL_SKIP` could
+    // previously break silently into wrapping overflow and false negatives.
+    let smallest_scored = base.get(small_end).map_or(u32::MAX, |e| e.prime).max(3);
+    let scored_bits = (32 - smallest_scored.leading_zeros() - 1).max(1);
+    let score_bound = g_bits as u32 + g_bits as u32 / scored_bits + 1;
+    let exact_scores = bias as u32 + score_bound <= u8::MAX as u32;
     scores.clear();
-    scores.resize(len, initial_score);
+    scores.resize(len, bias);
     // Flat logarithmic sieve. The formerly gated cache-blocked kernel was
     // unreachable for every shipped interval and was slower when forced on.
-    score_polynomial::<true>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
-    collect_candidates(scores, threshold, high_bit_biased, candidates);
+    if exact_scores {
+        score_polynomial::<false>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
+    } else {
+        score_polynomial::<true>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
+    }
+    collect_candidates(scores, scan_threshold, candidates);
     if candidates.is_empty() {
         return 0;
     }
     let survivors = candidates.len();
 
     let two_idx = base.iter().position(|e| e.prime == 2).map(|i| i as u32);
-    // Factor-base entries with `prime < small_skip` occupy the low indices (the base is sorted
-    // ascending). Those tiny primes are not sieved — gating them would waste a `fastmod` where a
-    // direct divide is cheaper (they divide most survivors) — so they are divided out directly.
-    let small_end = base.partition_point(|e| e.prime < small_skip);
-    // Dense small-prime root progressions are cheaper to test directly per
-    // survivor. Resieve only the sparse tail, where replaying root hits visits
-    // far fewer positions than an nfb scan.
-    let sparse_cutoff = (ctx.interval as u32 / 2).max(32_768);
-    let resieve_start = base
-        .partition_point(|e| e.prime < sparse_cutoff)
-        .max(small_end);
-    if candidate_slot.len() != len {
-        candidate_slot.resize(len, 0);
-        candidate_epoch.resize(len, 0);
-    }
-    *resieve_generation = resieve_generation.wrapping_add(1);
-    if *resieve_generation == 0 {
-        candidate_epoch.fill(0);
-        *resieve_generation = 1;
-    }
-    let generation = *resieve_generation;
-    hit_head.clear();
-    hit_head.resize(candidates.len(), u32::MAX);
-    hit_prime.clear();
-    hit_next.clear();
-    for (candidate_index, &position) in candidates.iter().enumerate() {
-        candidate_slot[position as usize] = candidate_index as u32;
-        candidate_epoch[position as usize] = generation;
-    }
-    for idx in resieve_start..base.len() {
-        if root1[idx] == u32::MAX {
-            continue;
-        }
-        let step = base[idx].prime as usize;
-        for &root in &[root1[idx], root2[idx]] {
-            let mut position = root as usize;
-            while position < len {
-                if candidate_epoch[position] == generation {
-                    let candidate_index = candidate_slot[position];
-                    let hit = hit_prime.len() as u32;
-                    hit_prime.push(idx as u32);
-                    hit_next.push(hit_head[candidate_index as usize]);
-                    hit_head[candidate_index as usize] = hit;
-                }
-                position += step;
-            }
-        }
-    }
     let mut powers_scratch = Vec::new();
 
-    for (candidate_index, &posu) in candidates.iter().enumerate() {
+    for &posu in candidates.iter() {
         let pos = posu as usize;
-        // The score is the sum of one rounded log weight per sieve hit. Once confirmed factors
-        // account for that weight, no later normal factor-base prime can divide this candidate.
-        // This is FLINT's `extra_bits < sieve[i]` stopping rule and avoids scanning the tail of the
-        // factor base for partial relations. It is exact on the non-saturating practical-range
-        // kernel; wider saturated scores conservatively disable the shortcut.
+        // The score is the sum of one log weight per sieve hit. Once the primes divided out account
+        // for that whole weight, no further scored factor-base prime can divide this candidate.
+        // This is FLINT's `extra_bits < sieve[i]` stopping rule; it saves scanning the tail of the
+        // factor base for the ~99% of survivors that are not smooth. It is exact only when scores
+        // did not saturate, so saturating polynomials disable it by demanding an unreachable score.
+        let score_target = if exact_scores {
+            u16::from(scores[pos].wrapping_sub(bias))
+        } else {
+            u16::MAX
+        };
+        let mut confirmed_score = 0u16;
         let x = pos as i64 - ctx.interval as i64;
         let xabs = x.unsigned_abs();
         let ax = a.checked_mul(&Natural::from_u64(xabs)).unwrap();
@@ -1418,65 +1541,48 @@ fn sieve_one_poly(
                     continue;
                 }
             }
-            let mut count = 0;
-            while q.rem_u64(p) == 0 {
-                q = q.div_rem_u64(p).unwrap().0;
-                count += 1;
-            }
+            let count = divide_out(&mut q, p);
             record(i as u32, count, &mut powers_scratch);
         }
         // Primes dividing `a` (seeded at exponent 1, root1 == MAX so not gated) — divide directly.
         for &ai in aidx {
             let p = base[ai as usize].prime as u64;
-            let mut count = 0;
-            while q.rem_u64(p) == 0 {
-                q = q.div_rem_u64(p).unwrap().0;
-                count += 1;
+            let count = divide_out(&mut q, p);
+            if count != 0 && p >= small_skip as u64 {
+                confirmed_score += u16::from(score_weight(p as u32));
             }
             record(ai, count, &mut powers_scratch);
         }
-        for idx in small_end..resieve_start {
+        // Scored factor base: gate each prime with the precomputed multiply-shift residue test and
+        // divide only on a hit (FLINT `qsieve_evaluate_candidate`), stopping as soon as the recorded
+        // score is accounted for or nothing is left to divide.
+        //
+        // msieve-style resieving was implemented here — replaying the root progressions of the
+        // sparse tail over a candidate bitmap so those primes cost O(number of factors) instead of a
+        // gated scan — and measured a net LOSS at every size and every cutoff tried (224-bit: gate
+        // scan 2.40 -> 1.49 cpu-s but the resieve pass cost 1.59; 256-bit: 26.5 -> 12.0 against a
+        // 17.1 cpu-s pass). The reason is structural: the gate below is only ~9 cycles per prime, so
+        // resieving competes against an already-cheap test, and its cost falls per *polynomial*
+        // while the saving accrues per *survivor* — and this engine sees only ~5 survivors per
+        // polynomial. See CHANGELOG 0.2.1.
+        for idx in small_end..base.len() {
+            if q.is_one() || confirmed_score >= score_target {
+                break;
+            }
             let r1 = root1[idx];
             if r1 == u32::MAX {
-                continue;
+                continue; // prime divides `a`; handled above
             }
             let p = base[idx].prime;
             let position_mod_p = fastmod(posu, p, ctx.pinv[idx]);
             if position_mod_p != r1 && position_mod_p != root2[idx] {
                 continue;
             }
-            let mut count = 0;
-            loop {
-                let (quotient, remainder) = q.div_rem_u64(p as u64).unwrap();
-                if remainder != 0 {
-                    break;
-                }
-                q = quotient;
-                count += 1;
+            let count = divide_out(&mut q, p as u64);
+            if count != 0 {
+                confirmed_score += u16::from(score_weight(p));
             }
             record(idx as u32, count, &mut powers_scratch);
-        }
-        // The resieve pass recorded exactly the factor-base roots hit by this
-        // candidate, so trial division is O(number of factors), not O(nfb).
-        let mut hit = hit_head[candidate_index];
-        while hit != u32::MAX {
-            if q.is_one() {
-                break;
-            }
-            let idx = hit_prime[hit as usize] as usize;
-            let p = base[idx].prime;
-            let pu = p as u64;
-            let mut count = 0;
-            loop {
-                let (quotient, remainder) = q.div_rem_u64(pu).unwrap();
-                if remainder != 0 {
-                    break;
-                }
-                q = quotient;
-                count += 1;
-            }
-            record(idx as u32, count, &mut powers_scratch);
-            hit = hit_next[hit as usize];
         }
         let large = if q.is_one() {
             LargePrime::None
@@ -1562,6 +1668,9 @@ fn classify_cofactor(q: u64, single_limit: u64, double_enabled: bool) -> Option<
     }
 }
 
+/// Bounded, cancellable Pollard-Brent over `Natural`. `iteration_limit` is the total across every
+/// polynomial constant tried, not per constant, so the caller's budget is the whole cost of the
+/// stage; see [`rho_budget`].
 #[cfg(any(unix, windows))]
 fn pollard_brent_natural(
     n: &Natural,
@@ -1571,8 +1680,11 @@ fn pollard_brent_natural(
     if n.is_even() {
         return Ok(Some(Natural::from_u64(2)));
     }
+    let mut iterations = 0u64;
     for c_value in 1..=8u64 {
-        let mut iterations = 0u64;
+        if iterations >= iteration_limit {
+            return Ok(None);
+        }
         if !keep_going() {
             return Err(EngineError::Cancelled);
         }
@@ -1726,7 +1838,7 @@ fn pollard_u64(n: u64) -> Option<u64> {
                 let mut product = mont.encode(1);
                 for _ in 0..batch {
                     y = mont.add(mont.mul(y, y), c_mont);
-                    let difference = if x >= y { x - y } else { y - x };
+                    let difference = x.abs_diff(y);
                     if difference != 0 {
                         product = mont.mul(product, difference);
                     }
@@ -1819,19 +1931,26 @@ impl Forest {
 struct RelationCollector {
     forest: Forest,
     columns: Vec<Column>,
+    /// Partials combined into full relations by closing a large-prime cycle. Reported by the
+    /// profiling path so the retained-partial count and the cycle yield can be compared directly.
+    cycles: usize,
 }
 impl RelationCollector {
     fn new() -> Self {
         Self {
             forest: Forest::default(),
             columns: Vec::new(),
+            cycles: 0,
         }
     }
     fn ingest(&mut self, rel: Relation, n: &Natural) {
         match rel.large {
             LargePrime::None => self.columns.push(to_column(rel)),
             LargePrime::One(p) => self.edge(p, 1, rel, n),
-            LargePrime::Two(a, b) if a == b => self.columns.push(combine_cycle([&rel], n)),
+            LargePrime::Two(a, b) if a == b => {
+                self.cycles += 1;
+                self.columns.push(combine_cycle([&rel], n))
+            }
             LargePrime::Two(a, b) => self.edge(a, b, rel, n),
         }
     }
@@ -1842,6 +1961,7 @@ impl RelationCollector {
             let mut path = Vec::new();
             self.forest.path(va, &mut path);
             self.forest.path(vb, &mut path);
+            self.cycles += 1;
             self.columns.push(combine_cycle(
                 core::iter::once(&rel).chain(
                     path.iter()
@@ -2036,6 +2156,61 @@ fn powmod64(mut a: u64, mut e: u64, n: u64) -> u64 {
 mod tests {
     use super::*;
 
+    /// `find_factor` used to carry its own copy of the whole of `prepare`, and the two copies had
+    /// already diverged on this one expression: `prepare` translated sieve roots by
+    /// `sieve_half_width % prime` while the native copy used `interval as u32 % prime`. They agree
+    /// only because `interval` *is* the (positive) sieve half width, which is the invariant pinned
+    /// here — together with the property the sieve actually depends on, namely that adding the
+    /// precomputed translation to a root mod `p` equals translating the signed coordinate first.
+    #[test]
+    fn interval_translation_matches_the_signed_coordinate_shift() {
+        let p = Natural::from_u64(18_446_744_073_709_551_557);
+        let q = Natural::from_u64(18_446_744_073_709_551_533);
+        let ctx = prepare(p.checked_mul(&q).unwrap()).unwrap().0;
+        let params = crate::qs::parameters::engine_params(ctx.n.bit_len());
+        assert_eq!(ctx.interval, params.sieve_half_width as i32);
+        assert!(ctx.interval > 0);
+        for (entry, &translation) in ctx.base.iter().zip(ctx.interval_mod_p.iter()) {
+            let prime = entry.prime;
+            assert_eq!(translation, params.sieve_half_width % prime);
+            assert_eq!(translation, ctx.interval as u32 % prime);
+            for x in [
+                -(ctx.interval as i64),
+                -1,
+                0,
+                1,
+                (prime as i64) - 1,
+                ctx.interval as i64 - 1,
+            ] {
+                let position = (x + ctx.interval as i64) as u64 % prime as u64;
+                let xmod = x.rem_euclid(prime as i64) as u32;
+                assert_eq!(
+                    position as u32,
+                    add_mod_u32(xmod, translation, prime),
+                    "p={prime} x={x}"
+                );
+            }
+        }
+    }
+
+    /// A deterministic `choose_a` famine must be reported as a parameter-selection failure and must
+    /// cost nothing, rather than burning the whole family budget and reporting "no factor". The
+    /// 65-85-bit dead zone made this indistinguishable from a genuine search failure in v0.2.0.
+    #[test]
+    fn polynomial_selection_famine_is_diagnosed_without_searching() {
+        let base = [FactorBaseEntry {
+            prime: 3,
+            log_prime: 9,
+            sqrt_n: 1,
+        }];
+        let target = Natural::from_u64(1 << 40);
+        let (all, pool, count) = build_a_candidates(&base, &target);
+        assert!(
+            all.len() < count || pool.is_empty(),
+            "a one-prime factor base cannot supply {count} coefficient factors"
+        );
+    }
+
     #[test]
     fn precomputed_remainders_and_root_translation_are_exact() {
         for p in 2u32..=10_000 {
@@ -2090,6 +2265,147 @@ mod tests {
                 .iter()
                 .try_fold(Natural::ONE, |a, b| a.checked_mul(b)),
             Some(n)
+        );
+    }
+
+    /// Balanced semiprimes at 65, 70, 75, 80, 85 and 90 bits, whose cofactors also cover the band.
+    const DEAD_ZONE: [&str; 6] = [
+        "18446744400127067027",        // 65 bits, the minimum reproducer
+        "635904368119925963561",       // 70 bits
+        "20988451891514649258347",     // 75 bits
+        "703713894016303629914563",    // 80 bits
+        "22921914745054882120472087",  // 85 bits
+        "648536833001811612107041493", // 90 bits
+    ];
+
+    /// Phase 1.1: `choose_a` could not build a candidate pool anywhere in the 65-85-bit band, because
+    /// it drew from primes above 1000 (10 bits and up) while accepting only primes within one bit of
+    /// `ideal_bits`, which is 6 there. The pool was empty for every family, so `polys` stayed 0.
+    ///
+    /// This has to be asserted against the engine directly. The Phase 1.3 rho stage now splits
+    /// everything in this band before SIQS is reached, so an end-to-end `factor()` on a dead-zone
+    /// input would succeed even with the bug fully present — exactly the masking the brief predicted.
+    #[test]
+    fn siqs_builds_polynomials_across_the_dead_zone() {
+        use std::str::FromStr;
+        for case in DEAD_ZONE {
+            let n = Natural::from_str(case).unwrap();
+            let context =
+                prepare(n.clone()).unwrap_or_else(|e| panic!("{case} ({} bits): {e}", n.bit_len()));
+            assert!(
+                !context.0.a_pool.is_empty(),
+                "{case} ({} bits): empty A candidate pool",
+                n.bit_len()
+            );
+            let result = execute(&context, EngineJob { family: 0 });
+            assert!(
+                result.polynomials > 0,
+                "{case} ({} bits): no polynomials from family 0",
+                n.bit_len()
+            );
+        }
+    }
+
+    /// The same band, end to end through SIQS with the rho stage bypassed, so a factor really is
+    /// recovered from sieved relations rather than from the preceding ladder stage.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn siqs_alone_factors_the_dead_zone() {
+        use std::str::FromStr;
+        for case in DEAD_ZONE {
+            let n = Natural::from_str(case).unwrap();
+            let d = find_factor(n.clone(), 2, &mut |_| true)
+                .unwrap_or_else(|e| panic!("{case} ({} bits): {e}", n.bit_len()));
+            assert!(!d.is_one() && d != n, "{case}: trivial factor {d}");
+            assert!(
+                n.div_rem(&d).unwrap().1.is_zero(),
+                "{case}: {d} does not divide it"
+            );
+        }
+    }
+
+    /// Phase 1.3: the bounded Pollard-Brent stage must split an unbalanced `N` — the case SIQS is
+    /// worst at, since SIQS pays for the size of `N` while rho pays for the size of its smallest
+    /// factor — without entering SIQS at all. Asserted through the stage counters rather than from
+    /// the answers, because SIQS returns the same factors and would hide a dead rho stage.
+    ///
+    /// These are the unbalanced entries of the supplied corpus whose small factor is above the 10^4
+    /// trial-division bound: 16, 20 and 24-bit factors of 127, 160 and 224-bit inputs. The 224-bit
+    /// one takes 0.01 s through rho against about 5 s of sieving.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn rho_stage_splits_unbalanced_inputs_without_entering_siqs() {
+        use std::str::FromStr;
+        let cases = [
+            "88948294177717782578521953992989251229",
+            "1185123569529286501965460691005493488051524107431",
+            "13695626177198106295200293487798368178679518660650179392786377544541",
+        ];
+        for case in cases {
+            let n = Natural::from_str(case).unwrap();
+            stage_counts::reset();
+            let factors = factor(n.clone(), 2, |_| true).unwrap();
+            assert_eq!(
+                factors
+                    .iter()
+                    .try_fold(Natural::ONE, |acc, f| acc.checked_mul(f)),
+                Some(n.clone()),
+                "{case} did not factor back"
+            );
+            assert!(
+                stage_counts::rho() > 0,
+                "{case} ({} bits) did not reach the rho stage",
+                n.bit_len()
+            );
+            assert_eq!(
+                stage_counts::siqs(),
+                0,
+                "{case} ({} bits) entered SIQS",
+                n.bit_len()
+            );
+        }
+    }
+
+    /// The other half of the previous test: on a balanced semiprime the rho stage must spend its
+    /// budget and hand off, so the assertion above cannot pass by the counters being wired backwards.
+    /// This is also what keeps the stage honest — an unbounded rho here measured 0.56 s at 80 bits
+    /// and 2.16 s at 90 bits against 0.03 s and 0.01 s for SIQS alone.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn balanced_semiprimes_fall_through_rho_to_siqs() {
+        let p = Natural::from_u64(18_446_744_073_709_551_557);
+        let q = Natural::from_u64(18_446_744_073_709_551_533);
+        let n = p.checked_mul(&q).unwrap();
+        stage_counts::reset();
+        factor(n, 2, |_| true).unwrap();
+        assert!(stage_counts::siqs() > 0, "128-bit input skipped SIQS");
+    }
+
+    /// The budget is the total across every polynomial constant tried, not per constant. It was
+    /// per-constant at first, which made the stage cost 8× its nominal budget — 27 s of a 64 s
+    /// 256-bit run — while reporting the same number.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn rho_respects_its_total_iteration_budget() {
+        let p = Natural::from_u64(18_446_744_073_709_551_557);
+        let q = Natural::from_u64(18_446_744_073_709_551_533);
+        let n = p.checked_mul(&q).unwrap();
+        let mut polls = 0usize;
+        let started = std::time::Instant::now();
+        let result = pollard_brent_natural(&n, 4_096, || {
+            polls += 1;
+            true
+        })
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "4096 iterations should not split a 128-bit balanced semiprime"
+        );
+        // Eight constants each running to a 4096-iteration budget would take multiple seconds in an
+        // unoptimized test build; one shared budget is milliseconds.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "budget was not shared across constants ({polls} cancellation polls)"
         );
     }
 

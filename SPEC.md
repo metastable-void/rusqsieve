@@ -330,22 +330,31 @@ score-array positions.
 
 ### 7.4 Logarithmic sieve
 
-Workers reuse score, root, increment, candidate, and sparse-hit buffers across
-polynomials.
+Workers reuse score, root, increment, and candidate buffers across polynomials.
 
-The sieve uses twice-log2 saturating `u8` scores and:
+The sieve uses bit-length `u8` scores and:
 
-1. initializes scores to zero;
-2. skips selected very small primes and derives their expected threshold slack;
-3. adds rounded `2 log2(p)` weights at both sorted modular roots;
+1. biases every score by `128 − threshold`, so reaching the threshold sets the
+   byte's high bit;
+2. skips selected very small primes and derives their expected threshold slack
+   from that set;
+3. adds `ceil(log2 p)` weights at both sorted modular roots, wrapping rather
+   than saturating whenever the engine can prove from the smallest scored prime
+   that no position can carry past 255;
 4. uses the paired root-difference stride loop;
-5. records factor-base indices while scoring the sparse large-prime tail;
-6. extracts threshold candidates;
-7. trial-divides survivors from direct dense-prefix tests and recorded tail hits.
+5. extracts candidates eight positions at a time with one masked compare;
+6. trial-divides survivors.
 
 For each survivor, `g(x) = Q(x)/A` is reconstructed directly as a signed value.
-Candidate division of the dense prefix is gated by a precomputed
-multiply-shift residue test; the sparse tail consumes only recorded root hits.
+Candidate division is gated by a precomputed multiply-shift residue test and
+stops as soon as the primes divided out account for the recorded score, which is
+exact when the scores did not saturate.
+
+The sieve threshold is `log2|g(x)| − log2(large-prime bound) − small-prime slack`
+plus a measured per-tier offset. The large-prime term is the acceptance bound
+itself, not an independent constant: a survivor whose cofactor exceeds what
+`classify_cofactor` will accept costs a full trial division for no possible
+relation.
 
 ### 7.5 Relations and large primes
 

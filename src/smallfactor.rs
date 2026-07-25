@@ -3,7 +3,7 @@
 //! Deterministic Miller–Rabin primality and Pollard–Brent factorization using
 //! only `u64`/`u128` arithmetic. This bypasses fixed-capacity `Natural` big-integer
 //! arithmetic entirely for small cofactors, which dominates cost below the SIQS
-//! range. Results are deterministic (fixed sequence seeds), as required by SPEC §20.
+//! range. Results are deterministic (fixed sequence seeds), as required by SPEC §6.
 use std::sync::OnceLock;
 
 /// Trial-division bound for the cached small-prime table.
@@ -106,8 +106,11 @@ pub fn is_prime_u64(n: u64) -> bool {
     true
 }
 
-/// Brent's improvement to Pollard's rho with batched GCD. `n` must be an odd
-/// composite; returns a nontrivial factor. Deterministic given `n`.
+/// Brent's improvement to Pollard's rho with batched GCD. Returns a nontrivial factor of the
+/// composite `n`, or `None` if `cancelled` fires first. Deterministic given `n`.
+///
+/// `n` must be composite — the cycle search does not terminate for a prime. Even `n` is handled
+/// directly rather than excluded, so only oddness of a *composite* argument is unnecessary.
 fn pollard_brent(n: u64, cancelled: &mut impl FnMut() -> bool) -> Option<u64> {
     if n.is_multiple_of(2) {
         return Some(2);

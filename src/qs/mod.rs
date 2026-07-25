@@ -341,39 +341,49 @@ pub mod parameters {
     }
 
     /// Tuned SIQS engine parameters per input bit-length. These were selected by
-    /// benchmarking balanced semiprimes against `flintqs`. `lp_allowance` is the
-    /// large-prime cofactor budget (bits) used to derive the sieve threshold
-    /// `2 * (log2|g(x)| - lp_allowance)`.
+    /// benchmarking balanced semiprimes against `flintqs`.
     ///
     /// The 193–224 range grows the factor base far beyond the older 60k bound. With Barrett-gated
     /// trial division (`engine.rs`, FLINT-style) the per-survivor factoring is cheap at any nfb, so
     /// these relation-starved bit-lengths benefit from a larger factor base: it raises smooth
     /// density, needing far fewer polynomials, dropping total sieve work (measured −15% at 208,
     /// −33% at 192, −45% at 224 vs the pre-optimization baseline). These nfb targets (≈5.7k at 208,
-    /// ≈11k at 224) track FLINT's `qsieve_tune` table. Beyond 224 the optimum is *smaller* (≈7k at
-    /// 240, ≈9k at 256): with many more polynomials, the per-polynomial O(nfb) costs (Gray-code root
-    /// updates and the score-write scan) dominate and cap the affordable factor base. Lifting that
-    /// cap needs the still-unbuilt cache-blocked sieve + larger intervals (fewer, larger polynomials)
-    /// and a sparse Block-Lanczos linear algebra (the dense solve is single-threaded and O(nfb²⁺)).
+    /// ≈11k at 224) track FLINT's `qsieve_tune` table.
+    ///
+    /// The bounds above 224 build ≈15.1k and ≈20.9k primes, and both were re-measured against the
+    /// alternatives at 256-bit, 4 threads (sieve + linear algebra, seconds): 150k → 79.6, 250k →
+    /// 50.8, 350k → 39.9, **500k → 35.9**, 700k → 37.2, 1M → 45.7. Shrinking the base makes the
+    /// sieve relation-starved; growing it makes the single-threaded dense solve explode (LA alone:
+    /// 2.6 s at 500k, 5.5 s at 700k, 12.3 s at 1M). Sieve half-widths were checked the same way
+    /// (327 680 → 35.9, 458 752 → 37.8, 655 360 → 43.8). An earlier revision of this comment
+    /// claimed the optimum beyond 224 bits was *smaller* — ≈7k at 240 and ≈9k at 256 — which
+    /// contradicted the table it documented and does not hold on measurement.
+    ///
+    /// `thresh_adj` is the measured sieve-threshold offset in bits, added to
+    /// `log2|g(x)| − log2(large-prime bound) − small-prime slack`. Deeper thresholds trade more
+    /// survivors for fewer polynomials, and the optimum deepens with input size because
+    /// per-polynomial cost grows faster than per-survivor cost. Measured optima on a 48-core Xeon
+    /// 8259CL at 4 threads: 0 at 192-bit, −2 at 224-bit, −4 at 256-bit; the intermediate tiers
+    /// interpolate that ramp and were not measured individually.
     #[derive(Clone, Copy, Debug)]
     pub struct EngineParams {
         pub factor_base_bound: u32,
         pub sieve_half_width: u32,
-        pub lp_allowance: usize,
+        pub thresh_adj: i32,
         pub large_prime_mult: u32,
     }
     pub fn engine_params(bits: usize) -> EngineParams {
         #[allow(unused_mut)]
-        let (mut factor_base_bound, mut sieve_half_width, lp_allowance) = match bits {
-            0..=100 => (3_000, 32_768, 16),
-            101..=128 => (6_000, 32_768, 18),
-            129..=160 => (40_000, 65_536, 22),
-            161..=176 => (60_000, 65_536, 22),
-            177..=192 => (100_000, 90_112, 22),
-            193..=208 => (120_000, 131_072, 26),
-            209..=224 => (250_000, 262_144, 26),
-            225..=248 => (350_000, 262_144, 30),
-            _ => (500_000, 327_680, 34),
+        let (mut factor_base_bound, mut sieve_half_width, thresh_adj) = match bits {
+            0..=100 => (3_000, 32_768, 0),
+            101..=128 => (6_000, 32_768, 0),
+            129..=160 => (40_000, 65_536, 0),
+            161..=176 => (60_000, 65_536, 0),
+            177..=192 => (100_000, 90_112, 0),
+            193..=208 => (120_000, 131_072, -1),
+            209..=224 => (250_000, 262_144, -2),
+            225..=248 => (350_000, 262_144, -3),
+            _ => (500_000, 327_680, -4),
         };
         // Tuning overrides (experimentation only; unset in production builds).
         #[cfg(any(unix, windows))]
@@ -394,7 +404,7 @@ pub mod parameters {
         EngineParams {
             factor_base_bound,
             sieve_half_width,
-            lp_allowance,
+            thresh_adj,
             large_prime_mult: 256,
         }
     }
@@ -521,7 +531,7 @@ fn is_prime_u64(n: u64) -> bool {
     true
 }
 
-/// Portable logarithmic quadratic sieve (SPEC §12.6).
+/// Portable logarithmic quadratic sieve (SPEC §7.4).
 ///
 /// Each job sieves `polynomial_count` contiguous segments of the `Q(x) = x² - N`
 /// line (`x = ceil_sqrt(N) + offset`, `N = working_n`). For every factor-base

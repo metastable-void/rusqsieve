@@ -162,7 +162,8 @@ Notable performance work includes:
 
 - target-fitted SIQS polynomials and Gray-code root updates;
 - translated, sorted roots and a paired root-difference stride loop;
-- twice-log2 logarithmic scores with recorded sparse-tail resieve hits;
+- biased byte logarithmic scores with word-at-a-time candidate rejection;
+- multiply-shift-gated survivor division that stops on the recorded score;
 - single-large-prime relation combination with a bounded 256× factor-base limit;
 - deterministic low-weight sparse matrix elimination;
 - compact residual row-echelon solving;

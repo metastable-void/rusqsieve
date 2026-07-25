@@ -142,10 +142,11 @@ fn balanced_semiprimes_across_the_choose_a_dead_zone() {
     }
 }
 
-#[test]
-fn supplied_factorization_corpus() {
+/// Every entry of the supplied corpus, parsed. The arity varies from 1 to 10, so the whole line is
+/// read and no entry may be assumed to be a semiprime.
+fn corpus_entries() -> Vec<(&'static str, Vec<&'static str>)> {
     let corpus = include_str!("data/rusqsieve-factorization-corpus.txt");
-    let mut tested = 0usize;
+    let mut entries = Vec::new();
     for (line_index, line) in corpus.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -157,16 +158,70 @@ fn supplied_factorization_corpus() {
             "corpus line {} has no factorization",
             line_index + 1
         );
-        assert_factorization(fields[0], &fields[1..]);
+        entries.push((fields[0], fields[1..].to_vec()));
+    }
+    assert_eq!(entries.len(), 309, "unexpected corpus entry count");
+    entries
+}
+
+/// Where the default corpus test stops and the `#[ignore]`d one picks up. Every one of the 117
+/// entries in the 65-85-bit `choose_a` dead zone — the regression this corpus exists for — is below
+/// it, with margin. Above it the entries are genuine SIQS work: a 256-bit factorization is tens of
+/// seconds in a release build and minutes in the default unoptimized test profile, which would make
+/// `cargo test` too slow to be run.
+const DEFAULT_TIER_BITS: usize = 128;
+
+/// The corpus through [`DEFAULT_TIER_BITS`]. Note this exercises the ladder's cheap stages, not the
+/// sieve: since the Pollard-Brent stage was added, everything in this band splits before SIQS is
+/// reached. The dead zone is pinned against the sieve itself by `engine`'s
+/// `siqs_builds_polynomials_across_the_dead_zone` and `siqs_alone_factors_the_dead_zone`.
+#[test]
+fn supplied_factorization_corpus_through_128_bits() {
+    let mut tested = 0usize;
+    let mut in_dead_zone = 0usize;
+    for (n, factors) in corpus_entries() {
+        let bits = Natural::<16>::from_str(n).unwrap().bit_len();
+        if bits > DEFAULT_TIER_BITS {
+            continue;
+        }
+        assert_factorization(n, &factors);
+        tested += 1;
+        if (65..=85).contains(&bits) {
+            in_dead_zone += 1;
+        }
+    }
+    assert_eq!(
+        in_dead_zone, 117,
+        "the 65-85-bit regression band is not fully covered"
+    );
+    assert!(tested >= 270, "only {tested} entries ran");
+}
+
+/// The remaining corpus entries, up to 256 bits. Run with
+/// `cargo test --profile release-test --test factorization -- --ignored`.
+#[test]
+#[ignore = "minutes of sieving; run in CI on a schedule"]
+fn supplied_factorization_corpus_above_128_bits() {
+    let mut tested = 0usize;
+    for (n, factors) in corpus_entries() {
+        if Natural::<16>::from_str(n).unwrap().bit_len() <= DEFAULT_TIER_BITS {
+            continue;
+        }
+        assert_factorization(n, &factors);
         tested += 1;
     }
-    assert_eq!(tested, 309, "unexpected corpus entry count");
+    assert_eq!(tested, 29, "unexpected large corpus entry count");
 }
 
 #[test]
 #[ignore = "manual interleaved performance measurement"]
 fn profile_single_input() {
-    let input = std::env::var("RUSQSIEVE_BENCH_INPUT").unwrap();
+    // `--ignored` runs this alongside the slow corpus tier, so an absent input is "nothing to
+    // measure" rather than a failure.
+    let Ok(input) = std::env::var("RUSQSIEVE_BENCH_INPUT") else {
+        eprintln!("BENCH skipped: set RUSQSIEVE_BENCH_INPUT to a decimal integer");
+        return;
+    };
     let n = Natural::<16>::from_str(&input).unwrap();
     let repeats = std::env::var("RUSQSIEVE_BENCH_REPEATS")
         .ok()

@@ -2,8 +2,15 @@
 use crate::Natural;
 use core::num::NonZero;
 
+// Counts strong-Lucas evaluations on the current thread. No known input distinguishes a correct
+// Lucas implementation from one that never runs — no Baillie-PSW pseudoprime is known — so the tests
+// assert on this counter to prove the stage is not dead code. Thread-local, because `cargo test` runs
+// test functions concurrently and a process-wide counter would let one test's Lucas call satisfy
+// another test's assertion.
 #[cfg(test)]
-static LUCAS_TEST_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static LUCAS_TEST_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Debug)]
 pub struct PrimalityConfig {
@@ -44,10 +51,13 @@ pub fn is_probable_prime<const P: usize>(n: &Natural<P>, config: &PrimalityConfi
     if n.is_even() {
         return false;
     }
-    if n.bit_len() > 64 {
-        if n.is_square() || !miller_rabin_witness(n, 2) || !strong_lucas_selfridge(n) {
-            return false;
-        }
+    // Baillie-PSW, above 2^64 only. Below that the seven-base Jaeschke/Sinclair witness set in
+    // `smallfactor` is proven exact, so BPSW would add cost and no strength. The square test is not
+    // an optimization: Selfridge's `D` search never terminates for a perfect square.
+    if n.bit_len() > 64
+        && (n.is_square() || !miller_rabin_witness(n, 2) || !strong_lucas_selfridge(n))
+    {
+        return false;
     }
     let one = Natural::ONE;
     let nm1 = n.checked_sub(&one).unwrap();
@@ -111,7 +121,7 @@ fn miller_rabin_witness<const P: usize>(n: &Natural<P>, witness: u64) -> bool {
 
 fn strong_lucas_selfridge<const P: usize>(n: &Natural<P>) -> bool {
     #[cfg(test)]
-    LUCAS_TEST_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LUCAS_TEST_CALLS.with(|c| c.set(c.get() + 1));
 
     let mut magnitude = 5i64;
     let mut positive = true;
@@ -262,19 +272,62 @@ mod tests {
         }
     }
 
+    /// Below 2^64 the witness set is not Baillie-PSW but the fixed `SMALL` table, so these are the
+    /// inputs that table has to get right on its own: Carmichael numbers (Fermat liars to every base
+    /// coprime to `n`) and strong pseudoprimes to base 2.
     #[test]
-    fn rejects_strong_pseudoprimes_and_exercises_lucas() {
-        LUCAS_TEST_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
+    fn rejects_carmichael_numbers_and_base_two_strong_pseudoprimes() {
         let c = PrimalityConfig::default();
-        for composite in ["318665857834031151167461", "3317044064679887385961981"] {
+        for n in [
+            561u64, 1105, 1729, 2465, 2821, 6601, 8911, 41041, 62745, 162401, 825265, 321197185,
+        ] {
+            assert!(
+                !is_probable_prime(&Natural::<2>::from_u64(n), &c),
+                "Carmichael number {n} was accepted as prime"
+            );
+        }
+        for n in [2047u64, 3277, 4033, 4681, 8321, 15841, 42799, 3215031751] {
+            assert!(
+                !is_probable_prime(&Natural::<2>::from_u64(n), &c),
+                "base-2 strong pseudoprime {n} was accepted as prime"
+            );
+        }
+    }
+
+    /// Above 2^64 the guarantee comes from Baillie-PSW. `318665857834031151167461` and
+    /// `3317044064679887385961981` are the smallest strong pseudoprimes to all bases up to 37 and 41
+    /// respectively — beyond what a fixed-base table can settle — and
+    /// `82963349344421390809 = 2400187 · 4800373 · 7200559` is a Carmichael number above 2^64, so it
+    /// is a Fermat liar to every base coprime to it. All three must be rejected, the Mersenne prime
+    /// must be accepted, and the strong Lucas stage must be shown to have actually run.
+    #[test]
+    fn baillie_psw_rejects_strong_pseudoprimes_and_runs_the_lucas_stage() {
+        LUCAS_TEST_CALLS.with(|c| c.set(0));
+        let c = PrimalityConfig::default();
+        for composite in [
+            "318665857834031151167461",
+            "3317044064679887385961981",
+            "82963349344421390809",
+        ] {
             let n = Natural::<16>::from_decimal(composite).unwrap();
             assert!(!is_probable_prime(&n, &c), "{composite} is composite");
         }
         let prime = Natural::<16>::from_decimal("170141183460469231731687303715884105727").unwrap();
         assert!(is_probable_prime(&prime, &c));
         assert!(
-            LUCAS_TEST_CALLS.load(core::sync::atomic::Ordering::Relaxed) > 0,
+            LUCAS_TEST_CALLS.with(core::cell::Cell::get) > 0,
             "the strong Lucas stage was not exercised"
         );
+    }
+
+    /// Selfridge's `D` search never terminates for a perfect square, so the square test in front of
+    /// it is load-bearing rather than an optimization. A large square must be rejected promptly.
+    #[test]
+    fn perfect_squares_above_2_64_are_rejected_before_the_d_search() {
+        let c = PrimalityConfig::default();
+        let root = Natural::<16>::from_decimal("18446744073709551557").unwrap();
+        let square = root.checked_mul(&root).unwrap();
+        assert!(square.bit_len() > 64);
+        assert!(!is_probable_prime(&square, &c));
     }
 }

@@ -68,5 +68,17 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+# Optimized test builds. `cargo test --release` cannot link this crate from a cold cache:
+# `crate-type = ["rlib", "cdylib", "staticlib"]` collides on `librusqsieve.rlib` (cargo#6313) and
+# combines badly with `panic = "abort"` and fat LTO, so the test harness fails to resolve symbols.
+# `panic = "unwind"` is also required for the harness to report a failing assertion rather than
+# aborting the process. Use `cargo test --profile release-test` for the slow corpus tiers.
+[profile.release-test]
+inherits = "release"
+panic = "unwind"
+lto = "thin"
+codegen-units = 16
+strip = false
+
 [dev-dependencies]
 num-bigint = { version = "0.5.1" }
