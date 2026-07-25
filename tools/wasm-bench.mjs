@@ -1,4 +1,10 @@
-// Node/V8 benchmark for the same independent-instance Web Worker architecture as the browser demo.
+// Node/V8 benchmark for the independent-instance sieve-Worker architecture.
+//
+// This measures sieve throughput, and runs the coordinator inline on the main thread. The browser
+// demo no longer does: since the coordinator moved into its own Worker, relation collection and the
+// GF(2) solve run off the main thread there. That difference does not affect what this benchmark
+// measures, but it means this is not an end-to-end model of the page — see
+// `tools/browser-arch-check.mjs`, which drives the real two-kinds-of-Worker protocol.
 import { readFile } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
 import { performance } from "node:perf_hooks";

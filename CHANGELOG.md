@@ -53,6 +53,28 @@ or removed.
 - Oversized dense linear-algebra fallbacks return a resource-limit error instead
   of silently taking the O(n³) path on the unfiltered matrix, which on Wasm
   permanently inflated the tab's heap.
+- **The browser demo could not factor anything.** Two separate faults, both from
+  moving the coordinator into its own Worker:
+  - `docs/`, which is committed and is what GitHub Pages serves, never received
+    `coordinator.js`: the Makefile's published-asset list was hand-maintained and
+    was not updated. The page 404s and `boot()` awaits a `ready` message that
+    never arrives, so it hangs with the button disabled rather than degrading.
+    The list is now derived from `web/` (excluding the local preview server), and
+    `make docs-verify` fails if any same-directory reference in the published
+    HTML or JS does not resolve — checked against both drift directions.
+  - `EngineSession` dropped duplicate-`A` families in `take_jobs`, but the WASM
+    coordinator numbers families itself and never calls `take_jobs`. Two families
+    that pick the same `A` sieve identical polynomials, so ingesting both puts
+    duplicate columns in the matrix and every dependency they form is trivial
+    (`x ≡ ±y`) — extraction then reports "no factor" on an input that factors.
+    A 110-bit semiprime the native path splits in 14 ms produced 3 duplicate
+    families out of 56 and failed outright. The filter now runs where relations
+    are ingested, so it protects any scheduler.
+  - Added `tools/browser-arch-check.mjs`, which drives the real
+    coordinator-Worker plus sieve-Worker protocol on node worker threads and
+    asserts a known semiprime comes back correctly factored, and wired it plus
+    `docs-verify` into `make test`. Neither fault was reachable by any existing
+    test; the architecture was only ever exercised by hand in a browser.
 
 ### Tests
 

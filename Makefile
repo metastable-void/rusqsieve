@@ -20,12 +20,18 @@ WASM_SCALAR := target/wasm-scalar/$(WASM_TARGET)/release/rusqsieve.wasm
 WASM_SIMD   := target/wasm-simd/$(WASM_TARGET)/release/rusqsieve.wasm
 DOCS        := docs
 WEB         := web
-ASSETS      := index.html index.css abi.js numtheory.js worker.js index.js
+# Derived from the directory, not hand-maintained: this list silently lost
+# coordinator.js when the relation coordinator moved into its own Worker, which
+# 404s on GitHub Pages and leaves boot() awaiting a "ready" message that never
+# arrives. `serve.mjs` is the local preview server and is deliberately not
+# published; it is excluded by extension (`*.js` does not match `*.mjs`).
+ASSETS      := $(notdir $(wildcard $(WEB)/*.html) $(wildcard $(WEB)/*.css) \
+	$(wildcard $(WEB)/*.js))
 DOCS_FILES  := $(addprefix $(DOCS)/,$(ASSETS)) $(DOCS)/rusqsieve.wasm \
 	$(DOCS)/rusqsieve-simd.wasm $(DOCS)/.nojekyll
 
 .DEFAULT_GOAL := native
-.PHONY: native install docs wasm serve test clean
+.PHONY: native install docs docs-verify wasm serve test clean
 
 native:
 	$(CARGO) build --release
@@ -46,7 +52,26 @@ install: native
 		rusqsieve.pc.in > "$(DESTDIR)$(PKGCONFIGDIR)/rusqsieve.pc"
 	chmod 0644 "$(DESTDIR)$(PKGCONFIGDIR)/rusqsieve.pc"
 
-docs: $(DOCS_FILES)
+# Every same-directory asset the published frontend references must exist in
+# docs/. Deriving ASSETS from the directory prevents the omission that broke
+# GitHub Pages; this catches the reverse case, a reference to a file that was
+# renamed or never added to web/ at all.
+# Intentionally has no prerequisites: it must audit `docs/` exactly as it stands,
+# so it also catches a tree that was committed without re-running `make docs`.
+docs-verify:
+	@missing=0; \
+	for src in $(DOCS)/*.js $(DOCS)/*.html; do \
+		for ref in $$(grep -oE '"\./[A-Za-z0-9_.-]+"' "$$src" | tr -d '"'); do \
+			if [ ! -f "$(DOCS)/$${ref#./}" ]; then \
+				echo "$$src references $$ref, absent from $(DOCS)/"; \
+				missing=1; \
+			fi; \
+		done; \
+	done; \
+	if [ $$missing -ne 0 ]; then echo "docs/ is incomplete"; exit 1; fi; \
+	echo "docs/: all $$(ls $(DOCS) | wc -l | tr -d ' ') files present, every reference resolves."
+
+docs: $(DOCS_FILES) docs-verify
 	@echo "docs/ ready for GitHub Pages (scalar $$(ls -lh $(DOCS)/rusqsieve.wasm | awk '{print $$5}'), SIMD $$(ls -lh $(DOCS)/rusqsieve-simd.wasm | awk '{print $$5}'))."
 	@echo "  Local preview:  make serve"
 	@echo "  Publish:        Settings > Pages > Deploy from branch > /docs"
@@ -80,10 +105,14 @@ $(DOCS)/.nojekyll:
 serve: docs
 	node $(WEB)/serve.mjs $(DOCS) 8000
 
-# Native + wasm correctness checks.
+# Native + wasm correctness checks. The browser architecture check drives the real
+# coordinator-Worker/sieve-Worker protocol on node worker threads, which is otherwise
+# only ever exercised by hand in a browser.
 test:
 	$(CARGO) test
 	$(MAKE) wasm
+	$(MAKE) docs-verify
+	node tools/browser-arch-check.mjs
 
 clean:
 	rm -rf $(DOCS)

@@ -482,34 +482,20 @@ impl EngineSession {
     /// Hand out up to `maximum` polynomial families to sieve.
     ///
     /// Returns fewer than `maximum` jobs — possibly none — once the family budget is spent, which a
-    /// caller distinguishes from "done" with [`EngineSession::is_ready`]. The bound matters:
-    /// `choose_a` declines a family whenever its `A` duplicates one already issued, so without a cap
-    /// a scheduler that kept asking would spin forever and grow `buffered` without limit.
+    /// caller distinguishes from "done" with [`EngineSession::is_ready`]. Families whose `A`
+    /// duplicates one already issued are dropped at ingest rather than here, so a caller that
+    /// assigns family numbers itself (as the WASM coordinator does) is equally protected.
     pub fn take_jobs(&mut self, maximum: usize) -> Vec<EngineJob> {
         if self.is_ready() {
             return Vec::new();
         }
         let mut jobs = Vec::with_capacity(maximum);
         while jobs.len() < maximum && self.next_job < MAX_FAMILIES {
-            let family = self.next_job;
+            jobs.push(EngineJob {
+                family: self.next_job,
+            });
             self.next_job += 1;
-            if let Some((a, _)) = choose_a(&self.context.0, family)
-                && self.seen_a.insert(a)
-            {
-                jobs.push(EngineJob { family });
-            } else {
-                self.buffered.insert(
-                    family,
-                    FamilyResult {
-                        family,
-                        polynomials: 0,
-                        relations: Vec::new(),
-                        survivors: 0,
-                    },
-                );
-            }
         }
-        self.drain_buffered();
         jobs
     }
     pub fn submit(&mut self, result: EngineJobResult) {
@@ -529,6 +515,20 @@ impl EngineSession {
     fn drain_buffered(&mut self) {
         while let Some(r) = self.buffered.remove(&self.next_merge) {
             self.next_merge += 1;
+            // Only the first family to produce a given `A` contributes. Two families that pick the
+            // same `A` sieve identical polynomials, so their relations are identical too, and
+            // ingesting both puts duplicate columns in the matrix — every dependency those form is
+            // trivial (`x ≡ ±y`), so extraction reports "no factor" on an input that factors.
+            //
+            // This has to happen at ingest, not at dispatch: the WASM coordinator numbers families
+            // itself and never calls `take_jobs`, so filtering there left the browser path
+            // unprotected. A 110-bit semiprime that the native path factors in 14 ms produced 3
+            // duplicate families out of 56 and failed outright in the browser.
+            let unique =
+                choose_a(&self.context.0, r.family).is_some_and(|(a, _)| self.seen_a.insert(a));
+            if !unique {
+                continue;
+            }
             self.polynomials += r.polynomials;
             let n = &self.context.0.n;
             for rel in r.relations {
@@ -2259,6 +2259,48 @@ mod tests {
         assert_eq!(a.polynomials, b.polynomials);
         assert_eq!(a.relations, b.relations);
         assert!(a.polynomials > 0);
+    }
+
+    /// `EngineSession` is the collector the WASM coordinator drives, and that coordinator numbers
+    /// families itself rather than calling `take_jobs`. Duplicate-`A` families therefore have to be
+    /// dropped where relations are ingested; dropping them at dispatch left the browser path
+    /// ingesting identical relations twice, which makes duplicate matrix columns whose dependencies
+    /// are all trivial, and extraction then reports no factor on an input that factors natively.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn session_drops_duplicate_a_families_however_they_are_scheduled() {
+        use std::str::FromStr;
+        // 110-bit semiprime that produced 3 duplicate families out of 56 on the native path.
+        let n = Natural::from_str("668319744971798315493259725219859").unwrap();
+        let context = prepare(n).unwrap();
+
+        // Feed every family in order, as the coordinator does, and count what is accepted.
+        let mut session = EngineSession::new(context.clone());
+        let mut duplicates = 0;
+        for family in 0..64u64 {
+            let before = session.polynomials();
+            session.submit(execute(&context, EngineJob { family }));
+            if session.polynomials() == before {
+                duplicates += 1;
+            }
+        }
+        assert!(
+            duplicates > 0,
+            "this input is supposed to generate duplicate A values; the test has gone stale"
+        );
+
+        // Every accepted family must have contributed a distinct A.
+        let mut seen = HashSet::new();
+        for family in 0..64u64 {
+            if let Some((a, _)) = choose_a(&context.0, family) {
+                seen.insert(a);
+            }
+        }
+        assert_eq!(
+            session.polynomials(),
+            seen.len() as u64 * (1 << (context.0.a_factor_count - 1).min(9)),
+            "accepted polynomial count does not match the number of distinct A values"
+        );
     }
 
     #[test]
