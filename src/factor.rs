@@ -43,9 +43,9 @@ pub(crate) struct FactorLimits {
 
 /// Configuration for native blocking factorization.
 ///
-/// Algorithm tuning is intentionally encapsulated so releases can improve
-/// SIQS parameters without making implementation details part of the stable
-/// API.
+/// Algorithm tuning is intentionally encapsulated so releases can improve sieve parameters without
+/// making implementation details part of the stable API. Note that the wrapped [`QsConfig`] drives
+/// the reference `x² − N` path, not the SIQS engine that handles the default width.
 ///
 /// The default uses [`Parallelism::Auto`] and reports progress at most every
 /// 100 milliseconds within a phase.
@@ -118,7 +118,8 @@ pub enum ResourceLimitKind {
     MatrixNonzeros,
     /// Maximum estimated memory.
     Memory,
-    /// Maximum SIQS polynomial batches.
+    /// Maximum sieve segment batches on the reference `x² − N` path. Despite the name this
+    /// does not bound SIQS polynomial families; the SIQS engine uses its own family cap.
     PolynomialBatches,
     /// Maximum Pollard-rho iterations.
     PollardRhoIterations,

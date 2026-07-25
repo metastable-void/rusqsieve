@@ -109,7 +109,8 @@ pub enum ProgressUnit {
     Candidates,
     /// Prime numbers examined or accepted.
     Primes,
-    /// SIQS polynomials processed.
+    /// Polynomials or sieve segments processed. The SIQS engine does not emit this unit; only
+    /// the reference `x² − N` path, whose "polynomials" are advancing segments of one polynomial.
     Polynomials,
     /// Sieve positions processed.
     SievePositions,

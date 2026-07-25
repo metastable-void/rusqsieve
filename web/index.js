@@ -165,25 +165,19 @@ async function factorize(N, report) {
       for (let i = 0; i < pp.k; i++) stack.push(pp.base);
       continue;
     }
-    // Pollard's rho is only worthwhile where it can actually finish: it is the
-    // primary tool below the sieve's viable range (~80 bits), and a quick cheap
-    // peel above it (to catch a small factor trial division missed). It cannot
-    // split a balanced large semiprime — that is the sieve's job.
-    const bits = c.toString(2).length;
-    if (bits <= 84) {
-      report({ phase: "pollard", n: c });
-      await tick();
-      const d = pollardBrent(c, 1 << 21);
-      if (d && d > 1n && d < c) {
-        stack.push(d, c / d);
-        continue;
-      }
-    } else {
-      const d = pollardBrent(c, 1 << 15);
-      if (d && d > 1n && d < c) {
-        stack.push(d, c / d);
-        continue;
-      }
+    // Pollard-Brent is a cheap opportunistic peel, not the primary tool at any size: it costs
+    // O(sqrt p) in the smallest factor while the sieve costs by the size of `c`, so it only wins
+    // where `c` is unbalanced. This used to spend a 2^21 budget below 84 bits on the theory that
+    // rho owned that range. Measured here in node (BigInt, single-threaded), 2^21 against 2^15:
+    // an 80-bit balanced semiprime 825 ms vs 44 ms, an 85-bit one 724 ms vs 44 ms, while the
+    // unbalanced 127-bit case splits in 0.3 ms either way — and the sieve handles those sizes in
+    // milliseconds. The large budget was up to 825 ms of blocked main thread for nothing.
+    report({ phase: "pollard", n: c });
+    await tick();
+    const d = pollardBrent(c, 1 << 15);
+    if (d && d > 1n && d < c) {
+      stack.push(d, c / d);
+      continue;
     }
     const factor = await siqsParallel(c.toString(), report);
     stack.push(factor, c / factor);

@@ -14,6 +14,11 @@ thread_local! {
 
 #[derive(Clone, Debug)]
 pub struct PrimalityConfig {
+    /// Miller-Rabin rounds. Under the default [`WitnessPolicy::FirstPrimes`] the witness for round
+    /// `r` is `SMALL[r % SMALL.len()]` over a 32-entry table, so **rounds beyond 32 repeat witnesses
+    /// and add no confidence** at the cost of a full modexp each. Above 2^64 the strength comes from
+    /// Baillie-PSW rather than from these rounds; below it the seven-base witness set in
+    /// `smallfactor` is proven exact.
     pub rounds: NonZero<u32>,
     pub witnesses: WitnessPolicy,
 }
@@ -317,6 +322,39 @@ mod tests {
         assert!(
             LUCAS_TEST_CALLS.with(core::cell::Cell::get) > 0,
             "the strong Lucas stage was not exercised"
+        );
+    }
+
+    /// Cost of the primality path, which Baillie-PSW adds a base-2 Miller-Rabin and a strong Lucas
+    /// test to. Run with `cargo test --profile release-test -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual primality-path measurement"]
+    fn profile_primality_path() {
+        // Primes above 2^64 (so BPSW applies) and a composite of two large primes, which is what the
+        // engine actually feeds this on recovered factors.
+        let inputs = [
+            "170141183460469231731687303715884105727",
+            "18446744073709551629",
+            "340282366920938463463374607431768211297",
+            "340282366920938463463374607431768211455",
+        ];
+        let values: Vec<Natural<16>> = inputs
+            .iter()
+            .map(|s| Natural::from_decimal(s).unwrap())
+            .collect();
+        let config = PrimalityConfig::default();
+        let started = std::time::Instant::now();
+        let mut accepted = 0usize;
+        for _ in 0..200 {
+            for value in &values {
+                if is_probable_prime(std::hint::black_box(value), &config) {
+                    accepted += 1;
+                }
+            }
+        }
+        eprintln!(
+            "BENCH primality_800_calls={:.6}s accepted={accepted}",
+            started.elapsed().as_secs_f64()
         );
     }
 

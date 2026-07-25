@@ -218,8 +218,10 @@ export const bitLength = (n) => (n <= 0n ? 0 : n.toString(2).length);
 
 // Cryptographically-random odd BigInt of exactly `bits` bits, with the top two
 // bits forced high so that a product of two such numbers lands in the intended
-// combined bit length (each factor is >= 0.75·2^(bits-1), so the product is
-// >= 2^(2·bits-2) · 0.5625 > 2^(2·bits-2), i.e. exactly 2·bits bits).
+// combined bit length. Setting bits `bits-1` and `bits-2` gives n >= 3·2^(bits-2)
+// = 0.75·2^bits, so a product of one `pbits` and one `qbits` value is at least
+// 0.5625·2^(pbits+qbits) > 2^(pbits+qbits-1) and strictly below 2^(pbits+qbits) —
+// exactly pbits+qbits bits.
 function randomOdd(bits) {
   const bytes = new Uint8Array((bits + 7) >> 3);
   crypto.getRandomValues(bytes);
@@ -234,7 +236,8 @@ function randomOdd(bits) {
 const SMALL_PRIMES = [3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n, 41n, 43n, 47n];
 
 // A random prime of exactly `bits` bits, found by scanning upward from a random
-// odd seed. Primality is the same deterministic-then-strong Miller-Rabin as isPrime.
+// odd seed. Primality is whatever `isPrime` does, which above 2^64 is Baillie-PSW
+// — a base-2 Miller-Rabin and a strong Lucas test — on top of the fixed-base rounds.
 export function randomPrime(bits) {
   for (;;) {
     let n = randomOdd(bits);

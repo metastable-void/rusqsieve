@@ -146,21 +146,29 @@ impl SparseBinaryMatrix {
     pub fn dense_dependencies(&self) -> DependencySet {
         let cols = self.columns();
         let words = cols.div_ceil(64);
+        let parity_words = self.rows().div_ceil(64);
         let mut basis: Vec<Option<(Vec<u64>, Vec<u64>)>> = vec![None; self.rows()];
         let mut deps = Vec::new();
+        // Two working vectors reused across columns. Allocating them inside the loop cost one
+        // allocation pair per column — 41 816 of them on a 256-bit matrix — and they are only moved
+        // out on the two paths that consume them, where a fresh pair is taken for the next column.
+        let mut parity = vec![0u64; parity_words];
+        let mut comb = vec![0u64; words];
         for col in 0..cols {
-            let mut parity = vec![0u64; self.rows().div_ceil(64)];
+            parity.clear();
+            parity.resize(parity_words, 0);
+            comb.clear();
+            comb.resize(words, 0);
             let a = self.csc_offsets[col] as usize;
             let b = self.csc_offsets[col + 1] as usize;
             for &r in &self.csc_rows[a..b] {
                 parity[r as usize / 64] ^= 1 << (r % 64)
             }
-            let mut comb = vec![0u64; words];
             comb[col / 64] |= 1 << (col % 64);
             loop {
                 let Some(pivot) = highest_bit(&parity) else {
                     if self.verify_dependency(&comb) {
-                        deps.push(comb.into_boxed_slice())
+                        deps.push(core::mem::take(&mut comb).into_boxed_slice())
                     }
                     break;
                 };
@@ -168,7 +176,7 @@ impl SparseBinaryMatrix {
                     xor(&mut parity, p);
                     xor(&mut comb, c)
                 } else {
-                    basis[pivot] = Some((parity, comb));
+                    basis[pivot] = Some((core::mem::take(&mut parity), core::mem::take(&mut comb)));
                     break;
                 }
             }
@@ -248,10 +256,10 @@ impl SparseBinaryMatrix {
         }
     }
 
-    /// Nullspace via SPEC §8 filtering — iterative low-weight row elimination
-    /// (a prime occurring in one live column forces that column out of every
-    /// dependency) — followed by dense elimination on the much smaller reduced
-    /// matrix. Dependencies are returned in the ORIGINAL column space (eliminated
+    /// Nullspace via SPEC §8 filtering — iterative elimination of every row of weight 1 through
+    /// `MAX_STRUCTURED_WEIGHT` (6), with Markowitz-style pivot selection to limit fill-in, not merely
+    /// the singleton rows an earlier version of this comment described — followed by dense
+    /// elimination on the much smaller reduced matrix. Dependencies are returned in the ORIGINAL column space (eliminated
     /// columns are held at zero) and every one is re-verified against `self`.
     ///
     /// For quadratic-sieve matrices this removes the many low-weight rows before
@@ -373,9 +381,11 @@ impl SparseBinaryMatrix {
         let dense_started = std::time::Instant::now();
         let words = ncols.div_ceil(64);
         let mut out = Vec::new();
-        // Block solvers conventionally return up to 64 independent QS
-        // dependencies. This gives ample deterministic headroom while avoiding
-        // hundreds of unnecessary back-substitutions.
+        // Cap the nullspace basis at 64 dependencies. Each one has an independent ~1/2 chance of
+        // yielding a nontrivial gcd, so 64 makes exhausting them without a factor negligible, while
+        // back-substitution is O(cols²/64) per dependency and there is no reason to compute the
+        // hundreds the residual matrix usually admits. (This bound was previously justified by what
+        // "block solvers conventionally return"; this crate has no block solver.)
         for dep in reduced.row_echelon_dependencies(64).iter() {
             let mut full = vec![0u64; words];
             for (j, &original_col) in alive_cols.iter().enumerate() {

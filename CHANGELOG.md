@@ -37,7 +37,11 @@ or removed.
   bases 2..53 would be a guaranteed false positive. Below 2^64 the seven-base
   Jaeschke/Sinclair witness set is proven exact and is unchanged. The
   perfect-square test in front of Selfridge's `D` search is load-bearing, not an
-  optimization: that search does not terminate for a square.
+  optimization: that search does not terminate for a square. Measured cost of
+  the primality path itself: 0.390 s → 0.439 s per 800 calls above 2^64, **+12.6%**
+  — but a factorization makes only a handful of such calls, at `factor_node`
+  entry and on recovered factors, never per survivor, so this is 0.007% of a
+  256-bit run and no round-count reduction is warranted.
 - **Cofactors of 64 bits or less are cancellable.** `smallfactor::factor_u64`
   and its Pollard–Brent loop polled nothing and could not be interrupted.
 - **One panicking worker no longer masks the cause.** The job mutex is recovered
@@ -146,6 +150,9 @@ Kept:
   a `Vec` along every tree path on every ingest.
 - `pollard_u64` is Brent with Montgomery multiplication and a batched GCD every
   128 steps, replacing Floyd with a `u128 %` and a GCD on every iteration.
+  **20.8× faster** on a representative double-large-prime cofactor (two 27-bit
+  primes: 2.515 s → 0.121 s per 1 000 splits), 18.4× on a 48-bit one. Split
+  results are identical on a fixed cofactor corpus.
 - `find_factor` calls `prepare` instead of carrying a near-line-for-line copy of
   it. The pinned interval translation is `sieve_half_width % prime`; the
   duplicate's `interval as u32 % prime` was numerically equal only because
@@ -194,10 +201,21 @@ Measured and rejected — each was implemented, measured, and removed:
   At 224 bits, 12-bit factors cut setup from 1.73 to 0.98 cpu-s and 11-bit to
   0.56, but wall time did not improve (4.48 / 4.47 / 4.62 s): `A` quality
   degrades and `bainv` grows.
-- **Double large primes** (brief §2.6) remain disabled. The gate was satisfied
-  by no shipped tier, and with it correctly parameterized it did not show a net
-  wall-time win against the bounded single-large-prime policy. `README.md` and
-  `SPEC.md` no longer advertise it.
+- **Double large primes** (brief §2.6) remain disabled, now on our own
+  measurement rather than an inherited claim. `LargePrime::Two`,
+  `classify_cofactor` and cycle combination are all reachable — one constant is
+  the whole switch — but at 192 bits, 4 threads (sieve+collect): off 0.605 s
+  (5 632 polys, 1 945 cycles); on with the threshold matched to the single-prime
+  bound 0.607 s (5 408 polys, 2 040 cycles); on with the threshold 4 bits deeper
+  0.680 s; on with the threshold widened to `2 · log2(large-prime bound)`, which
+  is what a genuine double actually needs, **did not finish in 300 s**. At a
+  matched threshold it buys 4% fewer polynomials and the extra cofactor splits
+  eat exactly that. `README.md` and `SPEC.md` no longer advertise it.
+- **Per-column allocations in the dense O(n³) solver** are hoisted out of the
+  loop (41 816 allocation pairs at 256 bits), moved out only on the two paths
+  that consume them. No measurable wall-time change on the filtered path, where
+  the dense solver runs on the reduced matrix; kept as a memory-traffic and
+  clarity win on the unfiltered fallback.
 
 Not reproduced from the brief's baseline figures: the ≈14% available at 224 bits
 from threshold retuning alone. On this host, 0.2.0's shipped default measures
@@ -255,11 +273,84 @@ a 64 s 256-bit run — while reporting the same number.
 - `sieve_root_pair` claimed an overflow bound from a hardcoded minimum prime
   that a tuning knob could invalidate; the bound is now computed and the comment
   describes what the code does.
+- `legendre_u32` computes a Jacobi symbol, which equals the Legendre symbol only
+  for an odd prime modulus. Every caller passes one; the precondition is now
+  documented and `debug_assert`ed, and both symbols have direct tests against the
+  Euler criterion — neither had any coverage.
+- `tonelli_shanks_u32` short-circuits `p ≡ 3 (mod 4)` to `n^((p+1)/4)`, so the
+  majority of calls never run the named algorithm. Documented, and its one
+  assertion — `assert_eq!(tonelli_shanks_u32(10, 13), Some(7).or(Some(6)))`,
+  which `Option::or` collapses to `== Some(7)` — is replaced by an explicit
+  membership check plus exhaustive coverage of both branches.
+- `filtered_dependencies` said "singleton-row elimination"; it eliminates rows of
+  weight 1 through 6 with Markowitz-style pivot selection.
+- The 64-dependency cap was justified by "what block solvers conventionally
+  return"; this crate has no block solver, so the real reason is stated.
+- `PrimalityConfig::rounds` accepts up to 2³²−1 while the witness table has 32
+  entries, so rounds beyond 32 repeat witnesses for the cost of a full modexp.
+  Documented.
+- `ResourceLimitKind::PolynomialBatches`, `ProgressUnit::Polynomials` and
+  `FactorConfig`'s doc all attributed SIQS to counters that only ever describe
+  the reference `x² − N` path.
+
+Addendum B.5 item 5 asked for the sweep to be extended to `web/*.js` and
+`tools/*.mjs`, which it had not covered. Checked every algorithm-naming
+identifier there — `pollardBrent`, `millerRabinWitness`, `strongLucasSelfridge`,
+`jacobi`, `modPow`, `integerRoot`, `perfectPower`, `trialDivide`, `randomPrime`,
+`rsaNumber`, `siqsParallel`, `MR_BASES`, `SMALL_PRIMES`. All implement what they
+claim; `pollardBrent` in particular is genuine Brent (`r`-doubling epochs,
+batched GCD over runs of ≤128, and the `g == n` backtrack replaying from `ys`),
+matching the Rust side. Two comment defects found and fixed: `randomOdd`'s
+derivation stated its own bound as `0.75·2^(bits-1)` when forcing the top two
+bits gives `0.75·2^bits` (the conclusion it draws is right), and `randomPrime`
+still described primality as "the same deterministic-then-strong Miller-Rabin as
+isPrime" after `isPrime` became Baillie-PSW above 2^64.
+
+One substantive browser defect came out of that sweep: `factorize` spent a 2^21
+Pollard-Brent budget on anything below 84 bits, on the same premise the Rust side
+had. Measured in node (BigInt, single-threaded), 2^21 against 2^15: an 80-bit
+balanced semiprime 825 ms vs 44 ms, an 85-bit one 724 ms vs 44 ms, while the
+unbalanced 127-bit case splits in 0.3 ms either way — and the sieve handles those
+sizes in milliseconds. That was up to 825 ms of blocked main thread for work the
+workers do faster. The bit-length special case is gone and the budget is a
+uniform 2^15.
 
 `Montgomery`, `BlockLanczos`, `extended_gcd`, `prepare_siqs`'s SIQS-claiming
 names, `SparseBinaryMatrix::provenance`, `MatrixSolver` and the always-zero job
 metrics are untouched here: resolving them removes or renames public items, so
 they belong to 0.3.0.
+
+### Attempted or deliberately not attempted, and still open
+
+- **Per-prime `pinv` for the per-family reductions.** Not done. Lemire's fast
+  remainder is exact only for a 32-bit dividend, and these reductions are a
+  multi-limb `Natural` modulo a 32-bit prime. Precomputing `2^64 mod p` and
+  `2^128 mod p` per prime to replace `rem_u64` was worked through and costs about
+  the same number of hardware divides, while adding 8 bytes per prime to a loop
+  that is already memory-bound. The binary xgcd part of that item did land.
+- **`record`'s linear `find`** over the survivor's power list is unchanged. The
+  list holds roughly 15 entries, so this is very likely noise; it was not
+  measured and is not claimed either way.
+- **The browser coordinator Worker (§2.11a) is unmeasured.** The change is
+  clearly right — the main thread no longer blocks for the serial solve — but
+  there is no browser in this environment, so no before/after number is claimed.
+  Its supporting number, the ~8 s serial term, comes from the brief's published
+  scaling fit, not from a measurement taken here.
+- **No small-L2 re-measurement (§2.12).** The bucket-sieving and blocked-kernel
+  negative results are re-confirmed only on a large-L3 host (71.5 MiB shared,
+  four threads), which is precisely the configuration the brief warns those
+  results are overfit to. The conclusion should be treated as provisional for
+  mobile and Wasm targets until someone re-runs it on one.
+- **§2.11b is a partial**: the `BTreeSet` filtering structures are now sorted
+  `Vec`s, which removes the tree overhead, but not the flat CSR with in-place
+  compaction the brief asked for. `f2_filter` at 256 bits moved 0.258 s → 0.225 s.
+- **§2.11d is a partial**: back-substitution's parity dot product is unrolled
+  four lanes wide but still scalar; it does not use `xor_wasm_simd`. Not measured
+  in isolation.
+- Acceptance criteria not met, stated plainly: §2.1's ≥10× per-survivor
+  reduction (structurally unreachable here — see above), §2.3's ≥10% at 224 and
+  256 bits (≈4% and ≈2% of sieve time), and §2.4's order-of-magnitude drop in
+  partial-relation memory (2.2×, from 263 024 retained partials to 117 878).
 
 ## 0.2.0 — 2026-07-25
 

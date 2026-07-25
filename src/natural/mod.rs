@@ -1259,12 +1259,29 @@ pub fn jacobi_u64(mut a: u64, mut n: u64) -> i8 {
     }
     if n == 1 { s } else { 0 }
 }
+/// The Legendre symbol `(n/p)` for an odd prime `p`.
+///
+/// The body is the Jacobi symbol, which coincides with Legendre exactly when the modulus is an odd
+/// prime — so the name is only accurate under that precondition, which every caller (factor-base
+/// construction) satisfies. For a composite modulus this returns the Jacobi symbol, which does not
+/// decide quadratic residuacity. `p == 2` is special-cased to `n & 1`, for which the Legendre symbol
+/// is undefined; the factor-base builder relies on that convention to admit 2.
 pub fn legendre_u32(n: u32, p: u32) -> i8 {
+    debug_assert!(
+        p == 2 || p & 1 == 1,
+        "Legendre requires an odd prime modulus"
+    );
     if p == 2 {
         return if n & 1 == 0 { 0 } else { 1 };
     }
     jacobi_u64((n % p) as u64, p as u64)
 }
+/// A square root of `n` modulo the odd prime `p`, or `None` if `n` is a non-residue.
+///
+/// Roughly half the factor base has `p ≡ 3 (mod 4)`, and those take the `n^((p+1)/4)` closed form
+/// rather than the loop below — so the majority of calls never execute Tonelli-Shanks proper. This
+/// is standard practice, noted because the name otherwise sets the wrong cost expectation. Which of
+/// the two roots is returned is unspecified.
 pub fn tonelli_shanks_u32(n: u32, p: u32) -> Option<u32> {
     if p == 2 {
         return Some(n & 1);
@@ -1352,7 +1369,60 @@ mod tests {
             Natural::from_u64(88).mul_mod(&Natural::from_u64(77), &m),
             Natural::from_u64(83)
         );
-        assert_eq!(tonelli_shanks_u32(10, 13), Some(7).or(Some(6)));
+        // `Some(7).or(Some(6))` was written here, which `Option::or` evaluates to exactly `Some(7)`.
+        // The intent was "either square root", so say that: a modular square root is only defined up
+        // to sign, and which of `r` and `p − r` is returned is an implementation detail.
+        let root = tonelli_shanks_u32(10, 13).expect("10 is a quadratic residue mod 13");
+        assert!(
+            root == 6 || root == 7,
+            "tonelli_shanks_u32(10, 13) = {root}, want 6 or 7"
+        );
+        assert_eq!(root * root % 13, 10);
+    }
+
+    /// Both branches of `tonelli_shanks_u32` against every residue of a `p ≡ 3 (mod 4)` prime, which
+    /// takes the `n^((p+1)/4)` short-circuit, and a `p ≡ 1 (mod 4)` one, which runs the named
+    /// algorithm. Roughly half the factor base is `p ≡ 3 (mod 4)`, so the majority of calls in a real
+    /// run never execute Tonelli-Shanks proper.
+    #[test]
+    fn tonelli_shanks_covers_both_branches() {
+        for p in [13u32, 17, 29, 41, 97, 101, 7, 11, 19, 23, 31, 103] {
+            let mut roots = 0;
+            for n in 0..p {
+                match tonelli_shanks_u32(n, p) {
+                    Some(root) => {
+                        assert_eq!(root * root % p, n, "p={p} n={n} root={root}");
+                        roots += 1;
+                    }
+                    None => assert_eq!(legendre_u32(n, p), -1, "p={p} n={n}"),
+                }
+            }
+            // Zero plus the (p−1)/2 nonzero quadratic residues.
+            assert_eq!(roots, 1 + (p - 1) / 2, "p={p}");
+        }
+    }
+
+    /// Neither symbol had a direct test. `legendre_u32` is the Legendre symbol only because every
+    /// caller passes an odd prime; it delegates to the Jacobi symbol, which agrees there.
+    #[test]
+    fn jacobi_and_legendre_agree_with_the_euler_criterion() {
+        for p in [3u64, 5, 7, 11, 13, 17, 19, 23, 29, 31, 97, 101, 8191] {
+            for n in 0..p.min(200) {
+                let euler = modpow_u64(n, (p - 1) / 2, p);
+                let expected = match euler {
+                    0 => 0i8,
+                    1 => 1,
+                    _ => -1, // p − 1
+                };
+                assert_eq!(jacobi_u64(n, p), expected, "({n}/{p})");
+                assert_eq!(legendre_u32(n as u32, p as u32), expected, "({n}/{p})");
+            }
+        }
+        // Jacobi is defined for odd composite moduli too, where it is a product of Legendre symbols
+        // and no longer decides quadratic residuacity: 2 is a non-residue mod both 3 and 5, so the
+        // symbol is +1 mod 15 even though 2 is not a square there.
+        assert_eq!(jacobi_u64(2, 15), 1);
+        assert_eq!(jacobi_u64(3, 15), 0);
     }
     #[test]
     fn agrees_with_u128() {

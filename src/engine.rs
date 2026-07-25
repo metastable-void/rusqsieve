@@ -388,7 +388,10 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
         a_all,
         a_pool,
         a_factor_count,
-        lp_bits: (64 - single_limit.leading_zeros()) as usize,
+        // A double needs room for two acceptable large primes, so the threshold has to admit twice
+        // the cofactor width or no double can ever survive it — the second, independent blocker that
+        // made `LargePrime::Two` unreachable in v0.2.0 even with its gate forced open.
+        lp_bits: (64 - single_limit.leading_zeros()) as usize * if double_enabled { 2 } else { 1 },
         thresh_adj: p.thresh_adj + env_delta("RUSQSIEVE_THRESH_ADJ"),
         single_limit,
         double_enabled,
@@ -411,11 +414,30 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     Ok(EngineContext(context))
 }
 
+/// Whether to capture and combine double-large-prime cofactors.
+///
+/// Off, on measurement. `LargePrime::Two`, `classify_cofactor` and cycle combination are all
+/// implemented and reachable — flipping this constant is the whole switch — but at 192-bit, 4
+/// threads, sieve+collect seconds:
+///
+/// | configuration                                    | polys | survivors | cycles | time  |
+/// |--------------------------------------------------|------:|----------:|-------:|------:|
+/// | off (shipped)                                    | 5 632 |    45 194 |  1 945 | 0.605 |
+/// | on, threshold matched to the single-prime bound   | 5 408 |    51 513 |  2 040 | 0.607 |
+/// | on, threshold 4 bits deeper                       | 4 672 |    85 829 |  2 391 | 0.680 |
+/// | on, threshold widened to admit genuine doubles    |     — |         — |      — | >300  |
+///
+/// At a matched threshold it buys 4% fewer polynomials and the extra cofactor splits eat exactly
+/// that, so it is a wash. Widening the threshold to `2 · log2(large-prime bound)` — which a genuine
+/// double *needs*, and which was the second, independent reason `LargePrime::Two` was unreachable in
+/// v0.2.0 — floods the survivor path and did not finish in 300 s against 0.605 s.
+const DOUBLE_LARGE_PRIMES: bool = false;
+
 /// Large-prime acceptance is independent from the sieve threshold slack.
 fn large_prime_policy(bound: u32, large_prime_mult: u32) -> (u64, bool) {
     (
         (bound as u64).saturating_mul(large_prime_mult as u64),
-        false,
+        DOUBLE_LARGE_PRIMES,
     )
 }
 
@@ -2425,7 +2447,7 @@ mod tests {
     #[test]
     #[ignore = "manual cofactor-split performance measurement"]
     fn profile_pollard_u64() {
-        let n = 15_485_863u64 * 15_485_867u64;
+        let n = 134_217_689u64 * 134_217_757u64;
         let started = std::time::Instant::now();
         for _ in 0..1_000 {
             assert!(
