@@ -330,22 +330,22 @@ score-array positions.
 
 ### 7.4 Logarithmic sieve
 
-Workers reuse score, root, increment, candidate, and blocked-sieve buffers across
+Workers reuse score, root, increment, candidate, and sparse-hit buffers across
 polynomials.
 
-The sieve uses byte scores and:
+The sieve uses twice-log2 saturating `u8` scores and:
 
-1. initializes scores with the threshold bias;
-2. skips selected very small primes and accounts for them with threshold slack;
-3. adds rounded `log2(p)` weights at both sorted modular roots;
+1. initializes scores to zero;
+2. skips selected very small primes and derives their expected threshold slack;
+3. adds rounded `2 log2(p)` weights at both sorted modular roots;
 4. uses the paired root-difference stride loop;
-5. uses a cache-blocked carried-position loop only at intervals where it wins;
-6. scans score words with a high-bit test before scalar candidate extraction;
-7. factors only surviving positions.
+5. records factor-base indices while scoring the sparse large-prime tail;
+6. extracts threshold candidates;
+7. trial-divides survivors from direct dense-prefix tests and recorded tail hits.
 
 For each survivor, `g(x) = Q(x)/A` is reconstructed directly as a signed value.
-Candidate division is gated by a precomputed multiply-shift residue test and
-stops when confirmed factor weights account for the stored sieve score.
+Candidate division of the dense prefix is gated by a precomputed
+multiply-shift residue test; the sparse tail consumes only recorded root hits.
 
 ### 7.5 Relations and large primes
 
@@ -357,8 +357,9 @@ t² ≡ (-1)^sign × product(p_i ^ e_i) × large_parts (mod N)
 
 where `t = Ax + B` reduced modulo `N`.
 
-Full relations have no large-prime cofactor. Partial relations may carry one or
-two probable-prime large factors according to the bit-size policy. The
+Full relations have no large-prime cofactor. The shipped engine accepts one
+probable-prime large factor up to 256 times the factor-base bound. Double-large-
+prime collection remains disabled because it did not produce a net wall-time win. The
 coordinator treats partials as edges in a large-prime graph. A cycle combines
 relations only when every large-prime exponent cancels to even parity; the
 corresponding square-root factors are retained for extraction.

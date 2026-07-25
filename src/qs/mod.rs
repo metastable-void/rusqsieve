@@ -102,6 +102,8 @@ pub struct FactorBaseBuilder<const P: usize> {
     n: Natural<P>,
     bound: u32,
     candidate: u32,
+    primes: Vec<u32>,
+    prime_cursor: usize,
     entries: Vec<FactorBaseEntry>,
     tested: u64,
     nonresidue: u64,
@@ -116,10 +118,13 @@ impl<const P: usize> FactorBaseBuilder<P> {
         if bound < 2 {
             return Err(FactorBaseError::InvalidBound);
         }
+        let primes = segmented_primes(bound);
         Ok(Self {
             n,
             bound,
             candidate: 2,
+            primes,
+            prime_cursor: 0,
             multiplier: 1,
             entries: Vec::new(),
             tested: 0,
@@ -129,15 +134,17 @@ impl<const P: usize> FactorBaseBuilder<P> {
     }
     pub fn step(&mut self, budget: usize) -> Result<FactorBaseBuildStatus, FactorBaseError> {
         for _ in 0..budget {
-            if self.candidate > self.bound {
+            let Some(&p) = self.primes.get(self.prime_cursor) else {
+                self.candidate = self.bound.saturating_add(1);
                 self.finished = true;
                 return Ok(FactorBaseBuildStatus::Complete);
-            }
-            let p = self.candidate;
-            self.candidate = if p == 2 { 3 } else { p.saturating_add(2) };
-            if !prime_u32(p) {
-                continue;
-            }
+            };
+            self.prime_cursor += 1;
+            self.candidate = self
+                .primes
+                .get(self.prime_cursor)
+                .copied()
+                .unwrap_or_else(|| self.bound.saturating_add(1));
             self.tested += 1;
             let r = self.n.mod_u64(p as u64) as u32;
             if r == 0 && self.n != Natural::from_u64(p as u64) {
@@ -178,21 +185,50 @@ impl<const P: usize> FactorBaseBuilder<P> {
         })
     }
 }
-fn prime_u32(n: u32) -> bool {
-    if n < 2 {
-        return false;
+fn segmented_primes(limit: u32) -> Vec<u32> {
+    if limit < 2 {
+        return Vec::new();
     }
-    if n.is_multiple_of(2) {
-        return n == 2;
-    }
-    let mut d = 3;
-    while d <= n / d {
-        if n.is_multiple_of(d) {
-            return false;
+    let root = (limit as f64).sqrt() as usize + 1;
+    let mut composite = vec![false; root + 1];
+    let mut base = Vec::new();
+    for value in 2..=root {
+        if composite[value] {
+            continue;
         }
-        d += 2
+        base.push(value as u32);
+        if value <= root / value {
+            for multiple in (value * value..=root).step_by(value) {
+                composite[multiple] = true;
+            }
+        }
     }
-    true
+    const SEGMENT: u32 = 32 * 1024;
+    let mut primes = Vec::new();
+    let mut low = 2u32;
+    while low <= limit {
+        let high = low.saturating_add(SEGMENT - 1).min(limit);
+        let mut marked = vec![false; (high - low + 1) as usize];
+        for &prime in &base {
+            let square = prime.saturating_mul(prime);
+            let first = square.max(low.div_ceil(prime).saturating_mul(prime));
+            if first > high {
+                continue;
+            }
+            for multiple in (first..=high).step_by(prime as usize) {
+                marked[(multiple - low) as usize] = true;
+            }
+        }
+        primes.extend(
+            marked
+                .iter()
+                .enumerate()
+                .filter(|(_, is_composite)| !**is_composite)
+                .map(|(offset, _)| low + offset as u32),
+        );
+        low = high.saturating_add(1);
+    }
+    primes
 }
 
 #[derive(Clone, Debug)]
@@ -324,6 +360,7 @@ pub mod parameters {
         pub factor_base_bound: u32,
         pub sieve_half_width: u32,
         pub lp_allowance: usize,
+        pub large_prime_mult: u32,
     }
     pub fn engine_params(bits: usize) -> EngineParams {
         #[allow(unused_mut)]
@@ -358,6 +395,7 @@ pub mod parameters {
             factor_base_bound,
             sieve_half_width,
             lp_allowance,
+            large_prime_mult: 256,
         }
     }
 }

@@ -152,8 +152,8 @@ The generated `docs/` directory can be deployed directly to GitHub Pages. It
 contains scalar and SIMD128 Wasm modules; the frontend attempts SIMD first and
 falls back to scalar on older engines.
 
-The browser architecture uses one coordinator Wasm instance and an independent
-Wasm instance in each Web Worker. Workers rebuild the same deterministic SIQS
+The browser architecture uses a dedicated coordinator Worker/Wasm instance and
+an independent Wasm instance in each sieve Worker. Workers rebuild the same deterministic SIQS
 context and return serialized polynomial-family relations. The coordinator
 merges families deterministically, filters the matrix, solves for dependencies,
 and extracts a verified nontrivial factor.
@@ -162,9 +162,8 @@ Notable performance work includes:
 
 - target-fitted SIQS polynomials and Gray-code root updates;
 - translated, sorted roots and a paired root-difference stride loop;
-- byte logarithmic scores with word-at-a-time candidate rejection;
-- multiply-shift-gated survivor division;
-- single/double-large-prime relation combination;
+- twice-log2 logarithmic scores with recorded sparse-tail resieve hits;
+- single-large-prime relation combination with a bounded 256× factor-base limit;
 - deterministic low-weight sparse matrix elimination;
 - compact residual row-echelon solving;
 - scoped Wasm SIMD128 XOR acceleration;

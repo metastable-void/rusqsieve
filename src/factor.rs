@@ -385,14 +385,11 @@ fn factor_node<const P: usize>(
     factor_node(factor, multiplicity, cfg, out, depth + 1)?;
     factor_node(other, multiplicity, cfg, out, depth + 1)
 }
-fn primes_to(limit: u32) -> Vec<u32> {
-    let mut ps = Vec::new();
-    for n in 2..=limit {
-        if n == 2 || n % 2 != 0 && ps.iter().take_while(|&&p| p <= n / p).all(|&p| n % p != 0) {
-            ps.push(n)
-        }
-    }
-    ps
+fn primes_to(limit: u32) -> impl Iterator<Item = u32> {
+    crate::smallfactor::small_primes()
+        .iter()
+        .copied()
+        .take_while(move |&prime| prime <= limit)
 }
 fn pollard_rho<const P: usize>(
     n: &Natural<P>,
@@ -505,6 +502,13 @@ fn reference_qs_factor<const P: usize>(
         .collect();
     let matrix = crate::f2::SparseBinaryMatrix::from_columns(ctx.factor_base().len() + 1, &columns)
         .map_err(|_| FactorError::InvalidDependency)?;
+    let dense_bytes = matrix
+        .columns()
+        .saturating_mul(matrix.rows().div_ceil(64))
+        .saturating_mul(16);
+    if dense_bytes > 256 * 1024 * 1024 {
+        return Err(FactorError::ResourceLimit(ResourceLimitKind::Memory));
+    }
     let deps = matrix.dense_dependencies();
     for dep in deps.iter() {
         if !matrix.verify_dependency(dep) {

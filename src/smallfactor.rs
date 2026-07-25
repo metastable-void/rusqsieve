@@ -4,8 +4,6 @@
 //! only `u64`/`u128` arithmetic. This bypasses fixed-capacity `Natural` big-integer
 //! arithmetic entirely for small cofactors, which dominates cost below the SIQS
 //! range. Results are deterministic (fixed sequence seeds), as required by SPEC §20.
-#![cfg(any(unix, windows))]
-
 use std::sync::OnceLock;
 
 /// Trial-division bound for the cached small-prime table.
@@ -110,12 +108,15 @@ pub fn is_prime_u64(n: u64) -> bool {
 
 /// Brent's improvement to Pollard's rho with batched GCD. `n` must be an odd
 /// composite; returns a nontrivial factor. Deterministic given `n`.
-fn pollard_brent(n: u64) -> u64 {
+fn pollard_brent(n: u64, cancelled: &mut impl FnMut() -> bool) -> Option<u64> {
     if n.is_multiple_of(2) {
-        return 2;
+        return Some(2);
     }
     let mut c = 1u64;
     loop {
+        if cancelled() {
+            return None;
+        }
         let f = |x: u64| ((x as u128 * x as u128 + c as u128) % n as u128) as u64;
         let mut y = 2u64;
         let mut r = 1u64;
@@ -130,6 +131,9 @@ fn pollard_brent(n: u64) -> u64 {
             }
             let mut k = 0u64;
             while k < r && g == 1 {
+                if cancelled() {
+                    return None;
+                }
                 ys = y;
                 let lim = core::cmp::min(128, r - k);
                 for _ in 0..lim {
@@ -146,6 +150,9 @@ fn pollard_brent(n: u64) -> u64 {
         }
         if g == n {
             loop {
+                if cancelled() {
+                    return None;
+                }
                 ys = f(ys);
                 g = gcd_u64(x.abs_diff(ys), n);
                 if g != 1 {
@@ -154,7 +161,7 @@ fn pollard_brent(n: u64) -> u64 {
             }
         }
         if g != n && g != 1 {
-            return g;
+            return Some(g);
         }
         c += 1;
     }
@@ -162,11 +169,26 @@ fn pollard_brent(n: u64) -> u64 {
 
 /// Fully factor `n` (which must fit in `u64`) into its prime factors, appended
 /// to `out` (unsorted; caller sorts).
-pub fn factor_u64(mut n: u64, out: &mut Vec<u64>) {
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn factor_u64(n: u64, out: &mut Vec<u64>) {
+    let completed = factor_u64_cancellable(n, out, || false);
+    debug_assert!(completed);
+}
+
+/// Cancellable form of [`factor_u64`]. Returns false without adding any more
+/// factors after `cancelled` first returns true.
+pub fn factor_u64_cancellable(
+    mut n: u64,
+    out: &mut Vec<u64>,
+    mut cancelled: impl FnMut() -> bool,
+) -> bool {
     if n <= 1 {
-        return;
+        return true;
     }
     for &p in small_primes() {
+        if cancelled() {
+            return false;
+        }
         let p = p as u64;
         if p.saturating_mul(p) > n {
             break;
@@ -177,21 +199,26 @@ pub fn factor_u64(mut n: u64, out: &mut Vec<u64>) {
         }
     }
     if n > 1 {
-        factor_rec(n, out);
+        return factor_rec(n, out, &mut cancelled);
     }
+    true
 }
 
-fn factor_rec(n: u64, out: &mut Vec<u64>) {
+fn factor_rec(n: u64, out: &mut Vec<u64>, cancelled: &mut impl FnMut() -> bool) -> bool {
+    if cancelled() {
+        return false;
+    }
     if n == 1 {
-        return;
+        return true;
     }
     if is_prime_u64(n) {
         out.push(n);
-        return;
+        return true;
     }
-    let d = pollard_brent(n);
-    factor_rec(d, out);
-    factor_rec(n / d, out);
+    let Some(d) = pollard_brent(n, cancelled) else {
+        return false;
+    };
+    factor_rec(d, out, cancelled) && factor_rec(n / d, out, cancelled)
 }
 
 #[cfg(test)]

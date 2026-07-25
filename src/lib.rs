@@ -37,7 +37,6 @@ mod native;
 #[allow(unsafe_code)]
 mod capi;
 
-#[cfg(any(unix, windows))]
 mod smallfactor;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

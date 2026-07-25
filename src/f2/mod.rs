@@ -1,7 +1,6 @@
 //! Sparse binary matrices and verified dependencies.
 use core::fmt;
 use core::ops::Range;
-use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MatrixOperation {
@@ -47,6 +46,7 @@ pub enum MatrixError {
     DimensionOverflow,
     IndexOutOfRange,
     MalformedOffsets,
+    ResourceLimit,
 }
 impl fmt::Display for MatrixError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -191,6 +191,9 @@ impl SparseBinaryMatrix {
         }
         let words = cols.div_ceil(64);
         let mut basis: Vec<Option<Box<[u64]>>> = vec![None; cols];
+        const M4RI_BITS: usize = 4;
+        let mut m4ri_tables: Vec<Option<Vec<Box<[u64]>>>> =
+            (0..cols.div_ceil(M4RI_BITS)).map(|_| None).collect();
 
         for row in 0..self.rows() {
             let a = self.csr_offsets[row] as usize;
@@ -204,13 +207,28 @@ impl SparseBinaryMatrix {
                 equation[column as usize / 64] ^= 1 << (column % 64);
             }
             while let Some(pivot) = highest_bit(&equation) {
-                if let Some(prior) = &basis[pivot] {
-                    xor(&mut equation[..=pivot / 64], &prior[..=pivot / 64]);
-                } else {
+                if basis[pivot].is_none() {
                     equation.truncate(pivot / 64 + 1);
                     basis[pivot] = Some(equation.into_boxed_slice());
+                    m4ri_tables[pivot / M4RI_BITS] = None;
                     break;
                 }
+                let block = pivot / M4RI_BITS;
+                let start = block * M4RI_BITS;
+                let table =
+                    m4ri_tables[block].get_or_insert_with(|| m4ri_table(&basis, start, M4RI_BITS));
+                let mut mask = 0usize;
+                for offset in 0..M4RI_BITS {
+                    let column = start + offset;
+                    if column < cols
+                        && basis[column].is_some()
+                        && equation[column / 64] >> (column % 64) & 1 != 0
+                    {
+                        mask |= 1 << offset;
+                    }
+                }
+                debug_assert_ne!(mask, 0);
+                xor(&mut equation, &table[mask]);
             }
         }
 
@@ -228,10 +246,7 @@ impl SparseBinaryMatrix {
                     continue;
                 };
                 let last = pivot / 64;
-                let odd = equation[..=last]
-                    .iter()
-                    .zip(&dependency[..=last])
-                    .fold(0u32, |parity, (&a, &b)| parity ^ ((a & b).count_ones() & 1));
+                let odd = parity_dot(&equation[..=last], &dependency[..=last]);
                 if odd != 0 {
                     dependency[last] ^= 1 << (pivot % 64);
                 }
@@ -254,22 +269,22 @@ impl SparseBinaryMatrix {
     /// For quadratic-sieve matrices this removes the many low-weight rows before
     /// the O(n³) dense step, turning the linear-algebra phase from a bottleneck
     /// into a small fraction of the run at large input sizes.
-    pub fn filtered_dependencies(&self) -> DependencySet {
+    pub fn filtered_dependencies(&self) -> Result<DependencySet, MatrixError> {
         #[cfg(any(unix, windows))]
         let filter_started = std::time::Instant::now();
         let nrows = self.rows();
         let ncols = self.columns();
         if ncols == 0 {
-            return DependencySet::default();
+            return Ok(DependencySet::default());
         }
-        let mut row_cols: Vec<BTreeSet<usize>> = (0..nrows)
+        let mut row_cols: Vec<Vec<usize>> = (0..nrows)
             .map(|r| {
                 let a = self.csr_offsets[r] as usize;
                 let b = self.csr_offsets[r + 1] as usize;
                 self.csr_columns[a..b].iter().map(|&c| c as usize).collect()
             })
             .collect();
-        let mut col_rows: Vec<BTreeSet<usize>> = (0..ncols)
+        let mut col_rows: Vec<Vec<usize>> = (0..ncols)
             .map(|c| {
                 let a = self.csc_offsets[c] as usize;
                 let b = self.csc_offsets[c + 1] as usize;
@@ -302,18 +317,18 @@ impl SparseBinaryMatrix {
 
             row_cols[r].clear();
             for &c in &equation {
-                col_rows[c].remove(&r);
+                sorted_remove(&mut col_rows[c], r);
             }
             let affected: Vec<usize> = col_rows[pivot].iter().copied().collect();
             for rr in affected {
-                row_cols[rr].remove(&pivot);
-                col_rows[pivot].remove(&rr);
+                sorted_remove(&mut row_cols[rr], pivot);
+                sorted_remove(&mut col_rows[pivot], rr);
                 for &c in &rhs {
-                    if row_cols[rr].remove(&c) {
-                        col_rows[c].remove(&rr);
+                    if sorted_remove(&mut row_cols[rr], c) {
+                        sorted_remove(&mut col_rows[c], rr);
                     } else {
-                        row_cols[rr].insert(c);
-                        col_rows[c].insert(rr);
+                        sorted_insert(&mut row_cols[rr], c);
+                        sorted_insert(&mut col_rows[c], rr);
                     }
                 }
                 if (1..=MAX_STRUCTURED_WEIGHT).contains(&row_cols[rr].len()) {
@@ -345,7 +360,11 @@ impl SparseBinaryMatrix {
             );
         }
         if alive_cols.len() == ncols || alive_cols.len() <= reduced_rows {
-            return self.dense_dependencies();
+            let dense_bytes = ncols.saturating_mul(nrows.div_ceil(64)).saturating_mul(16);
+            if dense_bytes > 256 * 1024 * 1024 {
+                return Err(MatrixError::ResourceLimit);
+            }
+            return Ok(self.dense_dependencies());
         }
         let reduced_cols: Vec<Vec<u32>> = alive_cols
             .iter()
@@ -360,7 +379,7 @@ impl SparseBinaryMatrix {
             })
             .collect();
         let Ok(reduced) = SparseBinaryMatrix::from_columns(reduced_rows, &reduced_cols) else {
-            return self.dense_dependencies();
+            return Err(MatrixError::MalformedOffsets);
         };
         #[cfg(any(unix, windows))]
         let dense_started = std::time::Instant::now();
@@ -397,13 +416,64 @@ impl SparseBinaryMatrix {
                 out.len()
             );
         }
-        DependencySet { vectors: out }
+        Ok(DependencySet { vectors: out })
+    }
+}
+
+fn m4ri_table(basis: &[Option<Box<[u64]>>], start: usize, width: usize) -> Vec<Box<[u64]>> {
+    let words = (start + width).div_ceil(64);
+    let mut table = Vec::with_capacity(1 << width);
+    for mask in 0usize..1 << width {
+        let mut row = vec![0u64; words];
+        for offset in 0..width {
+            if mask >> offset & 1 == 0 {
+                continue;
+            }
+            if let Some(source) = basis.get(start + offset).and_then(Option::as_deref) {
+                xor(&mut row, source);
+            }
+        }
+        table.push(row.into_boxed_slice());
+    }
+    table
+}
+
+fn sorted_remove(values: &mut Vec<usize>, value: usize) -> bool {
+    match values.binary_search(&value) {
+        Ok(index) => {
+            values.remove(index);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn sorted_insert(values: &mut Vec<usize>, value: usize) {
+    if let Err(index) = values.binary_search(&value) {
+        values.insert(index, value);
     }
 }
 fn highest_bit(v: &[u64]) -> Option<usize> {
     v.iter()
         .rposition(|&x| x != 0)
         .map(|i| i * 64 + 63 - v[i].leading_zeros() as usize)
+}
+#[inline]
+fn parity_dot(a: &[u64], b: &[u64]) -> u32 {
+    let mut parity = [0u32; 4];
+    let mut index = 0;
+    while index + 4 <= a.len().min(b.len()) {
+        for lane in 0..4 {
+            parity[lane] ^= (a[index + lane] & b[index + lane]).count_ones();
+        }
+        index += 4;
+    }
+    let mut result = parity.into_iter().fold(0, |value, lane| value ^ lane);
+    while index < a.len().min(b.len()) {
+        result ^= (a[index] & b[index]).count_ones();
+        index += 1;
+    }
+    result & 1
 }
 #[cfg(not(all(feature = "wasm-simd128", target_arch = "wasm32")))]
 fn xor(a: &mut [u64], b: &[u64]) {
@@ -500,7 +570,7 @@ impl std::error::Error for LinearAlgebraError {}
 impl BlockLanczos {
     pub fn begin(matrix: &SparseBinaryMatrix) -> Self {
         Self {
-            dependencies: matrix.filtered_dependencies(),
+            dependencies: matrix.filtered_dependencies().unwrap_or_default(),
             complete: true,
         }
     }
@@ -561,7 +631,7 @@ mod tests {
                 })
                 .collect();
             let m = SparseBinaryMatrix::from_columns(rows, &columns).unwrap();
-            let filtered = m.filtered_dependencies();
+            let filtered = m.filtered_dependencies().unwrap();
             for d in filtered.iter() {
                 assert!(
                     m.verify_dependency(d),

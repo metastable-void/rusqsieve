@@ -23,11 +23,101 @@ export function gcd(a, b) {
 // Deterministic Miller-Rabin (exact for n < 3.3·10^24 with these bases; strong
 // probable-prime beyond).
 const MR_BASES = [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n];
+const TWO64 = 1n << 64n;
+
+function millerRabinWitness(n, a) {
+  let d = n - 1n;
+  let s = 0n;
+  while ((d & 1n) === 0n) {
+    d >>= 1n;
+    s++;
+  }
+  let x = modPow(a % n, d, n);
+  if (x === 1n || x === n - 1n) return true;
+  for (let i = 1n; i < s; i++) {
+    x = (x * x) % n;
+    if (x === n - 1n) return true;
+    if (x === 1n) return false;
+  }
+  return false;
+}
+
+function jacobi(a, n) {
+  a %= n;
+  if (a < 0n) a += n;
+  let result = 1;
+  while (a !== 0n) {
+    while ((a & 1n) === 0n) {
+      a >>= 1n;
+      const n8 = n & 7n;
+      if (n8 === 3n || n8 === 5n) result = -result;
+    }
+    [a, n] = [n, a];
+    if ((a & 3n) === 3n && (n & 3n) === 3n) result = -result;
+    a %= n;
+  }
+  return n === 1n ? result : 0;
+}
+
+function strongLucasSelfridge(n) {
+  let magnitude = 5n;
+  let positive = true;
+  let D;
+  for (;;) {
+    D = positive ? magnitude : -magnitude;
+    const symbol = jacobi(D, n);
+    if (symbol === -1) break;
+    if (symbol === 0) return false;
+    magnitude += 2n;
+    positive = !positive;
+  }
+  const Q = (1n - D) / 4n;
+  let odd = n + 1n;
+  let s = 0n;
+  while ((odd & 1n) === 0n) {
+    odd >>= 1n;
+    s++;
+  }
+  const mod = (x) => ((x % n) + n) % n;
+  const half = (x) => {
+    x = mod(x);
+    return (x & 1n) === 0n ? x >> 1n : (x + n) >> 1n;
+  };
+  let U = 1n;
+  let V = 1n;
+  let Qk = mod(Q);
+  const bits = odd.toString(2);
+  for (let i = 1; i < bits.length; i++) {
+    U = mod(U * V);
+    V = mod(V * V - 2n * Qk);
+    Qk = mod(Qk * Qk);
+    if (bits[i] === "1") {
+      const oldU = U;
+      const oldV = V;
+      U = half(oldU + oldV);
+      V = half(D * oldU + oldV);
+      Qk = mod(Qk * Q);
+    }
+  }
+  if (U === 0n || V === 0n) return true;
+  for (let r = 1n; r < s; r++) {
+    V = mod(V * V - 2n * Qk);
+    Qk = mod(Qk * Qk);
+    if (V === 0n) return true;
+  }
+  return false;
+}
+
 export function isPrime(n) {
   if (n < 2n) return false;
   for (const p of MR_BASES) {
     if (n === p) return true;
     if (n % p === 0n) return false;
+  }
+  if (n >= TWO64) {
+    const root = integerRoot(n, 2);
+    if (root * root === n) return false;
+    if (!millerRabinWitness(n, 2n) || !strongLucasSelfridge(n)) return false;
   }
   let d = n - 1n;
   let s = 0n;

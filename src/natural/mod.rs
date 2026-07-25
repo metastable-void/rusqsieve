@@ -316,7 +316,30 @@ impl<const P: usize> Natural<P> {
         self.widening_mul(self)
     }
     pub(crate) fn overflowing_mul(&self, rhs: &Self) -> (Self, bool) {
-        self.widening_mul(rhs).overflowing_narrow()
+        let alen = sig_len(&self.parts);
+        let blen = sig_len(&rhs.parts);
+        let mut out = Self::ZERO;
+        let mut overflow = alen != 0 && blen != 0 && alen + blen - 1 > P;
+        for i in 0..alen.min(P) {
+            let mut carry = 0u128;
+            let count = blen.min(P - i);
+            for j in 0..count {
+                let k = i + j;
+                let value =
+                    self.parts[i] as u128 * rhs.parts[j] as u128 + out.parts[k] as u128 + carry;
+                out.parts[k] = value as u64;
+                carry = value >> 64;
+            }
+            let mut k = i + count;
+            while carry != 0 && k < P {
+                let value = out.parts[k] as u128 + carry;
+                out.parts[k] = value as u64;
+                carry = value >> 64;
+                k += 1;
+            }
+            overflow |= carry != 0;
+        }
+        (out, overflow)
     }
     /// Adds two values, returning `None` on capacity overflow.
     pub fn checked_add(&self, rhs: &Self) -> Option<Self> {
@@ -355,11 +378,11 @@ impl<const P: usize> Natural<P> {
         }
         let (q, r) = knuth_divmod(&self.parts, &divisor.parts);
         let mut qn = Self::ZERO;
-        for (slot, &x) in qn.parts.iter_mut().zip(q.iter()) {
+        for (slot, &x) in qn.parts.iter_mut().zip(q.as_slice()) {
             *slot = x;
         }
         let mut rn = Self::ZERO;
-        for (slot, &x) in rn.parts.iter_mut().zip(r.iter()) {
+        for (slot, &x) in rn.parts.iter_mut().zip(r.as_slice()) {
             *slot = x;
         }
         Some((qn, rn))
@@ -546,9 +569,8 @@ impl<const P: usize> Natural<P> {
         }
     }
     pub(crate) fn mul_mod(&self, rhs: &Self, m: &Self) -> Self {
-        let a = self.div_rem(m).unwrap().1;
-        let b = rhs.div_rem(m).unwrap().1;
-        a.widening_mul(&b).rem_natural(m)
+        debug_assert!(self < m && rhs < m, "mul_mod operands must be reduced");
+        self.widening_mul(rhs).rem_natural(m)
     }
     pub(crate) fn pow_mod(&self, e: &Self, m: &Self) -> Self {
         let mut a = self.div_rem(m).unwrap().1;
@@ -566,7 +588,7 @@ impl<const P: usize> Natural<P> {
         out
     }
     pub(crate) fn mod_u64(&self, m: u64) -> u64 {
-        self.div_rem_u64(m).unwrap().1
+        self.rem_u64(m)
     }
 }
 
@@ -590,22 +612,65 @@ fn sig_len(limbs: &[u64]) -> usize {
     limbs.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1)
 }
 
+const MAX_DIV_LIMBS: usize = 2 * 16 + 1;
+
+enum LimbBuffer {
+    Stack {
+        limbs: [u64; MAX_DIV_LIMBS],
+        len: usize,
+    },
+    Heap(Vec<u64>),
+}
+impl LimbBuffer {
+    fn zeroed(len: usize) -> Self {
+        if len <= MAX_DIV_LIMBS {
+            Self::Stack {
+                limbs: [0; MAX_DIV_LIMBS],
+                len,
+            }
+        } else {
+            Self::Heap(vec![0; len])
+        }
+    }
+    fn from_slice(values: &[u64]) -> Self {
+        let mut buffer = Self::zeroed(values.len());
+        buffer.as_mut_slice().copy_from_slice(values);
+        buffer
+    }
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Self::Stack { limbs, len } => &limbs[..*len],
+            Self::Heap(limbs) => limbs,
+        }
+    }
+    fn as_mut_slice(&mut self) -> &mut [u64] {
+        match self {
+            Self::Stack { limbs, len } => &mut limbs[..*len],
+            Self::Heap(limbs) => limbs,
+        }
+    }
+}
+
 /// Little-endian schoolbook long division (Knuth TAOCP Alg. D) on limb slices.
 /// Returns `(quotient, remainder)` as trimmed little-endian limb vectors.
 /// `den` must be nonzero. This is the shared normalized-long-division primitive
 /// used by both `Natural::div_rem` and wide-product reduction (SPEC §6.11).
-fn knuth_divmod(num: &[u64], den: &[u64]) -> (Vec<u64>, Vec<u64>) {
+fn knuth_divmod(num: &[u64], den: &[u64]) -> (LimbBuffer, LimbBuffer) {
     const LOW: u128 = 0xffff_ffff_ffff_ffff;
     let num_len = sig_len(num);
     let n = sig_len(den);
     debug_assert!(n >= 1, "division by zero");
     if num_len < n {
-        return (vec![0], num[..num_len.max(1)].to_vec());
+        return (
+            LimbBuffer::from_slice(&[0]),
+            LimbBuffer::from_slice(&num[..num_len.max(1)]),
+        );
     }
     // Single-limb divisor: straight long division.
     if n == 1 {
         let d = den[0] as u128;
-        let mut q = vec![0u64; num_len];
+        let mut q = LimbBuffer::zeroed(num_len);
+        let q = q.as_mut_slice();
         let mut r = 0u128;
         for i in (0..num_len).rev() {
             let cur = (r << 64) | num[i] as u128;
@@ -613,12 +678,16 @@ fn knuth_divmod(num: &[u64], den: &[u64]) -> (Vec<u64>, Vec<u64>) {
             r = cur - qi as u128 * d;
             q[i] = qi;
         }
-        return (q, vec![r as u64]);
+        return (
+            LimbBuffer::from_slice(q),
+            LimbBuffer::from_slice(&[r as u64]),
+        );
     }
     let m = num_len - n;
     let shift = den[n - 1].leading_zeros();
     // Normalize divisor and dividend so the divisor's top bit is set.
-    let mut vn = vec![0u64; n];
+    let mut vn = LimbBuffer::zeroed(n);
+    let vn = vn.as_mut_slice();
     if shift == 0 {
         vn.copy_from_slice(&den[..n]);
     } else {
@@ -627,7 +696,8 @@ fn knuth_divmod(num: &[u64], den: &[u64]) -> (Vec<u64>, Vec<u64>) {
         }
         vn[0] = den[0] << shift;
     }
-    let mut un = vec![0u64; num_len + 1];
+    let mut un = LimbBuffer::zeroed(num_len + 1);
+    let un = un.as_mut_slice();
     if shift == 0 {
         un[..num_len].copy_from_slice(&num[..num_len]);
     } else {
@@ -637,7 +707,8 @@ fn knuth_divmod(num: &[u64], den: &[u64]) -> (Vec<u64>, Vec<u64>) {
         }
         un[0] = num[0] << shift;
     }
-    let mut q = vec![0u64; m + 1];
+    let mut q = LimbBuffer::zeroed(m + 1);
+    let q = q.as_mut_slice();
     let base = 1u128 << 64;
     for j in (0..=m).rev() {
         let top = ((un[j + n] as u128) << 64) | un[j + n - 1] as u128;
@@ -677,7 +748,8 @@ fn knuth_divmod(num: &[u64], den: &[u64]) -> (Vec<u64>, Vec<u64>) {
         q[j] = qj;
     }
     // Denormalize the remainder.
-    let mut rem = vec![0u64; n];
+    let mut rem = LimbBuffer::zeroed(n);
+    let rem = rem.as_mut_slice();
     if shift == 0 {
         rem.copy_from_slice(&un[..n]);
     } else {
@@ -686,7 +758,7 @@ fn knuth_divmod(num: &[u64], den: &[u64]) -> (Vec<u64>, Vec<u64>) {
         }
         rem[n - 1] = un[n - 1] >> shift;
     }
-    (q, rem)
+    (LimbBuffer::from_slice(q), LimbBuffer::from_slice(rem))
 }
 
 impl<const P: usize> Ord for Natural<P> {
@@ -1060,12 +1132,19 @@ impl<const P: usize> WideNatural<P> {
             }
             return Natural::from_u64(r as u64);
         }
-        let mut wide = Vec::with_capacity(2 * P);
-        wide.extend_from_slice(&self.low);
-        wide.extend_from_slice(&self.high);
-        let (_, r) = knuth_divmod(&wide, &m.parts);
+        let (_, r) = if P <= 16 {
+            let mut wide = [0u64; 2 * 16];
+            wide[..P].copy_from_slice(&self.low);
+            wide[P..2 * P].copy_from_slice(&self.high);
+            knuth_divmod(&wide[..2 * P], &m.parts)
+        } else {
+            let mut wide = Vec::with_capacity(2 * P);
+            wide.extend_from_slice(&self.low);
+            wide.extend_from_slice(&self.high);
+            knuth_divmod(&wide, &m.parts)
+        };
         let mut rn = Natural::ZERO;
-        for (slot, &x) in rn.parts.iter_mut().zip(r.iter()) {
+        for (slot, &x) in rn.parts.iter_mut().zip(r.as_slice()) {
             *slot = x;
         }
         rn

@@ -131,6 +131,9 @@ where
         })
         .map_err(|error| match error {
             crate::engine::EngineError::Cancelled => FactorError::Cancelled,
+            crate::engine::EngineError::ResourceLimit => {
+                FactorError::ResourceLimit(crate::ResourceLimitKind::Memory)
+            }
             _ => FactorError::NoNontrivialFactor,
         })?;
         let mut output = PrimeFactors::new();

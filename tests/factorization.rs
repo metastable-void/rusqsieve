@@ -3,6 +3,7 @@ use rusqsieve::{
     FactorConfig, FactorError, Natural, Parallelism, ProgressAction, ProgressPhase, factor,
     factor_with_progress,
 };
+use std::str::FromStr;
 
 #[test]
 fn factors_sorted_with_repetitions() {
@@ -86,4 +87,104 @@ fn progress_cancellation_stops_parallel_sieving() {
     });
     assert!(reached_sieving);
     assert!(matches!(result, Err(FactorError::Cancelled)));
+}
+
+fn assert_factorization(input: &str, expected: &[&str]) {
+    let n = Natural::<16>::from_str(input).unwrap();
+    let factors = factor(n.clone()).unwrap_or_else(|error| panic!("failed to factor {n}: {error}"));
+    assert!(
+        factors.verify_product(&n),
+        "factor product mismatch for {n}"
+    );
+    let actual = factors
+        .expanded()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "prime factorization mismatch for {n}");
+
+    // Each listed factor must itself terminate as one prime factor. This exercises
+    // the library's final primality decision rather than merely trusting the product.
+    for expected_prime in expected {
+        let prime = Natural::<16>::from_str(expected_prime).unwrap();
+        let prime_factors = factor(prime.clone()).unwrap();
+        assert_eq!(
+            prime_factors.total_len(),
+            1,
+            "{prime} was not accepted as prime"
+        );
+        assert!(prime_factors.verify_product(&prime));
+    }
+}
+
+#[test]
+fn balanced_semiprimes_across_the_choose_a_dead_zone() {
+    let cases: &[(&str, &[&str])] = &[
+        // Required minimum reproducer (65 bits).
+        ("18446744400127067027", &["4294967311", "4294967357"]),
+        ("27072011721716628587", &["4273765633", "6334463339"]),
+        ("635904368119925963561", &["19860882047", "32017931863"]),
+        ("20988451891514649258347", &["91807517561", "228613652227"]),
+        (
+            "703713894016303629914563",
+            &["815250411389", "863187413567"],
+        ),
+        (
+            "22921914745054882120472087",
+            &["2921865453193", "7844959020959"],
+        ),
+        (
+            "648536833001811612107041493",
+            &["24295067057461", "26694177524513"],
+        ),
+    ];
+    for &(n, expected) in cases {
+        assert_factorization(n, expected);
+    }
+}
+
+#[test]
+fn supplied_factorization_corpus() {
+    let corpus = include_str!("data/rusqsieve-factorization-corpus.txt");
+    let mut tested = 0usize;
+    for (line_index, line) in corpus.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        assert!(
+            fields.len() >= 2,
+            "corpus line {} has no factorization",
+            line_index + 1
+        );
+        assert_factorization(fields[0], &fields[1..]);
+        tested += 1;
+    }
+    assert_eq!(tested, 309, "unexpected corpus entry count");
+}
+
+#[test]
+#[ignore = "manual interleaved performance measurement"]
+fn profile_single_input() {
+    let input = std::env::var("RUSQSIEVE_BENCH_INPUT").unwrap();
+    let n = Natural::<16>::from_str(&input).unwrap();
+    let repeats = std::env::var("RUSQSIEVE_BENCH_REPEATS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let started = std::time::Instant::now();
+    for _ in 0..repeats {
+        let factors = rusqsieve::factor_with(
+            n.clone(),
+            FactorConfig::default().with_parallelism(Parallelism::threads(4).unwrap()),
+        )
+        .unwrap();
+        assert!(factors.verify_product(&n));
+    }
+    eprintln!(
+        "BENCH input_bits={} repeats={} elapsed={:.6}s",
+        n.bit_len(),
+        repeats,
+        started.elapsed().as_secs_f64()
+    );
 }
