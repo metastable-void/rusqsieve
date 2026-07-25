@@ -1,7 +1,7 @@
 // Main thread: UI + coordinator. Peels easy factors with BigInt number theory and
 // hands hard composites to a pool of wasm Web Workers running the quadratic sieve,
 // with the pool sized to navigator.hardwareConcurrency.
-import { instantiate, loadModule, putString, putBytes, takePacket, bytesToBigInt } from "./abi.js";
+import { loadModule, bytesToBigInt } from "./abi.js";
 import { trialDivide, isPrime, perfectPower, pollardBrent, groupFactors, rsaNumber, bitLength } from "./numtheory.js";
 
 const SIMD_WASM_URL = new URL("./rusqsieve-simd.wasm", import.meta.url);
@@ -25,7 +25,7 @@ const els = {
   rsaGen: document.getElementById("rsa-gen"),
 };
 
-let coord = null; // coordinator wasm instance (main thread)
+let coord = null; // coordinator Worker (owns its own wasm instance)
 let workers = []; // sieve worker pool
 let gen = 0; // generation token so stale worker messages are ignored
 let wasmFlavor = "scalar";
@@ -42,7 +42,14 @@ async function boot() {
     // Older engines can still use the portable artifact.
     module = await loadModule(SCALAR_WASM_URL);
   }
-  coord = await instantiate(module);
+  coord = new Worker(new URL("./coordinator.js", import.meta.url), { type: "module" });
+  const abi = await new Promise((resolve, reject) => {
+    coord.onmessage = ({ data }) => {
+      if (data.type === "ready") resolve(data.abi);
+      else if (data.type === "error") reject(new Error(data.error));
+    };
+    coord.postMessage({ cmd: "init", module });
+  });
   workers = await Promise.all(
     Array.from({ length: nWorkers }, () => {
       const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
@@ -58,7 +65,7 @@ async function boot() {
     }),
   );
   els.workers.textContent =
-    `${nWorkers} worker${nWorkers === 1 ? "" : "s"} · ${wasmFlavor} · ABI v${coord.qs_abi_version()}`;
+    `${nWorkers} worker${nWorkers === 1 ? "" : "s"} · ${wasmFlavor} · ABI v${abi}`;
   els.go.disabled = false;
   els.status.textContent = "Ready.";
 }
@@ -67,11 +74,7 @@ async function boot() {
 function siqsParallel(decimal, report) {
   return new Promise((resolve, reject) => {
     const myGen = ++gen;
-    const s = putString(coord, decimal);
-    const session = coord.qs_coord_new(s.ptr, s.len);
-    coord.qs_dealloc(s.ptr, s.len, 1);
-    if (!session) return reject(new Error("could not build a sieve for this number"));
-    const target = coord.qs_coord_target(session);
+    let target = 0;
     let relations = 0;
     let nextFamily = 0;
     let finished = false;
@@ -82,17 +85,29 @@ function siqsParallel(decimal, report) {
       nextFamily += BATCH;
       w.postMessage({ cmd: "sieve", family, count: BATCH, gen: myGen });
     };
-    const finish = () => {
-      finished = true;
-      report({ phase: "linalg" });
-      const handle = coord.qs_coord_extract(session);
-      const payload = takePacket(coord, handle);
-      coord.qs_coord_free(session);
-      if (!payload) return reject(new Error("linear algebra found no factor"));
-      resolve(bytesToBigInt(payload));
+    coord.onmessage = ({ data }) => {
+      if (data.gen !== myGen && data.type !== "error") return;
+      if (data.type === "error") {
+        if (!finished) {
+          finished = true;
+          reject(new Error(data.error));
+        }
+      } else if (data.type === "session") {
+        target = data.target;
+        for (const w of workers) w.postMessage({ cmd: "prepare", n: decimal, gen: myGen });
+      } else if (data.type === "submitted") {
+        relations = data.relations;
+        report({ phase: "sieving", relations, target });
+        if (!finished) dispatch(workers[data.worker]);
+      } else if (data.type === "linalg") {
+        report({ phase: "linalg" });
+      } else if (data.type === "factor") {
+        finished = true;
+        resolve(bytesToBigInt(data.factor));
+      }
     };
 
-    for (const w of workers) {
+    workers.forEach((w, workerIndex) => {
       w.onmessage = ({ data }) => {
         // Errors are always surfaced; other messages from an obsolete generation
         // (a worker's in-flight job for a previous composite) are ignored.
@@ -113,20 +128,20 @@ function siqsParallel(decimal, report) {
           dispatch(w);
         } else if (data.type === "relations") {
           if (data.payload) {
-            const b = putBytes(coord, data.payload);
-            relations = coord.qs_coord_submit(session, b.ptr, b.len);
-            coord.qs_dealloc(b.ptr, b.len, 1);
-            report({ phase: "sieving", relations, target });
+            coord.postMessage(
+              { cmd: "submit", payload: data.payload, worker: workerIndex, gen: myGen },
+              [data.payload.buffer],
+            );
+            return;
           }
-          if (relations >= target) finish();
-          else if (nextFamily > MAX_FAMILIES) {
+          if (nextFamily > MAX_FAMILIES) {
             finished = true;
             reject(new Error("relation budget exhausted"));
           } else dispatch(w);
         }
       };
-      w.postMessage({ cmd: "prepare", n: decimal, gen: myGen });
-    }
+    });
+    coord.postMessage({ cmd: "new", n: decimal, gen: myGen });
   });
 }
 
@@ -150,25 +165,19 @@ async function factorize(N, report) {
       for (let i = 0; i < pp.k; i++) stack.push(pp.base);
       continue;
     }
-    // Pollard's rho is only worthwhile where it can actually finish: it is the
-    // primary tool below the sieve's viable range (~80 bits), and a quick cheap
-    // peel above it (to catch a small factor trial division missed). It cannot
-    // split a balanced large semiprime — that is the sieve's job.
-    const bits = c.toString(2).length;
-    if (bits <= 84) {
-      report({ phase: "pollard", n: c });
-      await tick();
-      const d = pollardBrent(c, 1 << 21);
-      if (d && d > 1n && d < c) {
-        stack.push(d, c / d);
-        continue;
-      }
-    } else {
-      const d = pollardBrent(c, 1 << 15);
-      if (d && d > 1n && d < c) {
-        stack.push(d, c / d);
-        continue;
-      }
+    // Pollard-Brent is a cheap opportunistic peel, not the primary tool at any size: it costs
+    // O(sqrt p) in the smallest factor while the sieve costs by the size of `c`, so it only wins
+    // where `c` is unbalanced. This used to spend a 2^21 budget below 84 bits on the theory that
+    // rho owned that range. Measured here in node (BigInt, single-threaded), 2^21 against 2^15:
+    // an 80-bit balanced semiprime 825 ms vs 44 ms, an 85-bit one 724 ms vs 44 ms, while the
+    // unbalanced 127-bit case splits in 0.3 ms either way — and the sieve handles those sizes in
+    // milliseconds. The large budget was up to 825 ms of blocked main thread for nothing.
+    report({ phase: "pollard", n: c });
+    await tick();
+    const d = pollardBrent(c, 1 << 15);
+    if (d && d > 1n && d < c) {
+      stack.push(d, c / d);
+      continue;
     }
     const factor = await siqsParallel(c.toString(), report);
     stack.push(factor, c / factor);
