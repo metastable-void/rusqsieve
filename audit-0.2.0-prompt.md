@@ -80,7 +80,9 @@ improvement.
 
 Do not add new algorithms beyond those named here. Do not restructure modules beyond the
 splits explicitly requested. Do not touch the benchmark corpus or `BENCHMARKING.md`
-numbers except to append new measurements clearly labelled with your host.
+numbers except to append new measurements clearly labelled with your host. The factorization
+corpus supplied with this brief is new to the repository; commit it as-is and do not prune
+entries from it.
 
 ---
 
@@ -101,7 +103,8 @@ always fail; 82–85 bits fail depending on the Knuth-Schroeppel multiplier; 86 
 fine. Reproduces at any thread count. The failure is not a wrong answer and not a hang — the
 engine reports no factor found.
 
-**33 of the 200 entries in the project's own `difftests.txt` corpus fail.** Most of those are
+**33 of the 200 entries in the corpus used during the review fail** — that is the measured
+reach of the bug, not a property of the corpus shipped with this brief. Most of those 33 are
 not themselves in the dead zone: a larger `n` splits successfully once, and the *cofactor*
 lands in the zone. Example, 151-bit input:
 
@@ -112,6 +115,13 @@ PROFILE nfb=226  interval=32768 target=290  k=2
 PROFILE sieve+collect=1.660s polys=0 families=100000 survivors=0 relations=0      <- dead zone
 qs-factor: factor engine failed: no nontrivial factor found
 ```
+
+`rusqsieve-factorization-corpus.txt`, supplied alongside this brief, is a rebuilt and
+independently verified replacement for that review corpus: **309 entries spanning 7–256
+bits**, each line an `N` followed by its complete prime factorization (arity varies — see
+the file's own header). **117 of them sit in the 65–85 bit dead-zone band, 87 of those
+semiprimes that fail deterministically on v0.2.0.** It is *not* currently in the repository;
+add it under `tests/data/`.
 
 This affects the library API, not only the CLI: `rusqsieve::native::factor_impl` →
 `engine::factor_node`.
@@ -144,10 +154,15 @@ to 200).
    window when the pool comes up short. Whatever you choose, add an assertion or a
    `debug_assert` that the constructed constraint set is non-empty, so this class of bug
    cannot recur silently.
-3. Add a corpus test that runs the whole of `difftests.txt` and verifies every factorization
-   (product equals `n`, every factor prime). It must reach 200/200.
+3. Add a corpus test driven by the supplied corpus file. Commit
+   `rusqsieve-factorization-corpus.txt` into the repository at
+   `tests/data/rusqsieve-factorization-corpus.txt` — its own header documents its provenance
+   and the verification every entry passed. Each line is `N f1 f2 ... fk`; **the arity
+   varies, so the parser must read the whole line and must not assume exactly two factors.**
+   The test must factor every entry and verify each result (product equals `n`, every factor
+   prime), with zero failures.
 
-**Acceptance:** the size-sweep test and the 200-entry corpus test both pass; `polys > 0` for
+**Acceptance:** the size-sweep test and the corpus test both pass; `polys > 0` for
 every size in the sweep under `RUSQSIEVE_PROFILE=1`.
 
 ### 1.2 A `choose_a` famine must not be reported as "no factor"
@@ -200,6 +215,53 @@ output that SIQS is not entered); no regression above 128 bits.
   `src/engine.rs:705`'s `let _ = h.join()` discards the original payload. Use
   `lock().unwrap_or_else(|e| e.into_inner())` and propagate the first panic message.
 
+### 1.5 Baillie-PSW as the final primality decision
+
+This is a requirement from the project owner: add Baillie-PSW on top of a reasonable number of
+Miller-Rabin rounds, in two places — the library's final primality decision, and the web demo's
+RSA number generation — provided it does not slow things down materially.
+
+**Why it matters.** `src/primality.rs`'s 16 default rounds draw their bases via
+`SMALL[round % 32]`, i.e. bases 2..53. That is **deterministic, not probabilistic**, so a strong
+pseudoprime to all of bases 2..53 is a guaranteed false positive — and such numbers are
+constructible (Arnault's constructions; Albrecht, Massimo, Paterson and Somorovsky, "Prime and
+Prejudice", 2018, which broke fixed-base implementations in named libraries). By contrast **no
+Baillie-PSW pseudoprime is known to exist**; constructing one is an open problem.
+
+**Scope, with one important exclusion.** Below 2^64 the 7-base Jaeschke/Sinclair witness set at
+`src/smallfactor.rs:73` is **proven exact**, so BPSW adds nothing there. Branch on size and apply
+BPSW for `n >= 2^64` only.
+
+**Implementation notes.**
+
+- BPSW is: trial division by small primes, then a base-2 Miller-Rabin, then a strong Lucas test
+  with Selfridge Method A parameter selection.
+- The strong Lucas test needs a **Jacobi symbol over `Natural<P>`**. The existing `jacobi_u64`
+  (`src/natural/mod.rs:1152-1236`) is u64-only, so this is new code.
+- Selfridge's `D` search does not terminate for perfect squares, so a square test must run first.
+  **`is_square` (`src/natural/mod.rs:491`) is currently dead code and Phase 3.3 lists it for
+  deletion — this gives it a user. Keep it.**
+- Keep the Miller-Rabin rounds as an additional layer, but they are no longer what carries the
+  guarantee.
+
+**Cost.** BPSW is roughly one Miller-Rabin round plus one strong Lucas, and a strong Lucas costs
+about 2–3× a Miller-Rabin round — so about 15–20% added to the primality path at 16 rounds.
+Primality is **not** the sieve hot path: it runs at `factor_node` entry (`src/engine.rs:526`) and
+on recovered factors, never per survivor. Measure the primality path before and after and report
+both numbers. If it turns out to exceed a few percent of total runtime, reduce the Miller-Rabin
+round count rather than dropping BPSW — BPSW is what carries the strength.
+
+**Web demo.** Apply the same structure in `web/numtheory.js`'s RSA number generation. Candidates
+are rejected quickly by trial division and the base-2 Miller-Rabin, so the Lucas test runs roughly
+once per accepted prime; JS `BigInt` is adequate.
+
+**Acceptance:** the extended primality tests from §4.3 (Carmichael numbers, strong pseudoprimes to
+base 2) all reject; the primality-path timing is reported before and after. **And critically —
+assert that the Lucas step is actually reached and exercised** (a counter, or a test hook).
+Because no BPSW pseudoprime is known, there is no input that distinguishes a correct Lucas
+implementation from one that silently never runs, so every test would also pass if the Lucas step
+were dead. Given this crate's existing stubs, prove it executes.
+
 ---
 
 ## Phase 2 — Performance, internal only (`0.2.1`)
@@ -246,8 +308,19 @@ factorization results unchanged on the corpus.
   caller in `extract` passes already-reduced operands. Drop the two redundant reductions;
   document the precondition and `debug_assert` it.
 - **`src/natural/mod.rs:621,630,640,680`** — `knuth_divmod` allocates four `Vec`s per call.
-  `P` is a const generic, so fixed `[u64; 2*P+1]` stack arrays are free. This is the
-  workhorse of every multi-limb division.
+  This is the workhorse of every multi-limb division, so those allocations should become
+  stack buffers — but **do not write `[u64; 2*P+1]`**: an array length computed from a const
+  generic parameter needs `generic_const_exprs`, which is unstable, and the crate is
+  stable-only. Two stable ways to get the same result:
+  **(a)** mirror what `WideNatural` (`src/natural/mod.rs:1032-1073`) already does and carry
+  several `[u64; P]` arrays instead of one `2*P`-sized array — a standalone `P` is a legal
+  array length; or
+  **(b)** since `PARTS` is a crate constant, define a literal `const MAX_LIMBS: usize = 16;`
+  and declare `[u64; 2 * MAX_LIMBS + 1]` — array lengths built from literal consts are fine
+  on stable — then slice it down with `&mut buf[..2 * p + 1]` for the `p` actually in play.
+  Option (b) costs a little stack when `P` is smaller than `MAX_LIMBS`, but it removes the
+  heap traffic and keeps one buffer instead of several. This composes with Phase 3.4, which
+  makes `PARTS` a fixed constant.
 - **`src/natural/mod.rs:1063`** — `WideNatural::rem_natural` allocates a `Vec::with_capacity(2*P)`
   purely to concatenate `low`/`high` into a contiguous slice.
 - **`src/natural/mod.rs:277-278,292`** — `widening_mul` zero-initializes `[u64; 16]` twice and
@@ -597,7 +670,10 @@ about the crate's performance characteristics:**
   R, no R², no `n′ = −m⁻¹ mod 2⁶⁴`, no REDC. `encode` (`:1111`) and `decode` (`:1114`) are
   both `v mod m`, i.e. the identity rather than Montgomery form; `mul` (`:1117`) is
   `a.mul_mod(b, m)`. **There is no Montgomery multiplication of any kind.** Implement CIOS, or
-  delete the type and rename its call sites honestly. Note that
+  delete the type and rename its call sites honestly. If you implement CIOS, its `s+2`-limb
+  accumulator runs into the same stable-Rust limit as Phase 2.2's `knuth_divmod`:
+  `[u64; P + 2]` does not compile, so size the buffer from a literal const and slice it.
+  Note that
   `Montgomery::inv` (`:1126-1149`) hand-rolls Euclid with a `mul_mod` per iteration — an O(n)
   chain of O(n²) divisions where binary xgcd is O(n²) total.
 - `src/natural/mod.rs:1439-1466` — `diff_montgomery` passes **because** encode/decode are the
@@ -641,8 +717,10 @@ about the crate's performance characteristics:**
   `qs_worker_context_import` (`:244`), `qs_worker_context_free` (`:248`),
   `qs_worker_execute` (`:250`). Removing exports from a versioned ABI requires bumping
   `ABI_VERSION`; do that.
-- `src/natural/mod.rs:491` — `is_square`, one reference. `src/qs/mod.rs:393` —
-  `CombinedRelation`, one reference.
+- `src/qs/mod.rs:393` — `CombinedRelation`, one reference.
+- `src/natural/mod.rs:491` — `is_square`, one reference today, but **keep it**: §1.5's
+  Baillie-PSW needs a perfect-square test before Selfridge's `D` search, because that search does
+  not terminate for squares. This is the one item in this list that is not a deletion candidate.
 - Never-read config fields: `FactorLimits::{max_partial_relations, max_matrix_nonzeros,
   max_memory_bytes}` (`src/factor.rs:37-39`), `QsConfig::sieve_score_scale`
   (`src/qs/mod.rs:36`), `LargePrimeConfig::{double_product_limit, enable_double}`
@@ -711,8 +789,10 @@ about the crate's performance characteristics:**
   `rusqsieve.h:57-58` claims "the engine may still cap tiny inputs", which is actively
   misleading. Clamp on **both** paths.
 - **Safe Rust functions that dereference caller-supplied pointers.** `src/lib.rs:3-6`
-  disables `deny(unsafe_code)` for the entire wasm32 build. In edition 2024 an
-  `extern "C" fn` without `unsafe` is a *safe* function, so `qs_dealloc`
+  disables `deny(unsafe_code)` for the entire wasm32 build. An `extern "C" fn` declared without
+  `unsafe` is a *safe* function — that is true in every edition, not something edition 2024
+  introduced (what 2024 changed is `unsafe extern` blocks and `unsafe_op_in_unsafe_fn` becoming
+  warn-by-default). So `qs_dealloc`
   (`src/wasm.rs:116`) frees an arbitrary address and `qs_coord_submit`
   (`src/wasm.rs:331`), `qs_session_new`, and `qs_worker_prepare` dereference arbitrary
   addresses via `input()`. Make all of them `pub unsafe extern "C" fn`. Add `// SAFETY:`
@@ -808,6 +888,53 @@ so the diffs stay reviewable:
 Also split `sieve_one_poly` (`src/engine.rs:1224-1441`, 218 lines): the per-candidate body
 (`:1302-1439`) is a standalone `evaluate_candidate`.
 
+### 3.8 Seeded witness selection
+
+**There is no OS entropy on `wasm32-unknown-unknown`.** `getrandom` needs JS glue, and this crate
+has zero runtime dependencies and no `wasm-bindgen`; `Instant::now()` and `SystemTime::now()`
+panic on that target (which is why the native scheduler at `src/engine.rs:465-748` is already
+`#[cfg(any(unix, windows))]`). So Miller-Rabin witness bases **cannot** be nondeterministic here.
+The only available construction is a **seeded deterministic PRNG**: an explicit seed-setting call,
+with the seed defaulting to 0 when it is never called.
+
+Check whether this is additive before designing new API: `WitnessPolicy::Seeded`
+(`src/primality.rs:52-55`) and `FactorConfig::seed` (`src/factor.rs:55-60`) **already exist**.
+Determine whether `WitnessPolicy` is `#[non_exhaustive]`. If the existing variants can express
+this, prefer wiring them up — together with §3.2's finding that `seed` is ignored on the default
+path — over adding public surface. Add API only if the existing surface genuinely cannot express
+it.
+
+**PRNG choice.**
+
+- **Do not use Mersenne Twister.** Its internal state is recoverable from 624 outputs, its seed
+  diffusion is weak, and its ~2.5 KB of state is a poor fit for wasm.
+- SHA-256 in counter mode is sound but is ~200 lines of new code under the zero-dependency
+  constraint.
+- **Recommended: ChaCha8 in counter mode** — about 50 lines, smaller and faster than SHA-256, far
+  stronger than MT. Use ChaCha20 if you want more margin.
+- **Do not use the existing `xorshift`** (`src/engine.rs:1667` and the three duplicates) for
+  witness selection. Consolidate those per §3.3 and keep them for polynomial family selection
+  only.
+
+Document the limit honestly: with the default seed of 0 the **default configuration is fully
+deterministic and therefore targetable** by an adversary who chooses `N`. That is an acceptable,
+documented tradeoff — but the docs must state plainly that in the default configuration the
+strength comes from Baillie-PSW (§1.5), not from witness randomization, and must state what
+setting a seed does and does not buy.
+
+Fix the existing bug in the same code while you are there: `WitnessPolicy::Seeded` computes its
+witness as `Natural::from_u64(2 + rng)` reduced mod `n`, which **can be 0**;
+`src/primality.rs:59-60` then `continue`s, silently consuming a round, so a caller asking for 16
+rounds can get fewer. Bases must be drawn uniformly from `[2, n-2]` — use `(rng mod (n-3)) + 2`.
+This path is also completely untested today (§4.3).
+
+**Sequencing: §1.5 does not depend on this subsection.** Do not let the seed API design block
+shipping Baillie-PSW.
+
+**Acceptance:** `WitnessPolicy::Seeded` produces a base in `[2, n-2]` on every round with no
+silent skips, has tests, and the same seed reproduces the same base sequence on both a native
+target and `wasm32-unknown-unknown`.
+
 ---
 
 ## Phase 4 — Tests, CI, and documentation truthfulness
@@ -875,7 +1002,7 @@ suite against `num-bigint` — add/sub/mul/`widening_mul`, `div_rem`, `div_rem_u
   suite is 128 bits (`tests/factorization.rs:73-75`, `src/engine.rs:1799-1801,1812-1813,1826-1828`
   — all the same two 64-bit primes). Add one 192-bit and one 256-bit balanced semiprime with
   known factors, `#[ignore]`d if runtime demands, and run them in CI on a schedule.
-- The 65–90 bit sweep and the 200-entry corpus test from Phase 1.1.
+- The 65–90 bit sweep and the corpus test from Phase 1.1.
 - `n = p²` for a 100+ bit `p` (exercises `perfect_power` → `factor_node` recursion,
   `src/engine.rs:530-537`).
 - `n = p·q·r` with three large primes — the recursive split at `src/engine.rs:543-544` is
@@ -890,13 +1017,17 @@ suite against `num-bigint` — add/sub/mul/`widening_mul`, `div_rem`, `div_rem_u
 - `WitnessPolicy::Seeded` (`src/primality.rs:52-55`) is **never tested**. Its witness is
   `Natural::from_u64(2 + rng)` reduced mod n; if that is 0 it `continue`s (`:59-60`), silently
   consuming a round without testing anything — so a caller asking for 16 rounds can get
-  fewer, undocumented. Fix and test.
+  fewer, undocumented. Fix and test, per §3.8.
 - Carmichael coverage is `[561, 1105]` (`src/primality.rs:112`), both under 2^11. Add 41041,
   62745, 162401, 825265, and strong pseudoprimes to base 2 (2047, 3277, 4033), plus a large
-  Carmichael. The 16 default rounds use `SMALL[round % 32]`, bases 2..53 — that is
-  **deterministic, not probabilistic**, so a strong pseudoprime to all of bases 2..53 is a
-  guaranteed false positive. Either find one and test the behaviour, or document the bound
-  within which the test is exact.
+  Carmichael. These are tests of the **Baillie-PSW path** from §1.5, and every one of them must
+  reject. They are what the 16 default rounds cannot be trusted to do on their own: those rounds
+  use `SMALL[round % 32]`, bases 2..53 — **deterministic, not probabilistic** — so a strong
+  pseudoprime to all of bases 2..53 is a guaranteed false positive.
+- **A test that the strong Lucas step is actually reached**, per §1.5's acceptance criterion — a
+  counter or a test hook, asserted non-zero. No known input distinguishes a correct Lucas
+  implementation from one that never runs, so without this every other primality test above
+  passes on a dead Lucas step.
 
 **Fuzzing — none exists (no `fuzz/`, no `arbitrary` dependency):**
 
