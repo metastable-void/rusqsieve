@@ -1,8 +1,9 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(
     not(all(target_arch = "wasm32", target_os = "unknown")),
-    forbid(unsafe_code)
+    deny(unsafe_code)
 )]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod f2;
 pub mod natural;
@@ -18,6 +19,12 @@ pub mod engine;
 
 #[cfg(any(unix, windows))]
 mod native;
+
+// Raw pointers are confined to the native C ABI boundary. The rest of the
+// native crate remains under `deny(unsafe_code)`.
+#[cfg(any(unix, windows))]
+#[allow(unsafe_code)]
+mod capi;
 
 #[cfg(any(unix, windows))]
 mod smallfactor;

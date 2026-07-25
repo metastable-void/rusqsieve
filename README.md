@@ -42,6 +42,47 @@ Custom schedulers, including Web Workers, can use `engine::prepare`,
 The portable job kernel never creates threads; the native blocking API schedules
 the same deterministic polynomial-family work across persistent workers.
 
+### C API
+
+Native Unix and Windows builds export a minimal owning C interface from the
+`cdylib` and `staticlib`. The ABI uses standard C `size_t` for Rust `usize` and
+NUL-terminated decimal strings for all integers.
+
+`make` builds the optimized native library and `qs-factor` CLI. Installation
+defaults to `/usr/local`:
+
+```sh
+sudo make install
+# Packaging/staging example:
+make install PREFIX=/usr DESTDIR="$pkgdir"
+```
+
+`BINDIR`, `LIBDIR`, `INCLUDEDIR`, and `PKGCONFIGDIR` are independently
+overridable. Installation includes the shared and static C libraries,
+`rusqsieve.h`, the CLI, and `rusqsieve.pc`.
+
+```c
+#include "rusqsieve.h"
+
+rusqsieve_factors *factors = rusqsieve_factors_new();
+if (factors == NULL)
+    return 1;
+
+int status = rusqsieve_factor("360", 0, factors);
+if (status == RUSQSIEVE_OK) {
+    for (size_t i = 0; i < rusqsieve_factors_len(factors); ++i)
+        puts(rusqsieve_factors_get(factors, i)); /* 2, 2, 2, 3, 3, 5 */
+}
+
+rusqsieve_factors_free(factors);
+```
+
+`threads == 0` selects available parallelism capped at 48. The opaque output
+owns sorted decimal prime factors, repeated according to multiplicity and
+borrowed through `rusqsieve_factors_get`. C callers must release the complete
+result with `rusqsieve_factors_free`; individual strings must not be freed. See
+[`rusqsieve.h`](rusqsieve.h) for the full lifetime and error contract.
+
 ## Why it is fast in browsers
 
 - Numerically target-fitted SIQS polynomials and a double-large-prime relation

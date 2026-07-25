@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: rusqsieve
+Description: Native integer factorization library with a decimal-string C ABI
+Version: @VERSION@
+Libs: -L${libdir} -lrusqsieve
+Libs.private: -ldl -lpthread -lm
+Cflags: -I${includedir}
