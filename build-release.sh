@@ -62,6 +62,13 @@ Environment:
   SDKROOT           Required for aarch64-apple-darwin.
   OUT_DIR           Archive output directory (default: repository root).
   CARGO_TARGET_DIR  Cargo build directory (default: ./target).
+  XWIN_CACHE_DIR    xwin SDK cache (default: under CARGO_TARGET_DIR).
+  CARGO_ZIGBUILD_CACHE_DIR
+                    cargo-zigbuild cache (default: under CARGO_TARGET_DIR).
+  ZIG_GLOBAL_CACHE_DIR
+                    Zig global cache (default: under CARGO_TARGET_DIR).
+  ZIG_LOCAL_CACHE_DIR
+                    Zig local cache (default: under CARGO_TARGET_DIR).
   SOURCE_DATE_EPOCH Timestamp used for reproducible archives.
 EOF
 }
@@ -148,6 +155,7 @@ add_common_files() {
     copy_file 0644 "$SCRIPT_DIR/LICENSE-APACHE" "$package_dir/LICENSE-APACHE"
     copy_file 0644 "$SCRIPT_DIR/LICENSE-MPL" "$package_dir/LICENSE-MPL"
     copy_file 0644 "$SCRIPT_DIR/README.md" "$package_dir/README.md"
+    copy_file 0644 "$SCRIPT_DIR/CHANGELOG.md" "$package_dir/CHANGELOG.md"
 }
 
 add_posix_installer() {
@@ -243,6 +251,7 @@ package_wasm() {
     copy_file 0644 "$SCRIPT_DIR/LICENSE-APACHE" "$package_dir/LICENSE-APACHE"
     copy_file 0644 "$SCRIPT_DIR/LICENSE-MPL" "$package_dir/LICENSE-MPL"
     copy_file 0644 "$SCRIPT_DIR/README.md" "$package_dir/README.md"
+    copy_file 0644 "$SCRIPT_DIR/CHANGELOG.md" "$package_dir/CHANGELOG.md"
     create_archive "$package_dir"
 }
 
@@ -265,6 +274,8 @@ build_target() {
             package_posix "$target" so no
             ;;
         x86_64-pc-windows-msvc)
+            XWIN_CACHE_DIR="${XWIN_CACHE_DIR:-$BUILD_DIR/xwin-cache}"
+            export XWIN_CACHE_DIR
             run_with_rustflags "-C target-feature=+crt-static" \
                 cargo xwin build \
                     --locked \
@@ -274,6 +285,10 @@ build_target() {
             package_windows
             ;;
         aarch64-apple-darwin)
+            CARGO_ZIGBUILD_CACHE_DIR="${CARGO_ZIGBUILD_CACHE_DIR:-$BUILD_DIR/cargo-zigbuild-cache}"
+            ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$BUILD_DIR/zig-global-cache}"
+            ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$BUILD_DIR/zig-local-cache}"
+            export CARGO_ZIGBUILD_CACHE_DIR ZIG_GLOBAL_CACHE_DIR ZIG_LOCAL_CACHE_DIR
             run_with_rustflags "" \
                 cargo zigbuild --locked --release --target "$target" --target-dir "$BUILD_DIR"
             package_posix "$target" dylib yes
@@ -347,7 +362,14 @@ for target in $TARGETS; do
                 die "SDKROOT must name an Apple SDK when building aarch64-apple-darwin"
             case "$SDKROOT" in
                 /*) ;;
-                *) die "SDKROOT must be an absolute path: $SDKROOT" ;;
+                *)
+                    sdkroot_input=$SDKROOT
+                    SDKROOT=$(
+                        CDPATH='' cd -P "$SDKROOT" 2>/dev/null
+                        pwd
+                    ) || die "SDKROOT is not a directory: $sdkroot_input"
+                    export SDKROOT
+                    ;;
             esac
             [ -d "$SDKROOT" ] || die "SDKROOT is not a directory: $SDKROOT"
             ;;

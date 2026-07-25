@@ -8,8 +8,16 @@ use core::str::FromStr;
 /// A decimal parsing failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseNaturalError {
+    /// The input contained no digits.
     Empty,
-    InvalidDigit { index: usize, byte: u8 },
+    /// The input contained a byte outside `0` through `9`.
+    InvalidDigit {
+        /// Zero-based byte offset of the invalid byte.
+        index: usize,
+        /// Invalid byte value.
+        byte: u8,
+    },
+    /// The value exceeded the selected fixed capacity.
     Overflow,
 }
 
@@ -39,7 +47,9 @@ impl std::error::Error for CapacityError {}
 /// A serialization destination was too small.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferTooSmall {
+    /// Minimum number of bytes needed.
     pub required: usize,
+    /// Number of bytes supplied by the caller.
     pub available: usize,
 }
 impl fmt::Display for BufferTooSmall {
@@ -64,7 +74,11 @@ pub const PARTS: usize = 16;
 #[cfg(feature = "limit-to-512-bits")]
 pub const PARTS: usize = 8;
 
-/// A fixed-capacity unsigned integer with little-endian 64-bit limbs.
+/// A fixed-capacity unsigned integer.
+///
+/// `PARTS_64` is the number of 64-bit limbs. Storage is inline and never
+/// allocated. Arithmetic operators wrap modulo `2^(64 * PARTS_64)`; use the
+/// `checked_*` methods when overflow must be rejected.
 #[repr(transparent)]
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct Natural<const PARTS_64: usize = PARTS> {
@@ -72,13 +86,20 @@ pub struct Natural<const PARTS_64: usize = PARTS> {
 }
 
 impl<const P: usize> Natural<P> {
+    /// Capacity in bits.
     pub const BITS: usize = P * 64;
+    /// The additive identity.
     pub const ZERO: Self = Self { parts: [0; P] };
+    /// The multiplicative identity.
     pub const ONE: Self = Self::from_u64(1);
+    /// Largest representable value.
     pub const MAX: Self = Self {
         parts: [u64::MAX; P],
     };
 
+    /// Constructs a value from a machine integer.
+    ///
+    /// For the degenerate `Natural<0>`, every input maps to zero.
     pub const fn from_u64(value: u64) -> Self {
         let mut parts = [0; P];
         if P != 0 {
@@ -86,7 +107,7 @@ impl<const P: usize> Natural<P> {
         }
         Self { parts }
     }
-    pub const fn as_parts(&self) -> &[u64; P] {
+    pub(crate) const fn as_parts(&self) -> &[u64; P] {
         &self.parts
     }
     /// The value as a `u64` if it fits (all limbs above the lowest are zero).
@@ -94,29 +115,37 @@ impl<const P: usize> Natural<P> {
         if P == 0 {
             return Some(0);
         }
-        self.parts[1..].iter().all(|&x| x == 0).then_some(self.parts[0])
+        self.parts[1..]
+            .iter()
+            .all(|&x| x == 0)
+            .then_some(self.parts[0])
     }
-    pub fn as_mut_parts(&mut self) -> &mut [u64; P] {
+    pub(crate) fn as_mut_parts(&mut self) -> &mut [u64; P] {
         &mut self.parts
     }
+    /// Returns whether the value is zero.
     pub fn is_zero(&self) -> bool {
         self.parts.iter().all(|&x| x == 0)
     }
+    /// Returns whether the value is one.
     pub fn is_one(&self) -> bool {
         P != 0 && self.parts[0] == 1 && self.parts[1..].iter().all(|&x| x == 0)
     }
+    /// Returns whether the value is even.
     pub fn is_even(&self) -> bool {
         P == 0 || self.parts[0] & 1 == 0
     }
+    /// Returns whether the value is odd.
     pub fn is_odd(&self) -> bool {
         !self.is_even()
     }
+    /// Returns the number of significant bits, or zero for zero.
     pub fn bit_len(&self) -> usize {
         self.parts.iter().rposition(|&x| x != 0).map_or(0, |i| {
             i * 64 + (64 - self.parts[i].leading_zeros() as usize)
         })
     }
-    pub fn trailing_zeros(&self) -> usize {
+    pub(crate) fn trailing_zeros(&self) -> usize {
         self.parts
             .iter()
             .position(|&x| x != 0)
@@ -124,10 +153,14 @@ impl<const P: usize> Natural<P> {
                 i * 64 + self.parts[i].trailing_zeros() as usize
             })
     }
+    /// Tests a bit, returning `false` when `index` is outside the capacity.
     pub fn bit(&self, index: usize) -> bool {
         index < Self::BITS && (self.parts[index / 64] >> (index % 64)) & 1 != 0
     }
 
+    /// Parses unsigned ASCII decimal digits.
+    ///
+    /// Leading zeroes are accepted. Signs and separators are rejected.
     pub const fn from_decimal(value: &str) -> Result<Self, ParseNaturalError> {
         let bytes = value.as_bytes();
         if bytes.is_empty() {
@@ -156,6 +189,9 @@ impl<const P: usize> Natural<P> {
         Ok(out)
     }
 
+    /// Decodes an unsigned big-endian byte string.
+    ///
+    /// Excess leading zero bytes are accepted.
     pub fn from_be_bytes(bytes: &[u8]) -> Result<Self, CapacityError> {
         if bytes.len() > P * 8 && bytes[..bytes.len() - P * 8].iter().any(|&x| x != 0) {
             return Err(CapacityError);
@@ -166,6 +202,9 @@ impl<const P: usize> Natural<P> {
         }
         Ok(out)
     }
+    /// Decodes an unsigned little-endian byte string.
+    ///
+    /// Excess trailing zero bytes are accepted.
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, CapacityError> {
         if bytes.len() > P * 8 && bytes[P * 8..].iter().any(|&x| x != 0) {
             return Err(CapacityError);
@@ -179,6 +218,9 @@ impl<const P: usize> Natural<P> {
     fn byte_len(&self) -> usize {
         self.bit_len().div_ceil(8)
     }
+    /// Writes the shortest unsigned big-endian encoding.
+    ///
+    /// Returns the number of bytes written. Zero has an empty encoding.
     pub fn write_be_bytes(&self, out: &mut [u8]) -> Result<usize, BufferTooSmall> {
         let n = self.byte_len();
         if out.len() < n {
@@ -193,6 +235,9 @@ impl<const P: usize> Natural<P> {
         }
         Ok(n)
     }
+    /// Writes the shortest unsigned little-endian encoding.
+    ///
+    /// Returns the number of bytes written. Zero has an empty encoding.
     pub fn write_le_bytes(&self, out: &mut [u8]) -> Result<usize, BufferTooSmall> {
         let n = self.byte_len();
         if out.len() < n {
@@ -207,7 +252,7 @@ impl<const P: usize> Natural<P> {
         Ok(n)
     }
 
-    pub fn overflowing_add(&self, rhs: &Self) -> (Self, bool) {
+    pub(crate) fn overflowing_add(&self, rhs: &Self) -> (Self, bool) {
         let mut out = Self::ZERO;
         let mut carry = 0u128;
         for i in 0..P {
@@ -217,7 +262,7 @@ impl<const P: usize> Natural<P> {
         }
         (out, carry != 0)
     }
-    pub fn overflowing_sub(&self, rhs: &Self) -> (Self, bool) {
+    pub(crate) fn overflowing_sub(&self, rhs: &Self) -> (Self, bool) {
         let mut out = Self::ZERO;
         let mut borrow = false;
         for i in 0..P {
@@ -228,7 +273,7 @@ impl<const P: usize> Natural<P> {
         }
         (out, borrow)
     }
-    pub fn widening_mul(&self, rhs: &Self) -> WideNatural<P> {
+    pub(crate) fn widening_mul(&self, rhs: &Self) -> WideNatural<P> {
         let mut low = [0u64; P];
         let mut high = [0u64; P];
         // Only iterate over significant limbs so arithmetic cost scales with the
@@ -267,34 +312,40 @@ impl<const P: usize> Natural<P> {
         }
         WideNatural { low, high }
     }
-    pub fn widening_square(&self) -> WideNatural<P> {
+    pub(crate) fn widening_square(&self) -> WideNatural<P> {
         self.widening_mul(self)
     }
-    pub fn overflowing_mul(&self, rhs: &Self) -> (Self, bool) {
+    pub(crate) fn overflowing_mul(&self, rhs: &Self) -> (Self, bool) {
         self.widening_mul(rhs).overflowing_narrow()
     }
+    /// Adds two values, returning `None` on capacity overflow.
     pub fn checked_add(&self, rhs: &Self) -> Option<Self> {
         let (v, o) = self.overflowing_add(rhs);
         (!o).then_some(v)
     }
+    /// Subtracts `rhs`, returning `None` when the result would be negative.
     pub fn checked_sub(&self, rhs: &Self) -> Option<Self> {
         let (v, o) = self.overflowing_sub(rhs);
         (!o).then_some(v)
     }
+    /// Multiplies two values, returning `None` on capacity overflow.
     pub fn checked_mul(&self, rhs: &Self) -> Option<Self> {
         let (v, o) = self.overflowing_mul(rhs);
         (!o).then_some(v)
     }
-    pub fn wrapping_add(&self, rhs: &Self) -> Self {
+    pub(crate) fn wrapping_add(&self, rhs: &Self) -> Self {
         self.overflowing_add(rhs).0
     }
-    pub fn wrapping_sub(&self, rhs: &Self) -> Self {
+    pub(crate) fn wrapping_sub(&self, rhs: &Self) -> Self {
         self.overflowing_sub(rhs).0
     }
-    pub fn wrapping_mul(&self, rhs: &Self) -> Self {
+    pub(crate) fn wrapping_mul(&self, rhs: &Self) -> Self {
         self.overflowing_mul(rhs).0
     }
 
+    /// Divides by `divisor`, returning the quotient and remainder.
+    ///
+    /// Returns `None` when `divisor` is zero.
     pub fn div_rem(&self, divisor: &Self) -> Option<(Self, Self)> {
         let dtop = divisor.parts.iter().rposition(|&x| x != 0)?;
         // Single-limb divisor: use the dedicated fast path.
@@ -316,7 +367,7 @@ impl<const P: usize> Natural<P> {
     /// Remainder modulo a single limb, computed without materializing the quotient. Much cheaper
     /// than `div_rem_u64().1` in tight trial-division loops, where most divisibility tests fail
     /// and the quotient would be discarded. Returns `0` for a zero divisor (caller must guard).
-    pub fn rem_u64(&self, divisor: u64) -> u64 {
+    pub(crate) fn rem_u64(&self, divisor: u64) -> u64 {
         if divisor == 0 {
             return 0;
         }
@@ -343,7 +394,7 @@ impl<const P: usize> Natural<P> {
         }
         r as u64
     }
-    pub fn div_rem_u64(&self, divisor: u64) -> Option<(Self, u64)> {
+    pub(crate) fn div_rem_u64(&self, divisor: u64) -> Option<(Self, u64)> {
         if divisor == 0 {
             return None;
         }
@@ -403,11 +454,11 @@ impl<const P: usize> Natural<P> {
         }
         a << shift
     }
-    pub fn extended_gcd(&self, rhs: &Self) -> ExtendedGcdResult<P> {
+    pub(crate) fn extended_gcd(&self, rhs: &Self) -> ExtendedGcdResult<P> {
         ExtendedGcdResult { gcd: self.gcd(rhs) }
     }
 
-    pub fn sqrt_rem(&self) -> (Self, Self) {
+    pub(crate) fn sqrt_rem(&self) -> (Self, Self) {
         if self.is_zero() {
             return (Self::ZERO, Self::ZERO);
         }
@@ -426,10 +477,10 @@ impl<const P: usize> Natural<P> {
             x = next;
         }
     }
-    pub fn floor_sqrt(&self) -> Self {
+    pub(crate) fn floor_sqrt(&self) -> Self {
         self.sqrt_rem().0
     }
-    pub fn ceil_sqrt(&self) -> Self {
+    pub(crate) fn ceil_sqrt(&self) -> Self {
         let (s, r) = self.sqrt_rem();
         if r.is_zero() {
             s
@@ -437,10 +488,10 @@ impl<const P: usize> Natural<P> {
             s.checked_add(&Self::ONE).unwrap()
         }
     }
-    pub fn is_square(&self) -> bool {
+    pub(crate) fn is_square(&self) -> bool {
         self.sqrt_rem().1.is_zero()
     }
-    pub fn checked_pow_u32(&self, mut exponent: u32) -> Option<Self> {
+    pub(crate) fn checked_pow_u32(&self, mut exponent: u32) -> Option<Self> {
         let mut a = self.clone();
         let mut out = Self::ONE;
         while exponent != 0 {
@@ -454,7 +505,7 @@ impl<const P: usize> Natural<P> {
         }
         Some(out)
     }
-    pub fn perfect_power(&self) -> Option<(Self, u32)> {
+    pub(crate) fn perfect_power(&self) -> Option<(Self, u32)> {
         if self < &Self::from_u64(4) {
             return None;
         }
@@ -592,9 +643,7 @@ fn knuth_divmod(num: &[u64], den: &[u64]) -> (Vec<u64>, Vec<u64>) {
         let top = ((un[j + n] as u128) << 64) | un[j + n - 1] as u128;
         let mut qhat = top / vn[n - 1] as u128;
         let mut rhat = top - qhat * vn[n - 1] as u128;
-        while qhat >= base
-            || qhat * vn[n - 2] as u128 > (rhat << 64) | un[j + n - 2] as u128
-        {
+        while qhat >= base || qhat * vn[n - 2] as u128 > (rhat << 64) | un[j + n - 2] as u128 {
             qhat -= 1;
             rhat += vn[n - 1] as u128;
             if rhat >= base {

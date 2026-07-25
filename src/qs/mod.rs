@@ -341,10 +341,16 @@ pub mod parameters {
         // Tuning overrides (experimentation only; unset in production builds).
         #[cfg(any(unix, windows))]
         {
-            if let Some(v) = std::env::var("RUSQSIEVE_FB_BOUND").ok().and_then(|s| s.parse().ok()) {
+            if let Some(v) = std::env::var("RUSQSIEVE_FB_BOUND")
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
                 factor_base_bound = v;
             }
-            if let Some(v) = std::env::var("RUSQSIEVE_HALFW").ok().and_then(|s| s.parse().ok()) {
+            if let Some(v) = std::env::var("RUSQSIEVE_HALFW")
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
                 sieve_half_width = v;
             }
         }

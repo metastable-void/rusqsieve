@@ -1,21 +1,32 @@
 #![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
 #![cfg_attr(
     not(all(target_arch = "wasm32", target_os = "unknown")),
     deny(unsafe_code)
 )]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-pub mod f2;
-pub mod natural;
-pub mod progress;
-pub mod qs;
+// Internal kernels are intentionally compiled in different combinations by
+// native, Wasm coordinator, Wasm worker, and reference-engine builds.
+#[allow(dead_code)]
+mod f2;
+#[allow(dead_code)]
+mod natural;
+#[allow(dead_code)]
+mod progress;
+#[allow(dead_code)]
+mod qs;
 
+#[allow(dead_code)]
 mod factor;
 mod factors;
+#[allow(dead_code)]
 mod primality;
+#[allow(dead_code)]
 mod work;
 
-pub mod engine;
+#[allow(dead_code)]
+mod engine;
 
 #[cfg(any(unix, windows))]
 mod native;
@@ -32,38 +43,29 @@ mod smallfactor;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod wasm;
 
-pub use factor::{
-    AdvanceOutcome, FactorConfig, FactorError, FactorLimits, FactorSession, LocalWorkBudget,
-    Parallelism, ProgressAction, ResourceLimitKind, SessionPhase, SmallFactorMethod, SubmitOutcome,
-};
+pub use factor::{FactorConfig, FactorError, Parallelism, ProgressAction, ResourceLimitKind};
 pub use factors::PrimeFactors;
-pub use natural::{
-    BufferTooSmall, CapacityError, ExtendedGcdResult, Montgomery, MontgomeryError, Natural, PARTS,
-    ParseNaturalError, WideNatural, jacobi_u64, legendre_u32, tonelli_shanks_u32,
-};
-pub use primality::{PrimalityConfig, WitnessPolicy, is_probable_prime};
-pub use progress::*;
+pub use natural::{BufferTooSmall, CapacityError, Natural, ParseNaturalError};
+pub use progress::{ProgressAmount, ProgressPhase, ProgressSnapshot, ProgressTotal, ProgressUnit};
+
+pub(crate) use factor::{AdvanceOutcome, FactorSession, LocalWorkBudget};
+pub(crate) use natural::{PARTS, jacobi_u64, legendre_u32, tonelli_shanks_u32};
+pub(crate) use primality::{PrimalityConfig, is_probable_prime};
 
 #[cfg(any(unix, windows))]
 pub use native::{factor, factor_with, factor_with_progress};
 
-/// Stable low-level interfaces for custom native or WebAssembly schedulers.
-pub mod low_level {
-    pub use crate::engine::{
-        EngineContext, EngineJob, EngineJobResult, EngineSession, execute as execute_engine_job,
-        prepare as prepare_engine,
-    };
-    pub use crate::f2::{BlockLanczos, DependencySet, MatrixOperation, SparseBinaryMatrix};
-    pub use crate::qs::{
-        FactorBase, RawRelation, SieveContext, SieveScratch, prepare_siqs, sieve_job,
-    };
-    pub use crate::work::{
-        JobHeader, KernelContexts, MatrixMultiplyJob, MatrixMultiplyResult, SieveJob, SieveResult,
-        WorkJob, WorkResult, WorkerScratch, execute_job,
-    };
-}
-
-/// Construct a fixed-capacity integer from a decimal literal at compile time.
+/// Constructs a fixed-capacity integer from a decimal literal at compile time.
+///
+/// The second argument is the number of 64-bit limbs. Invalid decimal text or
+/// a value wider than the requested capacity causes a compile-time error.
+///
+/// ```
+/// use rusqsieve::{Natural, natural};
+///
+/// const N: Natural<2> = natural!("340282366920938463463374607431768211455", 2);
+/// assert_eq!(N, Natural::<2>::MAX);
+/// ```
 #[macro_export]
 macro_rules! natural {
     ($value:literal, $parts:literal) => {{

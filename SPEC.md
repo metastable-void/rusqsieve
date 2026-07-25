@@ -253,78 +253,33 @@ compile_error!("the qs-factor CLI is unavailable on wasm32 targets");
 
 ## 5. Public crate API
 
-Recommended root exports:
+As of 0.2, the supported Rust API is intentionally narrow:
 
 ```rust
-pub mod f2;
-pub mod low_level;
-pub mod natural;
-pub mod progress;
-pub mod qs;
-
-mod factor;
-mod factors;
-mod primality;
-mod work;
-mod arch;
-
-#[cfg(any(unix, windows))]
-mod native;
-
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-mod wasm;
-
 pub use factor::{
     FactorConfig,
     FactorError,
-    FactorLimits,
-    FactorSession,
     Parallelism,
     ProgressAction,
+    ResourceLimitKind,
 };
-
 pub use factors::PrimeFactors;
-pub use natural::{Natural, ParseNaturalError, WideNatural};
-pub use progress::*;
-
+pub use natural::{BufferTooSmall, CapacityError, Natural, ParseNaturalError};
+pub use progress::{
+    ProgressAmount,
+    ProgressPhase,
+    ProgressSnapshot,
+    ProgressTotal,
+    ProgressUnit,
+};
 #[cfg(any(unix, windows))]
 pub use native::{factor, factor_with, factor_with_progress};
 ```
 
-The `low_level` module should re-export stable work-unit and kernel APIs intended for custom schedulers:
-
-```rust
-pub mod low_level {
-    pub use crate::f2::{
-        BlockLanczos,
-        DependencySet,
-        MatrixOperation,
-        SparseBinaryMatrix,
-    };
-
-    pub use crate::qs::{
-        prepare_siqs,
-        sieve_job,
-        FactorBase,
-        RawRelation,
-        SieveContext,
-        SieveScratch,
-    };
-
-    pub use crate::work::{
-        execute_job,
-        JobHeader,
-        KernelContexts,
-        MatrixMultiplyJob,
-        MatrixMultiplyResult,
-        SieveJob,
-        SieveResult,
-        WorkJob,
-        WorkResult,
-        WorkerScratch,
-    };
-}
-```
+SIQS relations, factor bases, sparse matrices, work packets, engine sessions,
+and primality policy are crate-private. The WebAssembly C ABI uses those types
+only behind validated integer handles and serialized packets. They are not
+Rust layout or semantic compatibility commitments.
 
 ---
 
@@ -718,53 +673,31 @@ The API should consume `Natural` to avoid an unnecessary initial clone.
 ```rust
 #[derive(Clone, Debug)]
 pub struct FactorConfig {
-    pub parallelism: Parallelism,
-    pub primality: PrimalityConfig,
-    pub trial_division_limit: u32,
-    pub small_factor_method: SmallFactorMethod,
-    pub qs: QsConfig,
-    pub limits: FactorLimits,
-    pub seed: [u8; 32],
-    pub progress_reporting: ProgressReportingConfig,
+    // private
 }
-```
 
-```rust
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Parallelism {
     Auto,
-    Exact(NonZero<usize>),
+    Threads(NonZeroUsize),
 }
 ```
 
-```rust
-#[derive(Clone, Debug)]
-pub enum SmallFactorMethod {
-    None,
-    PollardRho {
-        attempts: u32,
-        iteration_limit: u64,
-    },
-}
-```
+`FactorConfig` exposes `parallelism`, `with_parallelism`,
+`progress_interval`, and `with_progress_interval`. `Parallelism::threads`
+constructs the nonzero explicit-count variant. Algorithm selection, primality
+rounds, random seeds, SIQS parameters, and memory structures remain private so
+the optimized implementation can evolve without expanding the stable API.
 
 `Parallelism::Auto` resolves using `std::thread::available_parallelism()` on native targets.
 
 ### 9.3 Resource limits
 
-```rust
-#[derive(Clone, Debug)]
-pub struct FactorLimits {
-    pub max_relations: Option<usize>,
-    pub max_partial_relations: Option<usize>,
-    pub max_matrix_nonzeros: Option<usize>,
-    pub max_memory_bytes: Option<usize>,
-    pub max_polynomial_batches: Option<u64>,
-    pub max_pollard_rho_iterations: Option<u64>,
-}
-```
-
-Native-only drivers may additionally enforce wall-clock cancellation, but portable kernels must not depend on clocks.
+Resource budgets are implementation policy in 0.2. Exceeded limits are
+reported through the non-exhaustive `FactorError::ResourceLimit` and
+`ResourceLimitKind` types, but callers cannot create inconsistent combinations
+of partial internal limits. Cancellation is cooperatively requested by
+returning `ProgressAction::Cancel` from the progress callback.
 
 ### 9.4 Recursive pipeline
 
@@ -798,17 +731,19 @@ Returned factors must be sorted by `Natural` order through `BTreeMap`.
 
 ---
 
-## 10. Factorization session and scheduler-independent coordination
+## 10. Internal factorization session and scheduler coordination
+
+This section describes crate-private machinery, not supported Rust API.
 
 ### 10.1 Session type
 
 ```rust
-pub struct FactorSession<const P: usize = 16> {
+pub(crate) struct FactorSession<const P: usize = 16> {
     // private coordinator state
 }
 ```
 
-Required API:
+Internal API:
 
 ```rust
 impl<const P: usize> FactorSession<P> {

@@ -1,6 +1,6 @@
 [package]
 name = "rusqsieve"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "The frontier of pure-Rust Quadratic Sieve integer factorization, portable to WASM (wasm32-unknown-unknown)."
 license = "Apache-2.0 OR MPL-2.0"

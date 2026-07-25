@@ -1,41 +1,93 @@
 //! Recursive factorization policy and portable session state.
-use crate::f2::LinearAlgebraError;
 use crate::progress::*;
 use crate::qs::{QsConfig, prepare_siqs};
 use crate::work::{WorkJob, WorkResult};
 use crate::{Natural, PrimalityConfig, PrimeFactors, is_probable_prime};
 use core::fmt;
-use core::num::NonZero;
+use core::num::NonZeroUsize;
+use core::time::Duration;
 
-#[derive(Clone, Copy, Debug)]
+/// Selects the worker count used by native blocking factorization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Parallelism {
+    /// Detect available parallelism when factorization starts.
     Auto,
-    Exact(NonZero<usize>),
+    /// Use exactly this many worker threads.
+    Threads(NonZeroUsize),
 }
+
+impl Parallelism {
+    /// Constructs an explicit worker count, returning `None` for zero.
+    pub const fn threads(count: usize) -> Option<Self> {
+        match NonZeroUsize::new(count) {
+            Some(count) => Some(Self::Threads(count)),
+            None => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-pub enum SmallFactorMethod {
+pub(crate) enum SmallFactorMethod {
     None,
     PollardRho { attempts: u32, iteration_limit: u64 },
 }
 #[derive(Clone, Debug, Default)]
-pub struct FactorLimits {
-    pub max_relations: Option<usize>,
-    pub max_partial_relations: Option<usize>,
-    pub max_matrix_nonzeros: Option<usize>,
-    pub max_memory_bytes: Option<usize>,
-    pub max_polynomial_batches: Option<u64>,
-    pub max_pollard_rho_iterations: Option<u64>,
+pub(crate) struct FactorLimits {
+    pub(crate) max_relations: Option<usize>,
+    pub(crate) max_partial_relations: Option<usize>,
+    pub(crate) max_matrix_nonzeros: Option<usize>,
+    pub(crate) max_memory_bytes: Option<usize>,
+    pub(crate) max_polynomial_batches: Option<u64>,
+    pub(crate) max_pollard_rho_iterations: Option<u64>,
 }
+
+/// Configuration for native blocking factorization.
+///
+/// Algorithm tuning is intentionally encapsulated so releases can improve
+/// SIQS parameters without making implementation details part of the stable
+/// API.
+///
+/// The default uses [`Parallelism::Auto`] and reports progress at most every
+/// 100 milliseconds within a phase.
 #[derive(Clone, Debug)]
 pub struct FactorConfig {
-    pub parallelism: Parallelism,
-    pub primality: PrimalityConfig,
-    pub trial_division_limit: u32,
-    pub small_factor_method: SmallFactorMethod,
-    pub qs: QsConfig,
-    pub limits: FactorLimits,
-    pub seed: [u8; 32],
-    pub progress_reporting: ProgressReportingConfig,
+    pub(crate) parallelism: Parallelism,
+    pub(crate) primality: PrimalityConfig,
+    pub(crate) trial_division_limit: u32,
+    pub(crate) small_factor_method: SmallFactorMethod,
+    pub(crate) qs: QsConfig,
+    pub(crate) limits: FactorLimits,
+    pub(crate) seed: [u8; 32],
+    pub(crate) progress_reporting: ProgressReportingConfig,
+}
+
+impl FactorConfig {
+    /// Returns the configured parallelism policy.
+    pub const fn parallelism(&self) -> Parallelism {
+        self.parallelism
+    }
+
+    /// Sets the parallelism policy.
+    #[must_use]
+    pub fn with_parallelism(mut self, parallelism: Parallelism) -> Self {
+        self.parallelism = parallelism;
+        self
+    }
+
+    /// Returns the minimum interval between progress callbacks.
+    pub const fn progress_interval(&self) -> Duration {
+        self.progress_reporting.minimum_interval
+    }
+
+    /// Sets the minimum interval between progress callbacks.
+    ///
+    /// A zero duration requests every available update and can materially slow
+    /// short factorizations.
+    #[must_use]
+    pub fn with_progress_interval(mut self, interval: Duration) -> Self {
+        self.progress_reporting.minimum_interval = interval;
+        self
+    }
 }
 impl Default for FactorConfig {
     fn default() -> Self {
@@ -54,29 +106,48 @@ impl Default for FactorConfig {
         }
     }
 }
+/// The kind of internal resource limit that was exceeded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ResourceLimitKind {
+    /// Maximum collected relations.
     Relations,
+    /// Maximum stored partial relations.
     PartialRelations,
+    /// Maximum sparse-matrix nonzero entries.
     MatrixNonzeros,
+    /// Maximum estimated memory.
     Memory,
+    /// Maximum SIQS polynomial batches.
     PolynomialBatches,
+    /// Maximum Pollard-rho iterations.
     PollardRhoIterations,
 }
-#[derive(Debug)]
+
+/// An error returned while factoring an integer.
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum FactorError {
+    /// Zero has no finite prime factorization.
     ZeroHasNoPrimeFactorization,
+    /// A value exceeded the selected [`Natural`] capacity.
     CapacityExceeded,
+    /// A configured internal resource limit was exceeded.
     ResourceLimit(ResourceLimitKind),
+    /// No nontrivial divisor was recovered.
     NoNontrivialFactor,
+    /// Sieving ended before enough usable relations were available.
     InsufficientRelations,
-    LinearAlgebra(LinearAlgebraError),
+    /// A relation failed an internal consistency check.
     InvalidRelation,
+    /// A matrix dependency failed an internal consistency check.
     InvalidDependency,
+    /// The progress callback requested cancellation.
     Cancelled,
+    /// The algorithm stopped making forward progress.
     Stalled,
-    InternalInvariant(&'static str),
+    /// An internal consistency check failed.
+    InternalFailure,
 }
 impl fmt::Display for FactorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,24 +157,26 @@ impl fmt::Display for FactorError {
             Self::ResourceLimit(k) => write!(f, "resource limit exceeded: {k:?}"),
             Self::NoNontrivialFactor => f.write_str("no nontrivial factor found"),
             Self::InsufficientRelations => f.write_str("insufficient quadratic-sieve relations"),
-            Self::LinearAlgebra(e) => write!(f, "linear algebra failed: {e}"),
             Self::InvalidRelation => f.write_str("invalid quadratic-sieve relation"),
             Self::InvalidDependency => f.write_str("invalid matrix dependency"),
             Self::Cancelled => f.write_str("factorization cancelled"),
             Self::Stalled => f.write_str("factorization stalled"),
-            Self::InternalInvariant(s) => write!(f, "internal invariant failed: {s}"),
+            Self::InternalFailure => f.write_str("internal factorization invariant failed"),
         }
     }
 }
 impl std::error::Error for FactorError {}
+/// Controls factorization from a progress callback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgressAction {
+    /// Continue factorization.
     Continue,
+    /// Stop at the next cancellation point.
     Cancel,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum SessionPhase {
+pub(crate) enum SessionPhase {
     Preprocessing,
     BuildingFactorBase,
     RelationCollection,
@@ -117,12 +190,12 @@ pub enum SessionPhase {
     Failed,
 }
 #[derive(Clone, Copy, Debug)]
-pub struct LocalWorkBudget {
-    pub factor_base_candidates: usize,
-    pub relations_to_combine: usize,
-    pub matrix_items: usize,
-    pub elimination_steps: usize,
-    pub primality_steps: usize,
+pub(crate) struct LocalWorkBudget {
+    pub(crate) factor_base_candidates: usize,
+    pub(crate) relations_to_combine: usize,
+    pub(crate) matrix_items: usize,
+    pub(crate) elimination_steps: usize,
+    pub(crate) primality_steps: usize,
 }
 impl Default for LocalWorkBudget {
     fn default() -> Self {
@@ -136,18 +209,18 @@ impl Default for LocalWorkBudget {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdvanceOutcome {
+pub(crate) enum AdvanceOutcome {
     Progressed,
     NeedsWorkers,
     Complete,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SubmitOutcome {
+pub(crate) enum SubmitOutcome {
     Accepted,
     IgnoredObsolete,
 }
 
-pub struct FactorSession<const P: usize = 16> {
+pub(crate) struct FactorSession<const P: usize = 16> {
     input: Natural<P>,
     config: FactorConfig,
     phase: SessionPhase,
@@ -157,7 +230,7 @@ pub struct FactorSession<const P: usize = 16> {
     generation: u64,
 }
 impl<const P: usize> FactorSession<P> {
-    pub fn new(input: Natural<P>, config: FactorConfig) -> Result<Self, FactorError> {
+    pub(crate) fn new(input: Natural<P>, config: FactorConfig) -> Result<Self, FactorError> {
         if input.is_zero() {
             return Err(FactorError::ZeroHasNoPrimeFactorization);
         }
@@ -172,16 +245,19 @@ impl<const P: usize> FactorSession<P> {
             generation: 0,
         })
     }
-    pub fn phase(&self) -> SessionPhase {
+    pub(crate) fn phase(&self) -> SessionPhase {
         self.phase
     }
-    pub fn progress(&self) -> &ProgressSnapshot {
+    pub(crate) fn progress(&self) -> &ProgressSnapshot {
         &self.progress
     }
-    pub fn progress_revision(&self) -> u64 {
+    pub(crate) fn progress_revision(&self) -> u64 {
         self.progress.revision
     }
-    pub fn advance_local(&mut self, _: LocalWorkBudget) -> Result<AdvanceOutcome, FactorError> {
+    pub(crate) fn advance_local(
+        &mut self,
+        _: LocalWorkBudget,
+    ) -> Result<AdvanceOutcome, FactorError> {
         if self.phase == SessionPhase::Complete {
             return Ok(AdvanceOutcome::Complete);
         }
@@ -194,16 +270,11 @@ impl<const P: usize> FactorSession<P> {
                 self.phase = SessionPhase::Complete;
                 self.progress.revision += 1;
                 self.progress.phase = ProgressPhase::Complete;
-                let factors = self.factors.as_ref().unwrap();
                 self.progress.amount = ProgressAmount {
                     completed: 1,
                     total: ProgressTotal::Exact(1),
                     unit: ProgressUnit::Tasks,
                 };
-                self.progress.detail = ProgressDetail::Complete(CompleteProgress {
-                    prime_factors: factors.len() as u64,
-                    factors_with_multiplicity: factors.iter().map(|(_, e)| e.get() as u64).sum(),
-                });
                 Ok(AdvanceOutcome::Complete)
             }
             Err(e) => {
@@ -212,10 +283,10 @@ impl<const P: usize> FactorSession<P> {
             }
         }
     }
-    pub fn take_jobs(&mut self, _: usize) -> Result<Vec<WorkJob>, FactorError> {
+    pub(crate) fn take_jobs(&mut self, _: usize) -> Result<Vec<WorkJob>, FactorError> {
         Ok(Vec::new())
     }
-    pub fn submit(&mut self, result: WorkResult<P>) -> Result<SubmitOutcome, FactorError> {
+    pub(crate) fn submit(&mut self, result: WorkResult<P>) -> Result<SubmitOutcome, FactorError> {
         let generation = match result {
             WorkResult::Sieve(r) => r.header.generation,
             WorkResult::MatrixMultiply(r) => r.header.generation,
@@ -227,10 +298,10 @@ impl<const P: usize> FactorSession<P> {
             SubmitOutcome::IgnoredObsolete
         })
     }
-    pub fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         matches!(self.phase, SessionPhase::Complete | SessionPhase::Failed)
     }
-    pub fn take_factors(self) -> Result<PrimeFactors<P>, FactorError> {
+    pub(crate) fn take_factors(self) -> Result<PrimeFactors<P>, FactorError> {
         self.factors
             .ok_or(self.error.unwrap_or(FactorError::Stalled))
     }
@@ -310,10 +381,7 @@ fn factor_node<const P: usize>(
     if factor.is_one() || factor == n {
         return Err(FactorError::NoNontrivialFactor);
     }
-    let other = n
-        .div_rem(&factor)
-        .ok_or(FactorError::InternalInvariant("factor division"))?
-        .0;
+    let other = n.div_rem(&factor).ok_or(FactorError::InternalFailure)?.0;
     factor_node(factor, multiplicity, cfg, out, depth + 1)?;
     factor_node(other, multiplicity, cfg, out, depth + 1)
 }
@@ -490,13 +558,16 @@ mod tests {
         let n = Natural::<2>::from_u64(1_000_003 * 1_000_033);
         let factors = factor_complete(n.clone(), &FactorConfig::default()).unwrap();
         assert!(factors.verify_product(&n));
-        assert_eq!(factors.len(), 2);
+        assert_eq!(factors.distinct_len(), 2);
     }
     #[test]
     fn prime_power_multiplicity() {
         let n = Natural::<2>::from_u64(3u64.pow(20));
         let factors = factor_complete(n.clone(), &FactorConfig::default()).unwrap();
-        assert_eq!(factors.get(&Natural::from_u64(3)).unwrap().get(), 20);
+        assert_eq!(
+            factors.multiplicity(&Natural::from_u64(3)).unwrap().get(),
+            20
+        );
         assert!(factors.verify_product(&n));
     }
     #[test]
@@ -520,6 +591,6 @@ mod tests {
         };
         let factors = factor_complete(n.clone(), &config).unwrap();
         assert!(factors.verify_product(&n));
-        assert_eq!(factors.len(), 2);
+        assert_eq!(factors.distinct_len(), 2);
     }
 }

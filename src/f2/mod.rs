@@ -223,8 +223,8 @@ impl SparseBinaryMatrix {
             dependency[free / 64] |= 1 << (free % 64);
             // A pivot row has no set bits above its pivot.  Ascending
             // substitution therefore has every right-hand-side value ready.
-            for pivot in 0..cols {
-                let Some(equation) = &basis[pivot] else {
+            for (pivot, equation) in basis.iter().enumerate() {
+                let Some(equation) = equation else {
                     continue;
                 };
                 let last = pivot / 64;

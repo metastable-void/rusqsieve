@@ -1,7 +1,9 @@
 #[cfg(target_arch = "wasm32")]
 compile_error!("the qs-factor CLI is unavailable on wasm32 targets");
 
-use rusqsieve::{Natural, engine};
+use rusqsieve::{
+    FactorConfig, Natural, Parallelism, ProgressAction, ProgressPhase, factor_with_progress,
+};
 use std::io::{self, IsTerminal, Read, Write};
 use std::time::Instant;
 
@@ -39,7 +41,7 @@ fn run() -> Result<(), String> {
     // Parse with the crate's public type first so CLI capacity and syntax stay
     // consistent with the library API. The SIQS engine has a deliberately
     // smaller practical bound than Natural's storage capacity.
-    let natural = Natural::from_decimal(input).map_err(|error| error.to_string())?;
+    let natural: Natural = Natural::from_decimal(input).map_err(|error| error.to_string())?;
     if natural.is_zero() {
         return Err("zero has no prime factorization".into());
     }
@@ -64,22 +66,38 @@ fn run() -> Result<(), String> {
             if thread_count == 1 { "" } else { "s" }
         );
     }
-    let factors = engine::factor(natural.clone(), thread_count, |snapshot| {
+    let parallelism = Parallelism::threads(thread_count)
+        .ok_or_else(|| "thread count must be nonzero".to_string())?;
+    let config = FactorConfig::default().with_parallelism(parallelism);
+    let factors = factor_with_progress(natural.clone(), config, |snapshot| {
         if show_progress {
-            match snapshot.phase {
-                engine::EnginePhase::Preprocessing => eprint!("\npreprocessing"),
-                engine::EnginePhase::BuildingFactorBase => eprint!("\nbuilding factor base"),
-                engine::EnginePhase::Sieving => eprint!(
-                    "\nsieving: {}/~{} relations, {} polynomials, {} workers",
-                    snapshot.relations, snapshot.target, snapshot.polynomials, snapshot.workers
-                ),
-                engine::EnginePhase::LinearAlgebra => {
-                    eprint!("\nlinear algebra: {} relations", snapshot.relations)
+            let amount = snapshot.amount();
+            match snapshot.phase() {
+                ProgressPhase::Preprocessing => eprint!("\npreprocessing"),
+                ProgressPhase::BuildingFactorBase => eprint!("\nbuilding factor base"),
+                ProgressPhase::Sieving => match amount.total() {
+                    rusqsieve::ProgressTotal::Exact(total)
+                    | rusqsieve::ProgressTotal::Estimated(total) => eprint!(
+                        "\nsieving: {}/~{} relations, {} workers",
+                        amount.completed(),
+                        total,
+                        thread_count
+                    ),
+                    rusqsieve::ProgressTotal::Unknown => eprint!(
+                        "\nsieving: {} relations, {} workers",
+                        amount.completed(),
+                        thread_count
+                    ),
+                },
+                ProgressPhase::LinearAlgebra => {
+                    eprint!("\nlinear algebra: {} relations", amount.completed())
                 }
-                engine::EnginePhase::Extracting => eprint!("\nextracting factors"),
+                ProgressPhase::ExtractingFactor => eprint!("\nextracting factors"),
+                _ => eprint!("\n{}", format!("{:?}", snapshot.phase()).to_lowercase()),
             }
             let _ = io::stderr().flush();
         }
+        ProgressAction::Continue
     })
     .map_err(|error| format!("factor engine failed: {error}"))?;
     if show_progress {
@@ -90,11 +108,11 @@ fn run() -> Result<(), String> {
     // before exposing machine-readable output, so incomplete results never
     // look like a successful factorization.
     let mut verified_product = Natural::ONE;
-    let mut rendered = Vec::with_capacity(factors.len());
-    for value in factors {
+    let mut rendered = Vec::with_capacity(factors.total_len());
+    for value in factors.expanded() {
         let decimal = value.to_string();
         verified_product = verified_product
-            .checked_mul(&value)
+            .checked_mul(value)
             .ok_or_else(|| "factor product exceeded input capacity".to_string())?;
         rendered.push(decimal);
     }

@@ -2,7 +2,6 @@
 
 use crate::{FactorConfig, Natural, PARTS, Parallelism, ParseNaturalError, factor_with};
 use core::ffi::{c_char, c_int};
-use core::num::NonZero;
 use core::ptr;
 use std::ffi::{CStr, CString};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -134,14 +133,12 @@ fn factor_impl(input: &[u8], threads: usize) -> Result<Option<Box<FactorAllocati
     } else {
         threads
     };
-    let config = FactorConfig {
-        parallelism: Parallelism::Exact(NonZero::new(workers).unwrap()),
-        ..FactorConfig::default()
-    };
+    let parallelism = Parallelism::threads(workers).ok_or(RUSQSIEVE_INVALID_ARGUMENT)?;
+    let config = FactorConfig::default().with_parallelism(parallelism);
     let result = factor_with(n, config).map_err(|_| RUSQSIEVE_FACTORIZATION_FAILED)?;
 
-    let mut strings = Vec::with_capacity(result.len());
-    let mut multiplicities = Vec::with_capacity(result.len());
+    let mut strings = Vec::with_capacity(result.distinct_len());
+    let mut multiplicities = Vec::with_capacity(result.distinct_len());
     for (prime, exponent) in result.iter() {
         let decimal = CString::new(prime.to_string()).map_err(|_| RUSQSIEVE_INTERNAL_ERROR)?;
         strings.push(decimal);

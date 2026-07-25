@@ -31,16 +31,27 @@ The crate is not constant-time and must not be used where operand-dependent timi
 ## Native API
 
 ```rust
-use rusqsieve::{Natural, factor};
+use rusqsieve::{FactorConfig, Natural, Parallelism, factor_with};
 
-let factors = factor(Natural::<16>::from_decimal("360").unwrap()).unwrap();
-assert!(factors.verify_product(&Natural::from_u64(360)));
+let input = Natural::<4>::from_decimal("360").unwrap();
+let config = FactorConfig::default().with_parallelism(
+    Parallelism::threads(4).expect("a nonzero worker count"),
+);
+let factors = factor_with(input.clone(), config).unwrap();
+
+assert_eq!(factors.distinct_len(), 3);
+assert_eq!(factors.total_len(), 6);
+assert!(factors.verify_product(&input));
 ```
 
-Custom schedulers, including Web Workers, can use `engine::prepare`,
-`EngineSession::take_jobs`, `engine::execute`, and `EngineSession::submit`.
-The portable job kernel never creates threads; the native blocking API schedules
-the same deterministic polynomial-family work across persistent workers.
+The 0.2 Rust API deliberately exposes only the safe blocking interface,
+configuration builders, progress snapshots, fixed-capacity input type, and
+owned factorization result. SIQS relations, matrix kernels, worker packets, and
+scheduler state are private implementation details. This keeps invalid
+relations or mismatched worker contexts from being representable through the
+supported Rust API and lets those internals evolve without breaking callers.
+All public items are covered by rustdoc, enforced during the build with the
+`missing_docs` lint.
 
 ### C API
 

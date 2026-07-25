@@ -1,16 +1,18 @@
 //! Portable SIQS engine and scheduler-facing work kernels.
-use crate::{Natural, PARTS, jacobi_u64};
 use crate::f2::SparseBinaryMatrix;
 use crate::qs::{AutoOr, FactorBaseEntry, MultiplierChoice, QsConfig, prepare_siqs};
+use crate::{Natural, PARTS, jacobi_u64};
 #[cfg(any(unix, windows))]
 use crate::{PrimalityConfig, is_probable_prime};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+#[cfg(any(unix, windows))]
 use std::sync::{Mutex, mpsc};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnginePhase {
     Preprocessing,
     BuildingFactorBase,
@@ -35,6 +37,7 @@ pub enum EngineError {
     NoFactor,
     Worker,
     InvalidDependency,
+    Cancelled,
 }
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -256,7 +259,9 @@ fn deserialize_family(b: &[u8]) -> Option<FamilyResult> {
 pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let p = crate::qs::parameters::engine_params(n.bit_len());
     let k = knuth_schroeppel(&n);
-    let sieve_n = n.checked_mul(&Natural::from_u64(k)).unwrap_or_else(|| n.clone());
+    let sieve_n = n
+        .checked_mul(&Natural::from_u64(k))
+        .unwrap_or_else(|| n.clone());
     let qcfg = QsConfig {
         factor_base_bound: AutoOr::Value(p.factor_base_bound),
         multiplier: MultiplierChoice::Value(k as u32),
@@ -265,10 +270,7 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
-    let interval_mod_p: Arc<[u32]> = base
-        .iter()
-        .map(|e| p.sieve_half_width % e.prime)
-        .collect();
+    let interval_mod_p: Arc<[u32]> = base.iter().map(|e| p.sieve_half_width % e.prime).collect();
     let target_a = sieve_n
         .floor_sqrt()
         .div_rem_u64(p.sieve_half_width as u64)
@@ -464,7 +466,7 @@ fn relation_target(base_len: usize) -> usize {
 pub fn factor(
     mut n: Natural,
     threads: usize,
-    mut progress: impl FnMut(EngineProgress),
+    mut progress: impl FnMut(EngineProgress) -> bool,
 ) -> Result<Vec<Natural>, EngineError> {
     if n.is_zero() {
         return Err(EngineError::Setup("zero has no prime factorization".into()));
@@ -497,16 +499,18 @@ fn factor_node(
     n: Natural,
     threads: usize,
     pc: &PrimalityConfig,
-    progress: &mut impl FnMut(EngineProgress),
+    progress: &mut impl FnMut(EngineProgress) -> bool,
     out: &mut Vec<Natural>,
 ) -> Result<(), EngineError> {
-    progress(EngineProgress {
+    if !progress(EngineProgress {
         phase: EnginePhase::Preprocessing,
         polynomials: 0,
         relations: 0,
         target: 0,
         workers: threads,
-    });
+    }) {
+        return Err(EngineError::Cancelled);
+    }
     if n.is_one() {
         return Ok(());
     }
@@ -544,7 +548,7 @@ fn factor_node(
 fn find_factor(
     n: Natural,
     threads: usize,
-    progress: &mut impl FnMut(EngineProgress),
+    progress: &mut impl FnMut(EngineProgress) -> bool,
 ) -> Result<Natural, EngineError> {
     // Small inputs finish faster than 96 OS threads take to spawn and join, so
     // cap worker count by problem size to avoid parallel-startup overhead.
@@ -555,20 +559,24 @@ fn find_factor(
         _ => threads,
     }
     .max(1);
-    progress(EngineProgress {
+    if !progress(EngineProgress {
         phase: EnginePhase::BuildingFactorBase,
         polynomials: 0,
         relations: 0,
         target: 0,
         workers: threads,
-    });
+    }) {
+        return Err(EngineError::Cancelled);
+    }
     let p = crate::qs::parameters::engine_params(n.bit_len());
     let bound = p.factor_base_bound;
     let interval = p.sieve_half_width as i32;
     let prof = std::env::var_os("RUSQSIEVE_PROFILE").is_some();
     let t_fb = std::time::Instant::now();
     let k = knuth_schroeppel(&n);
-    let sieve_n = n.checked_mul(&Natural::from_u64(k)).unwrap_or_else(|| n.clone());
+    let sieve_n = n
+        .checked_mul(&Natural::from_u64(k))
+        .unwrap_or_else(|| n.clone());
     let qcfg = QsConfig {
         factor_base_bound: AutoOr::Value(bound),
         multiplier: MultiplierChoice::Value(k as u32),
@@ -577,8 +585,7 @@ fn find_factor(
     let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
-    let interval_mod_p: Arc<[u32]> =
-        base.iter().map(|e| interval as u32 % e.prime).collect();
+    let interval_mod_p: Arc<[u32]> = base.iter().map(|e| interval as u32 % e.prime).collect();
     let target = relation_target(base.len());
     if prof {
         eprintln!(
@@ -608,16 +615,24 @@ fn find_factor(
     let job_rx = Arc::new(Mutex::new(job_rx));
     let (res_tx, res_rx) = mpsc::channel();
     let mut handles = Vec::new();
+    let cancellation = Arc::new(AtomicBool::new(false));
     for _ in 0..threads {
         let rx = job_rx.clone();
         let tx = res_tx.clone();
         let c = ctx.clone();
+        let cancellation = cancellation.clone();
         handles.push(std::thread::spawn(move || {
             let mut scratch = EngineScratch::default();
             loop {
+                if cancellation.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
                 let job = rx.lock().unwrap().recv();
                 match job {
                     Ok(Some(f)) => {
+                        if cancellation.load(AtomicOrdering::Relaxed) {
+                            break;
+                        }
                         if tx.send(sieve_family(&c, f, &mut scratch)).is_err() {
                             break;
                         }
@@ -643,8 +658,9 @@ fn find_factor(
     let mut collector = RelationCollector::new();
     let mut polynomials = 0u64;
     let mut total_survivors = 0u64;
+    let mut cancelled = false;
     let max_families = 100_000u64;
-    while collector.columns.len() < target && next_merge < max_families {
+    while collector.columns.len() < target && next_merge < max_families && !cancelled {
         let result = res_rx.recv().map_err(|_| EngineError::Worker)?;
         outstanding -= 1;
         buffered.insert(result.family, result);
@@ -658,15 +674,21 @@ fn find_factor(
                     break;
                 }
             }
-            progress(EngineProgress {
+            if !progress(EngineProgress {
                 phase: EnginePhase::Sieving,
                 polynomials,
                 relations: collector.columns.len(),
                 target,
                 workers: threads,
-            });
+            }) {
+                cancelled = true;
+                cancellation.store(true, AtomicOrdering::Relaxed);
+                break;
+            }
         }
-        while outstanding < threads * 2 && next_send < max_families && collector.columns.len() < target
+        while outstanding < threads * 2
+            && next_send < max_families
+            && collector.columns.len() < target
         {
             job_tx
                 .send(Some(next_send))
@@ -682,6 +704,9 @@ fn find_factor(
     for h in handles {
         let _ = h.join();
     }
+    if cancelled {
+        return Err(EngineError::Cancelled);
+    }
     if prof {
         eprintln!(
             "PROFILE sieve+collect={:.3}s polys={} families={} survivors={} relations={}",
@@ -692,13 +717,15 @@ fn find_factor(
             collector.columns.len()
         );
     }
-    progress(EngineProgress {
+    if !progress(EngineProgress {
         phase: EnginePhase::LinearAlgebra,
         polynomials,
         relations: collector.columns.len(),
         target,
         workers: threads,
-    });
+    }) {
+        return Err(EngineError::Cancelled);
+    }
     let t_la = std::time::Instant::now();
     let result = extract(&ctx, &collector.columns);
     if prof {
@@ -708,13 +735,15 @@ fn find_factor(
             collector.columns.len()
         );
     }
-    progress(EngineProgress {
+    if !progress(EngineProgress {
         phase: EnginePhase::Extracting,
         polynomials,
         relations: collector.columns.len(),
         target,
         workers: threads,
-    });
+    }) {
+        return Err(EngineError::Cancelled);
+    }
     result
 }
 
@@ -954,7 +983,10 @@ fn thresh_margin() -> i32 {
 fn env_default(name: &str, default: usize) -> usize {
     #[cfg(any(unix, windows))]
     {
-        return std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default);
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1225,10 +1257,9 @@ fn sieve_one_poly(
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
     });
-    let threshold = (g_bits as i32 - ctx.lp_allowance as i32 - small_slack() as i32
-        + thresh_margin()
-        + adj)
-        .clamp(1, 255) as u8;
+    let threshold =
+        (g_bits as i32 - ctx.lp_allowance as i32 - small_slack() as i32 + thresh_margin() + adj)
+            .clamp(1, 255) as u8;
     let high_bit_biased = g_bits <= 192 && threshold <= 128;
     let initial_score = if high_bit_biased { 128 - threshold } else { 0 };
     scores.clear();
@@ -1290,7 +1321,10 @@ fn sieve_one_poly(
         // signs (c_math = ∓c per csign). This avoids the wide t² squaring and the
         // division by a — a is guaranteed to divide Q since b² ≡ n (mod a).
         let ax2 = ax.checked_mul(&Natural::from_u64(xabs)).unwrap();
-        let two_bx = b.wrapping_add(b).checked_mul(&Natural::from_u64(xabs)).unwrap();
+        let two_bx = b
+            .wrapping_add(b)
+            .checked_mul(&Natural::from_u64(xabs))
+            .unwrap();
         let (gx, gxneg) = signed_add(&ax2, false, &two_bx, bneg ^ (x < 0));
         let (mut q, sign) = signed_add(&gx, gxneg, &c, csign);
         if q.is_zero() {
@@ -1459,13 +1493,7 @@ fn classify_cofactor(q: u64, single_limit: u64, double_enabled: bool) -> Option<
     }
     let d = pollard_u64(q)?;
     let e = q / d;
-    if d > 1
-        && e > 1
-        && d <= single_limit
-        && e <= single_limit
-        && is_prime64(d)
-        && is_prime64(e)
-    {
+    if d > 1 && e > 1 && d <= single_limit && e <= single_limit && is_prime64(d) && is_prime64(e) {
         Some(LargePrime::Two(d.min(e), d.max(e)))
     } else {
         None
@@ -1798,7 +1826,7 @@ mod tests {
         let p = Natural::from_u64(18_446_744_073_709_551_557);
         let q = Natural::from_u64(18_446_744_073_709_551_533);
         let n = p.checked_mul(&q).unwrap();
-        let factors = factor(n.clone(), 2, |_| {}).unwrap();
+        let factors = factor(n.clone(), 2, |_| true).unwrap();
         assert_eq!(factors, [q, p]);
         assert_eq!(
             factors

@@ -38,7 +38,10 @@ fn cli_reports_elapsed_time_to_stderr() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     // Factors still go to stdout, machine-readable.
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "2\n2\n2\n3\n3\n5\n");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "2\n2\n2\n3\n3\n5\n"
+    );
     // Elapsed time is reported on stderr as the final line.
     let stderr = String::from_utf8(output.stderr).unwrap();
     let last = stderr.lines().last().unwrap_or("");
