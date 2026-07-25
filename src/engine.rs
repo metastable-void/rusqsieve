@@ -61,7 +61,7 @@ struct Context {
     /// fixed translation avoids two signed divisions per prime and polynomial in the sieve pass.
     interval_mod_p: Arc<[u32]>,
     interval: i32,
-    target_a_bits: usize,
+    target_a: Natural,
     lp_allowance: usize,
     /// Maximum accepted single large prime (and maximum factor of a double).
     single_limit: u64,
@@ -130,6 +130,10 @@ struct EngineScratch {
     bainv: Vec<u32>,
     /// Positions surviving the score threshold, reused across polynomials.
     candidates: Vec<u32>,
+    /// Absolute carried hit positions for the cache-blocked sieve. Allocated only when the score
+    /// interval is at least two blocks and reused across polynomials.
+    block_pos1: Vec<usize>,
+    block_pos2: Vec<usize>,
 }
 
 /// Immutable portable SIQS worker context.
@@ -278,7 +282,7 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
         pinv,
         interval_mod_p,
         interval: p.sieve_half_width as i32,
-        target_a_bits: target_a.bit_len(),
+        target_a,
         lp_allowance: p.lp_allowance,
         single_limit,
         double_enabled,
@@ -320,7 +324,7 @@ pub struct EngineSession {
 }
 impl EngineSession {
     pub fn new(context: EngineContext) -> Self {
-        let target = context.0.base.len() + 64;
+        let target = relation_target(context.0.base.len());
         Self {
             context,
             target,
@@ -387,9 +391,6 @@ impl EngineSession {
 }
 
 fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural, EngineError> {
-    if columns.len() <= ctx.base.len() {
-        return Err(EngineError::InsufficientRelations);
-    }
     let matrix_cols: Vec<Vec<u32>> = columns
         .iter()
         .map(|c| {
@@ -446,6 +447,17 @@ fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural, EngineError> {
         }
     }
     Err(EngineError::NoFactor)
+}
+
+fn relation_target(base_len: usize) -> usize {
+    #[cfg(any(unix, windows))]
+    if let Some(percent) = std::env::var("RUSQSIEVE_REL_PERCENT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return (base_len * percent.clamp(50, 110) / 100).max(64);
+    }
+    base_len + 64
 }
 
 #[cfg(any(unix, windows))]
@@ -567,7 +579,7 @@ fn find_factor(
     let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
     let interval_mod_p: Arc<[u32]> =
         base.iter().map(|e| interval as u32 % e.prime).collect();
-    let target = base.len() + 64;
+    let target = relation_target(base.len());
     if prof {
         eprintln!(
             "PROFILE fb_build={:.3}s nfb={} interval={} target={} k={}",
@@ -587,7 +599,7 @@ fn find_factor(
         pinv,
         interval_mod_p,
         interval,
-        target_a_bits: target_a.bit_len(),
+        target_a,
         lp_allowance: p.lp_allowance,
         single_limit,
         double_enabled,
@@ -679,9 +691,6 @@ fn find_factor(
             total_survivors,
             collector.columns.len()
         );
-    }
-    if collector.columns.len() <= base.len() {
-        return Err(EngineError::InsufficientRelations);
     }
     progress(EngineProgress {
         phase: EnginePhase::LinearAlgebra,
@@ -775,8 +784,10 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
         }
         let xroot1 = mulmod_u32((e.sqrt_n + p - bp) % p, ainvp, p);
         let xroot2 = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, ainvp, p);
-        scratch.root1[idx] = add_mod_u32(xroot1, ctx.interval_mod_p[idx], p);
-        scratch.root2[idx] = add_mod_u32(xroot2, ctx.interval_mod_p[idx], p);
+        let r1 = add_mod_u32(xroot1, ctx.interval_mod_p[idx], p);
+        let r2 = add_mod_u32(xroot2, ctx.interval_mod_p[idx], p);
+        scratch.root1[idx] = r1.min(r2);
+        scratch.root2[idx] = r1.max(r2);
         for (j, bj) in bvals.iter().take(nvar).enumerate() {
             let bjp = bj.mod_u64(p as u64) as u32;
             let two_bjp = (2 * bjp as u64 % p as u64) as u32;
@@ -799,6 +810,8 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
             &scratch.root2,
             &mut scratch.scores,
             &mut scratch.candidates,
+            &mut scratch.block_pos1,
+            &mut scratch.block_pos2,
             &mut relations,
         ) as u64;
         if v + 1 >= variants {
@@ -815,18 +828,29 @@ fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> Fami
             false
         };
         let off = j * nfb;
-        for idx in 0..nfb {
-            if scratch.root1[idx] == u32::MAX {
-                continue;
+        if add_bainv {
+            for idx in 0..nfb {
+                if scratch.root1[idx] == u32::MAX {
+                    continue;
+                }
+                let p = base[idx].prime;
+                let d = scratch.bainv[off + idx];
+                let r1 = add_mod_u32(scratch.root1[idx], d, p);
+                let r2 = add_mod_u32(scratch.root2[idx], d, p);
+                scratch.root1[idx] = r1.min(r2);
+                scratch.root2[idx] = r1.max(r2);
             }
-            let p = base[idx].prime;
-            let d = scratch.bainv[off + idx];
-            if add_bainv {
-                scratch.root1[idx] = add_mod_u32(scratch.root1[idx], d, p);
-                scratch.root2[idx] = add_mod_u32(scratch.root2[idx], d, p);
-            } else {
-                scratch.root1[idx] = sub_mod_u32(scratch.root1[idx], d, p);
-                scratch.root2[idx] = sub_mod_u32(scratch.root2[idx], d, p);
+        } else {
+            for idx in 0..nfb {
+                if scratch.root1[idx] == u32::MAX {
+                    continue;
+                }
+                let p = base[idx].prime;
+                let d = scratch.bainv[off + idx];
+                let r1 = sub_mod_u32(scratch.root1[idx], d, p);
+                let r2 = sub_mod_u32(scratch.root2[idx], d, p);
+                scratch.root1[idx] = r1.min(r2);
+                scratch.root2[idx] = r1.max(r2);
             }
         }
     }
@@ -855,20 +879,34 @@ fn signed_add(a: &Natural, aneg: bool, b: &Natural, bneg: bool) -> (Natural, boo
 }
 
 fn choose_a(ctx: &Context, family: u64) -> Option<(Natural, Vec<u32>)> {
-    let pool: Vec<usize> = ctx
+    let all: Vec<usize> = ctx
         .base
         .iter()
         .enumerate()
         .filter(|(_, e)| e.prime > 1000)
         .map(|(i, _)| i)
         .collect();
-    if pool.len() < 8 {
+    if all.len() < 8 {
+        return None;
+    }
+    let target_bits = ctx.target_a.bit_len();
+    let factor_count = target_bits.div_ceil(14).clamp(3, 10);
+    let ideal_bits = target_bits.div_ceil(factor_count);
+    let pool: Vec<usize> = all
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let bits = (32 - ctx.base[i].prime.leading_zeros()) as usize;
+            bits.abs_diff(ideal_bits) <= 1
+        })
+        .collect();
+    if pool.len() < factor_count * 2 {
         return None;
     }
     let mut state = family ^ 0x9e3779b97f4a7c15;
     let mut a = Natural::ONE;
-    let mut idx = Vec::new();
-    while a.bit_len() < ctx.target_a_bits && idx.len() < 12 {
+    let mut idx = Vec::with_capacity(factor_count);
+    while idx.len() + 1 < factor_count {
         state = xorshift(state);
         let i = pool[state as usize % pool.len()];
         if idx.contains(&(i as u32)) {
@@ -878,7 +916,16 @@ fn choose_a(ctx: &Context, family: u64) -> Option<(Natural, Vec<u32>)> {
         a = next;
         idx.push(i as u32)
     }
-    (idx.len() >= 3).then_some((a, idx))
+    let desired = ctx.target_a.div_rem(&a)?.0;
+    let desired_u64 = desired.as_parts()[0];
+    let last = all
+        .iter()
+        .copied()
+        .filter(|&i| !idx.contains(&(i as u32)))
+        .min_by_key(|&i| (ctx.base[i].prime as u64).abs_diff(desired_u64))?;
+    a = a.checked_mul(&Natural::from_u64(ctx.base[last].prime as u64))?;
+    idx.push(last as u32);
+    Some((a, idx))
 }
 
 /// Tiny-prime skipping (audit frontier #3): primes below `small_skip()` are not added to the byte
@@ -939,35 +986,25 @@ fn sieve_root_pair<const SATURATING: bool>(
     }
 
     let len = scores.len();
-    let mut pos1 = root1;
-    let mut pos2 = root2;
-    while pos1 < len
-        && pos2 < len
-        && pos1.saturating_add(step) < len
-        && pos2.saturating_add(step) < len
-    {
-        add::<SATURATING>(&mut scores[pos1], weight);
-        add::<SATURATING>(&mut scores[pos2], weight);
-        pos1 += step;
-        pos2 += step;
-        add::<SATURATING>(&mut scores[pos1], weight);
-        add::<SATURATING>(&mut scores[pos2], weight);
-        pos1 += step;
-        pos2 += step;
+    debug_assert!(root1 <= root2);
+    let diff = root2 - root1;
+    let mut pos = root1;
+    while pos + step + diff < len {
+        add::<SATURATING>(&mut scores[pos], weight);
+        add::<SATURATING>(&mut scores[pos + diff], weight);
+        pos += step;
+        add::<SATURATING>(&mut scores[pos], weight);
+        add::<SATURATING>(&mut scores[pos + diff], weight);
+        pos += step;
     }
-    while pos1 < len && pos2 < len {
-        add::<SATURATING>(&mut scores[pos1], weight);
-        add::<SATURATING>(&mut scores[pos2], weight);
-        pos1 += step;
-        pos2 += step;
+    while pos + diff < len {
+        add::<SATURATING>(&mut scores[pos], weight);
+        add::<SATURATING>(&mut scores[pos + diff], weight);
+        pos += step;
     }
-    while pos1 < len {
-        add::<SATURATING>(&mut scores[pos1], weight);
-        pos1 += step;
-    }
-    while pos2 < len {
-        add::<SATURATING>(&mut scores[pos2], weight);
-        pos2 += step;
+    while pos < len {
+        add::<SATURATING>(&mut scores[pos], weight);
+        pos += step;
     }
 }
 
@@ -1024,6 +1061,92 @@ fn score_polynomial<const SATURATING: bool>(
     }
 }
 
+/// FLINT-style carried-position cache blocking. The factor base is replayed for each 256 KiB
+/// block, but every prime resumes at its first unprocessed absolute hit, so no modular arithmetic
+/// or re-striding setup is repeated. Score writes for large intervals remain local to one L2-sized
+/// block.
+#[allow(clippy::too_many_arguments)]
+fn score_polynomial_blocked<const SATURATING: bool>(
+    ctx: &Context,
+    b: &Natural,
+    bneg: bool,
+    c: &Natural,
+    csign: bool,
+    root1: &[u32],
+    root2: &[u32],
+    scores: &mut [u8],
+    small_skip: u32,
+    pos1: &mut Vec<usize>,
+    pos2: &mut Vec<usize>,
+) {
+    const BLOCK: usize = 4 * 65_536;
+    let nfb = ctx.base.len();
+    pos1.clear();
+    pos1.resize(nfb, usize::MAX);
+    pos2.clear();
+    pos2.resize(nfb, usize::MAX);
+
+    for (idx, e) in ctx.base.iter().enumerate() {
+        let p = e.prime;
+        if p == 2 || p < small_skip {
+            continue;
+        }
+        if root1[idx] != u32::MAX {
+            pos1[idx] = root1[idx] as usize;
+            pos2[idx] = root2[idx] as usize;
+        } else {
+            let mut bp = b.mod_u64(p as u64) as u32;
+            if bneg && bp != 0 {
+                bp = p - bp;
+            }
+            let denom = (2 * bp as u64 % p as u64) as u32;
+            let Some(inv) = inv_u32(denom, p) else {
+                continue;
+            };
+            let cm = c.mod_u64(p as u64) as u32;
+            let signed_c = if csign && cm != 0 { p - cm } else { cm };
+            let xroot = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
+            pos1[idx] = add_mod_u32(xroot, ctx.interval_mod_p[idx], p) as usize;
+        }
+    }
+
+    let mut block_end = BLOCK.min(scores.len());
+    while block_end != 0 {
+        for (idx, e) in ctx.base.iter().enumerate() {
+            let p = e.prime;
+            if p == 2 || p < small_skip {
+                continue;
+            }
+            let step = p as usize;
+            let weight = (32 - p.leading_zeros()) as u8;
+            let mut a = pos1[idx];
+            while a < block_end {
+                scores[a] = if SATURATING {
+                    scores[a].saturating_add(weight)
+                } else {
+                    scores[a].wrapping_add(weight)
+                };
+                a += step;
+            }
+            pos1[idx] = a;
+            let mut b = pos2[idx];
+            while b < block_end {
+                scores[b] = if SATURATING {
+                    scores[b].saturating_add(weight)
+                } else {
+                    scores[b].wrapping_add(weight)
+                };
+                b += step;
+            }
+            pos2[idx] = b;
+        }
+        if block_end == scores.len() {
+            break;
+        }
+        block_end = (block_end + BLOCK).min(scores.len());
+    }
+}
+
 /// Collect high-scoring positions. When the score array was initialized with `128 - threshold`,
 /// the high bit is the threshold comparison; test eight bytes at once before examining a word's
 /// individual positions. This is the portable form of FLINT's word-at-a-time candidate scan.
@@ -1076,6 +1199,8 @@ fn sieve_one_poly(
     root2: &[u32],
     scores: &mut Vec<u8>,
     candidates: &mut Vec<u32>,
+    block_pos1: &mut Vec<usize>,
+    block_pos2: &mut Vec<usize>,
     out: &mut Vec<Relation>,
 ) -> usize {
     let base = &ctx.base;
@@ -1112,7 +1237,21 @@ fn sieve_one_poly(
     // whole array resident in cache (SPEC §12.6). (Frontier #2 blocked/bucket sieving was
     // implemented and measured here: a naive per-block re-stride regressed 13–41% on this
     // large-L2 host because it fragments each prime's tight strided loop; see CLAUDE-AUDIT.md.)
-    if g_bits <= 192 {
+    // The reference host has 1 MiB private L2. Keep arrays through 768 KiB on the faster flat
+    // kernel; switch only once the score array itself reaches L2 capacity. Cache-constrained
+    // targets can lower this in a future target-specific tuning table.
+    const BLOCK_GATE: usize = 16 * 65_536;
+    if scores.len() >= BLOCK_GATE {
+        if g_bits <= 192 {
+            score_polynomial_blocked::<false>(
+                ctx, b, bneg, &c, csign, root1, root2, scores, small_skip, block_pos1, block_pos2,
+            );
+        } else {
+            score_polynomial_blocked::<true>(
+                ctx, b, bneg, &c, csign, root1, root2, scores, small_skip, block_pos1, block_pos2,
+            );
+        }
+    } else if g_bits <= 192 {
         score_polynomial::<false>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
     } else {
         score_polynomial::<true>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);

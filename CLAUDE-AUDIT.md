@@ -645,3 +645,44 @@ Measured negative results retained as guidance:
 Per-thread parity is still not achieved, but the gap is now ~2.0× at 192 bits and ~1.7× at 224
 bits, down from 3.8× / 3.4× at the start of the day. The remaining high-leverage difference visible
 in FLINT is its cache-blocked large-interval sieve plus more effective relation filtering.
+
+## Session 2026-07-24: per-thread FLINT lead achieved through 240 bits
+
+Continued direct comparison with `/home/dev/flint/src/qsieve/` produced the decisive changes:
+
+- **Exact sorted-root/difference sieve loop.** Roots are kept ordered after every Gray-code update.
+  The hot stride loop carries one position plus the root difference, matching FLINT's unrolled
+  kernel instead of maintaining two positions and four loop bounds. This alone moved the 192-bit
+  sample from 5.67 s to 4.92 s.
+- **Numerically target-fitted `A`.** `choose_a` now selects a deterministic factor count and primes
+  from the ideal size class, then chooses the final factor closest to
+  `target_A/current_product`. The old code stopped when the product merely reached the target bit
+  length, allowing a large last-prime overshoot. At 192 bits this cuts survivors 86,767 → 15,955
+  and time 4.92 s → 3.07 s before final retuning; at 224 bits it cuts 36.0 s → 21.4 s.
+- **Weight-two structured elimination.** Matrix filtering now deterministically merges the two
+  variables in a weight-two row while retaining exact original-column provenance. On the 224-bit
+  matrix this reduces 11,000×11,063 to 8,228×8,642. Sub-raw-row relation targets were tested:
+  99% works at 224 but fails at 192, so the safe default remains `nfb + 64` until staged
+  collect/filter/retry exists.
+- **Carried-position blocked sieve implemented.** Correct and available for score arrays at least
+  1 MiB. On this 1 MiB-L2 Xeon, a 512 KiB array is faster flat (40.23 s vs 42.36 s at 224), so the
+  gate reflects the actual cache rather than FLINT's conservative 512 KiB switch point.
+- **Tier retuning after the structural wins.** 177–192 bits now use bound 100k / half-width 90,112;
+  209–224 uses half-width 262,144; 225–248 uses bound 350k / half-width 262,144. The upper-tier
+  factor base can now grow because target-fitted polynomials and cheaper per-prime loops removed
+  the old cap.
+
+Clean saved-binary single-thread comparisons on the dedicated container:
+
+| bits | input | rusqsieve | FLINT | result |
+|-----:|-------|-----------:|------:|-------:|
+| 160 | checked-in 49-digit example | **0.35 s** | 0.57 s | 1.63× faster |
+| 192 | checked-in 58-digit example, two interleaved pairs | **2.49–2.53 s** | 2.78–2.79 s | 1.10–1.12× faster |
+| 208 | fresh balanced semiprime | **8.59 s** | 9.89 s | 1.15× faster |
+| 224 | fresh balanced semiprime | **21.43 s** | 26.60 s | 1.24× faster |
+| 240 | fresh balanced semiprime | **67.25 s** | 77.18 s | 1.15× faster |
+
+All outputs were product-verified by the CLI. The full native suite passes and the release
+`wasm32-unknown-unknown` build passes. This achieves the audit's per-thread goal on every measured
+head-to-head tier from 160 through 240 bits; FLINT still aborts on the reference host's 256-bit
+case, where rusqsieve remains functional.

@@ -1,6 +1,7 @@
 //! Sparse binary matrices and verified dependencies.
 use core::fmt;
 use core::ops::Range;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MatrixOperation {
@@ -190,47 +191,92 @@ impl SparseBinaryMatrix {
         if ncols == 0 {
             return DependencySet::default();
         }
+        let mut row_cols: Vec<BTreeSet<usize>> = (0..nrows)
+            .map(|r| {
+                let a = self.csr_offsets[r] as usize;
+                let b = self.csr_offsets[r + 1] as usize;
+                self.csr_columns[a..b].iter().map(|&c| c as usize).collect()
+            })
+            .collect();
+        let mut col_rows: Vec<BTreeSet<usize>> = (0..ncols)
+            .map(|c| {
+                let a = self.csc_offsets[c] as usize;
+                let b = self.csc_offsets[c + 1] as usize;
+                self.csc_rows[a..b].iter().map(|&r| r as usize).collect()
+            })
+            .collect();
         let mut col_alive = vec![true; ncols];
-        let mut row_weight = vec![0u32; nrows];
-        for (r, w) in row_weight.iter_mut().enumerate() {
-            *w = self.csr_offsets[r + 1] - self.csr_offsets[r];
-        }
-        let mut stack: Vec<usize> = (0..nrows).filter(|&r| row_weight[r] == 1).collect();
+        let mut provenance: Vec<Vec<usize>> = (0..ncols).map(|c| vec![c]).collect();
+        let mut stack: Vec<usize> = (0..nrows).filter(|&r| row_cols[r].len() <= 2).collect();
+
         while let Some(r) = stack.pop() {
-            if row_weight[r] != 1 {
-                continue;
-            }
-            let a = self.csr_offsets[r] as usize;
-            let b = self.csr_offsets[r + 1] as usize;
-            let Some(&c) = self.csr_columns[a..b]
-                .iter()
-                .find(|&&c| col_alive[c as usize])
-            else {
-                continue;
-            };
-            let c = c as usize;
-            col_alive[c] = false;
-            let ca = self.csc_offsets[c] as usize;
-            let cb = self.csc_offsets[c + 1] as usize;
-            for &rr in &self.csc_rows[ca..cb] {
-                let rr = rr as usize;
-                if row_weight[rr] > 0 {
-                    row_weight[rr] -= 1;
-                    if row_weight[rr] == 1 {
-                        stack.push(rr);
+            match row_cols[r].len() {
+                0 => {}
+                1 => {
+                    // A singleton equation forces its sole variable (and its whole merged
+                    // provenance group) to zero in every dependency.
+                    let c = *row_cols[r].iter().next().unwrap();
+                    let affected: Vec<usize> = col_rows[c].iter().copied().collect();
+                    for rr in affected {
+                        row_cols[rr].remove(&c);
+                        if row_cols[rr].len() <= 2 {
+                            stack.push(rr);
+                        }
                     }
+                    col_rows[c].clear();
+                    col_alive[c] = false;
                 }
+                2 => {
+                    // x_a + x_b = 0, hence x_a = x_b. Merge b into a, XORing their
+                    // incidence in every other row. Selecting the reduced variable later selects
+                    // both provenance groups in the original column space.
+                    let mut it = row_cols[r].iter();
+                    let a = *it.next().unwrap();
+                    let b = *it.next().unwrap();
+                    row_cols[r].clear();
+                    col_rows[a].remove(&r);
+                    col_rows[b].remove(&r);
+                    let affected: Vec<usize> = col_rows[b].iter().copied().collect();
+                    for rr in affected {
+                        row_cols[rr].remove(&b);
+                        col_rows[b].remove(&rr);
+                        if row_cols[rr].remove(&a) {
+                            col_rows[a].remove(&rr);
+                        } else {
+                            row_cols[rr].insert(a);
+                            col_rows[a].insert(rr);
+                        }
+                        if row_cols[rr].len() <= 2 {
+                            stack.push(rr);
+                        }
+                    }
+                    col_rows[b].clear();
+                    col_alive[b] = false;
+                    let merged = core::mem::take(&mut provenance[b]);
+                    provenance[a].extend(merged);
+                }
+                _ => {}
             }
         }
+
         let alive_cols: Vec<usize> = (0..ncols).filter(|&c| col_alive[c]).collect();
-        // Nothing eliminated, or no usable surplus left: fall back to dense.
         let mut reduced_rows = 0usize;
         let mut row_map = vec![u32::MAX; nrows];
         for r in 0..nrows {
-            if row_weight[r] >= 2 {
+            if !row_cols[r].is_empty() {
                 row_map[r] = reduced_rows as u32;
                 reduced_rows += 1;
             }
+        }
+        #[cfg(any(unix, windows))]
+        if std::env::var_os("RUSQSIEVE_PROFILE").is_some() {
+            eprintln!(
+                "PROFILE filter={}x{} -> {}x{}",
+                nrows,
+                ncols,
+                reduced_rows,
+                alive_cols.len()
+            );
         }
         if alive_cols.len() == ncols || alive_cols.len() <= reduced_rows {
             return self.dense_dependencies();
@@ -238,12 +284,10 @@ impl SparseBinaryMatrix {
         let reduced_cols: Vec<Vec<u32>> = alive_cols
             .iter()
             .map(|&c| {
-                let ca = self.csc_offsets[c] as usize;
-                let cb = self.csc_offsets[c + 1] as usize;
-                self.csc_rows[ca..cb]
+                col_rows[c]
                     .iter()
                     .filter_map(|&r| {
-                        let m = row_map[r as usize];
+                        let m = row_map[r];
                         (m != u32::MAX).then_some(m)
                     })
                     .collect()
@@ -256,9 +300,11 @@ impl SparseBinaryMatrix {
         let mut out = Vec::new();
         for dep in reduced.dense_dependencies().iter() {
             let mut full = vec![0u64; words];
-            for (j, &orig) in alive_cols.iter().enumerate() {
+            for (j, &reduced_col) in alive_cols.iter().enumerate() {
                 if (dep[j / 64] >> (j % 64)) & 1 != 0 {
-                    full[orig / 64] |= 1 << (orig % 64);
+                    for &orig in &provenance[reduced_col] {
+                        full[orig / 64] |= 1 << (orig % 64);
+                    }
                 }
             }
             if self.verify_dependency(&full) {
