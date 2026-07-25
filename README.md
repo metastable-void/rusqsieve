@@ -61,6 +61,15 @@ make install PREFIX=/usr DESTDIR="$pkgdir"
 overridable. Installation includes the shared and static C libraries,
 `rusqsieve.h`, the CLI, and `rusqsieve.pc`.
 
+`./build-release.sh` creates versioned `.tar.gz` archives for the supported
+Linux GNU/musl, FreeBSD, Windows MSVC, Apple arm64, and WebAssembly targets.
+It uses cross-rs for Linux and FreeBSD, xwin for MSVC, zigbuild for Apple
+(`SDKROOT` is required), and Cargo directly for Wasm. Native archives contain
+the target-appropriate libraries, CLI, header, pkg-config metadata, licenses,
+and an elevation-aware installer. The Wasm archive is directly deployable and
+contains both scalar and SIMD128 builds. Pass target triples as arguments to
+build only a subset; run `./build-release.sh --help` for the full list.
+
 ```c
 #include "rusqsieve.h"
 
