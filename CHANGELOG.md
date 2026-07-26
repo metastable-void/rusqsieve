@@ -87,6 +87,10 @@ documentation work deferred from 0.2.1.
   threshold adjustment)` settings are `(135k, 131072, 0)`,
   `(150k, 131072, 0)`, `(200k, 131072, −3)`, `(350k, 131072, −1)`, and
   `(400k, 196608, −5)` respectively.
+- Updated the web demo's one-click examples to the verified 224-, 240-, 256-,
+  and 272-bit balanced-semiprime anchors. During sieving above 256 bits it now
+  shows sieve-local elapsed time and an approximate ETA calibrated for the
+  accelerating partial-cycle relation yield.
 - Rejected several measured non-wins instead of retaining speculative
   optimization code: a dense prime-only hot stream regressed the 240-bit corpus
   mean by 0.5%; 64-way bit-sliced dependency back-substitution left the 272-bit

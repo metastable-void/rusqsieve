@@ -71,9 +71,10 @@ async function boot() {
 }
 
 // Parallel quadratic sieve for one hard composite; resolves to a nontrivial factor.
-function siqsParallel(decimal, report) {
+function siqsParallel(decimal, bits, report) {
   return new Promise((resolve, reject) => {
     const myGen = ++gen;
+    const sieveStarted = performance.now();
     let target = 0;
     let relations = 0;
     let nextFamily = 0;
@@ -97,7 +98,24 @@ function siqsParallel(decimal, report) {
         for (const w of workers) w.postMessage({ cmd: "prepare", n: decimal, gen: myGen });
       } else if (data.type === "submitted") {
         relations = data.relations;
-        report({ phase: "sieving", relations, target });
+        const now = performance.now();
+        const elapsedSeconds = (now - sieveStarted) / 1000;
+        // The accepted relation count accelerates as the partial-relation graph
+        // accumulates edges and closes more cycles. A linear rate extrapolation
+        // is therefore wildly pessimistic early in 272-bit runs. The measured
+        // browser curve is close to relations ∝ time^1.6; invert that curve to
+        // estimate total sieve time without embedding a machine-specific rate.
+        const progress = target > 0 ? Math.min(1, relations / target) : 0;
+        const etaSeconds =
+          progress >= 0.03 ? elapsedSeconds * (progress ** (-1 / 1.6) - 1) : null;
+        report({
+          phase: "sieving",
+          bits,
+          relations,
+          target,
+          elapsedSeconds,
+          etaSeconds,
+        });
         if (!finished) dispatch(workers[data.worker]);
       } else if (data.type === "linalg") {
         report({ phase: "linalg" });
@@ -179,7 +197,7 @@ async function factorize(N, report) {
       stack.push(d, c / d);
       continue;
     }
-    const factor = await siqsParallel(c.toString(), report);
+    const factor = await siqsParallel(c.toString(), bitLength(c), report);
     stack.push(factor, c / factor);
   }
   return groupFactors(primes);
@@ -193,10 +211,27 @@ const PHASE_TEXT = {
   trial: (s) => `Trial division on a ${digits(s.n)}-digit number…`,
   primality: (s) => `Miller–Rabin primality test (${digits(s.n)} digits)…`,
   pollard: (s) => `Pollard's rho on a ${digits(s.n)}-digit number…`,
-  sieving: (s) => `Quadratic sieve: ${s.relations}/${s.target} relations across ${nWorkers} workers…`,
+  sieving: (s) => {
+    const progress =
+      `Quadratic sieve: ${s.relations}/${s.target} relations across ${nWorkers} workers…`;
+    if (s.bits <= 256) return progress;
+    const elapsed = `elapsed ${formatDuration(s.elapsedSeconds)}`;
+    const eta =
+      Number.isFinite(s.etaSeconds) && s.etaSeconds >= 0
+        ? `ETA ≈ ${formatDuration(s.etaSeconds)}`
+        : "ETA calculating…";
+    return `${progress} ${elapsed} · ${eta}`;
+  },
   linalg: () => `Linear algebra over GF(2) — extracting a factor…`,
 };
 const digits = (n) => n.toString().length;
+const formatDuration = (seconds) => {
+  const rounded = Math.max(0, Math.round(seconds));
+  if (rounded < 60) return `${rounded}s`;
+  const minutes = Math.floor(rounded / 60);
+  const remainder = rounded % 60;
+  return `${minutes}m ${String(remainder).padStart(2, "0")}s`;
+};
 
 function render(grouped, original, seconds) {
   const plain = grouped
@@ -309,7 +344,7 @@ els.input.addEventListener("keydown", (e) => {
 });
 els.input.addEventListener("input", updateInputInfo);
 
-// RSA-style semiprime generator (128–384 bits, in steps of 32).
+// RSA-style semiprime generator (128–384 bits, in steps of 16).
 els.rsaBits.addEventListener("input", () => {
   els.rsaBitsLabel.textContent = `${els.rsaBits.value} bits`;
 });
