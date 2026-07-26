@@ -83,6 +83,13 @@ Per main-brief item:
   modular-square kernel and 2.33 s → 1.33–1.34 s over 200 fresh invocations of
   the fixed unbalanced 224-bit rho case. Interleaved balanced 224-bit runs were
   a wash (5.55–5.58 s before, 5.55–5.62 s after); no SIQS speedup is claimed.
+- Real Chromium/Web Worker measurements now cover five deterministic balanced
+  cases at 216, 224, 232, 240, 256, and 272 bits. Retained eight-worker SIMD
+  tier retunes lower corpus means by 35.9% at 216 bits, 16.8% at 224 bits, 28.0%
+  at 232 bits, 7.5% at 240 bits, and 8.0% at 256 bits. At 272 bits, sieving
+  remains the frontier; interval and factor-base sweeps, a dense prime-only
+  stream, and bit-sliced dependency back-substitution produced no reliable
+  end-to-end win and were removed.
 - All Phase 2 before/after figures, host details, A/B/A/B method, measured
   rejections, and variance qualifications remain in the 0.2.1 changelog and
   were not re-labeled as new 0.3 measurements.

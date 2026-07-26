@@ -5,6 +5,8 @@ self-initializing quadratic sieve. Its primary target is balanced, RSA-style
 semiprimes from **192 through 256 bits**, including browser execution across
 independent Web Workers without shared memory.
 
+> **To our knowledge, rusqsieve holds the fastest publicly documented browser-based SIQS timings for balanced 192-, 224-, and 256-bit semiprimes on a consumer mobile device.**
+
 Version 0.3 exposes a deliberately small, safe Rust API and an opaque native C
 ABI. SIQS relations, matrix kernels, worker packets, scheduler state, primality
 policy, and mutable limbs remain private implementation details.

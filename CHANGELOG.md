@@ -77,6 +77,21 @@ documentation work deferred from 0.2.1.
 
 ### Tests, CI, and documentation
 
+- Added a deterministic five-case corpus at each browser product, boundary, and
+  comparison target—216, 224, 232, 240, 256, and 272 bits—plus a real
+  Chromium/Web Worker benchmark driver. Eight-worker SIMD A/B measurements
+  retuned five SIQS tiers. Verified corpus means fell by 35.9% at 216 bits
+  (5.097 s → 3.266 s), 16.8% at 224 bits (6.417 s → 5.340 s), 28.0% at 232 bits
+  (11.258 s → 8.107 s), 7.5% at 240 bits (14.733 s → 13.629 s), and 8.0% at 256
+  bits (38.334 s → 35.279 s). The retained `(factor-base bound, half-width,
+  threshold adjustment)` settings are `(135k, 131072, 0)`,
+  `(150k, 131072, 0)`, `(200k, 131072, −3)`, `(350k, 131072, −1)`, and
+  `(400k, 196608, −5)` respectively.
+- Rejected several measured non-wins instead of retaining speculative
+  optimization code: a dense prime-only hot stream regressed the 240-bit corpus
+  mean by 0.5%; 64-way bit-sliced dependency back-substitution left the 272-bit
+  LA tail unchanged; and 272-bit interval/factor-base sweeps merely shifted
+  time between sieving and LA without a reliable end-to-end gain.
 - Added GitHub Actions for musl-native debug and release-profile tests, the
   feature matrix, fmt, clippy with warnings denied, both Wasm build paths, the
   C smoke executable, and scheduled slow 192–256-bit corpus coverage.

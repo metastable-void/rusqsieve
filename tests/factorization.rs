@@ -204,6 +204,43 @@ fn corpus_entries() -> Vec<(&'static str, Vec<&'static str>)> {
     entries
 }
 
+#[test]
+fn browser_tuning_corpus_has_exact_balanced_products() {
+    let corpus = include_str!("data/browser-balanced-corpus.txt");
+    let mut counts = [0usize; 6];
+    for (line_index, line) in corpus.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        assert_eq!(
+            fields.len(),
+            4,
+            "bad browser corpus line {}",
+            line_index + 1
+        );
+        let bits: usize = fields[0].parse().unwrap();
+        let n = Natural::<16>::from_str(fields[1]).unwrap();
+        let p = Natural::<16>::from_str(fields[2]).unwrap();
+        let q = Natural::<16>::from_str(fields[3]).unwrap();
+        assert_eq!(n.bit_len(), bits, "wrong width on line {}", line_index + 1);
+        assert_eq!(p.bit_len(), bits / 2);
+        assert_eq!(q.bit_len(), bits / 2);
+        assert_eq!(p.checked_mul(&q).unwrap(), n);
+        counts[match bits {
+            216 => 0,
+            224 => 1,
+            232 => 2,
+            240 => 3,
+            256 => 4,
+            272 => 5,
+            _ => panic!("unexpected browser tier {bits}"),
+        }] += 1;
+    }
+    assert_eq!(counts, [5, 5, 5, 5, 5, 5]);
+}
+
 /// Where the default corpus test stops and the `#[ignore]`d one picks up. Every one of the 117
 /// entries in the 65-85-bit `choose_a` dead zone — the regression this corpus exists for — is below
 /// it, with margin. Above it the entries are genuine SIQS work: a 256-bit factorization is tens of

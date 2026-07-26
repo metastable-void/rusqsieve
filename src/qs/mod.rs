@@ -279,8 +279,8 @@ pub mod parameters {
     /// −33% at 192, −45% at 224 vs the pre-optimization baseline). These nfb targets (≈5.7k at 208,
     /// ≈11k at 224) track FLINT's `qsieve_tune` table.
     ///
-    /// The bounds above 224 build ≈15.1k and ≈20.9k primes, and both were re-measured against the
-    /// alternatives at 256-bit, 4 threads (sieve + linear algebra, seconds): 150k → 79.6, 250k →
+    /// The original above-224 native tuning study re-measured factor-base bounds at 256-bit,
+    /// 4 threads (sieve + linear algebra, seconds): 150k → 79.6, 250k →
     /// 50.8, 350k → 39.9, **500k → 35.9**, 700k → 37.2, 1M → 45.7. Shrinking the base makes the
     /// sieve relation-starved; growing it makes the single-threaded dense solve explode (LA alone:
     /// 2.6 s at 500k, 5.5 s at 700k, 12.3 s at 1M). Sieve half-widths were checked the same way
@@ -288,12 +288,27 @@ pub mod parameters {
     /// claimed the optimum beyond 224 bits was *smaller* — ≈7k at 240 and ≈9k at 256 — which
     /// contradicted the table it documented and does not hold on measurement.
     ///
+    /// The 209–264 tiers were subsequently tuned in the actual browser architecture: five fixed,
+    /// balanced semiprimes per target, Chromium/V8 SIMD, eight independent workers. The retained
+    /// `(bound, half-width, threshold)` settings and verified corpus changes are:
+    ///
+    /// - 216 bits: `(250k, 262144, −2)` → `(135k, 131072, 0)`, 5.097 s → 3.266 s (−35.9%);
+    /// - 224 bits: `(250k, 262144, −2)` → `(150k, 131072, 0)`, 6.417 s → 5.340 s (−16.8%);
+    /// - 232 bits: `(350k, 262144, −3)` → `(200k, 131072, −3)`, 11.258 s → 8.107 s (−28.0%);
+    /// - 240 bits: `(350k, 262144, −3)` → `(350k, 131072, −1)`, 14.733 s → 13.629 s (−7.5%);
+    /// - 256 bits: `(500k, 327680, −4)` → `(400k, 196608, −5)`, 38.334 s → 35.279 s (−8.0%).
+    ///
+    /// Nearby sweeps bracketed each retained point: 216-bit bounds of 120k and 150k, 224-bit bounds
+    /// of 100k and 200k, 232-bit bounds of 175k and 250k, 240-bit widths of 98,304 and 196,608, and
+    /// 256-bit bounds of 300k and 450k all regressed. At 232 bits, −3 and −4 thresholds were equal
+    /// over the full corpus (8.107 s versus 8.103 s); −3 is retained as the less permissive setting.
+    ///
     /// `thresh_adj` is the measured sieve-threshold offset in bits, added to
     /// `log2|g(x)| − log2(large-prime bound) − small-prime slack`. Deeper thresholds trade more
     /// survivors for fewer polynomials, and the optimum deepens with input size because
     /// per-polynomial cost grows faster than per-survivor cost. Measured optima on a 48-core Xeon
-    /// 8259CL at 4 threads: 0 at 192-bit, −2 at 224-bit, −4 at 256-bit; the intermediate tiers
-    /// interpolate that ramp and were not measured individually.
+    /// 8259CL at 4 threads: 0 at 192-bit, −2 at 224-bit, −4 at 256-bit. The browser-tier values
+    /// above supersede those native or interpolated values where their bit ranges overlap.
     #[derive(Clone, Copy, Debug)]
     pub struct EngineParams {
         pub factor_base_bound: u32,
@@ -309,8 +324,11 @@ pub mod parameters {
             161..=176 => (60_000, 65_536, 0),
             177..=192 => (100_000, 90_112, 0),
             193..=208 => (120_000, 131_072, -1),
-            209..=224 => (250_000, 262_144, -2),
-            225..=248 => (350_000, 262_144, -3),
+            209..=216 => (135_000, 131_072, 0),
+            217..=224 => (150_000, 131_072, 0),
+            225..=232 => (200_000, 131_072, -3),
+            233..=248 => (350_000, 131_072, -1),
+            249..=264 => (400_000, 196_608, -5),
             _ => (500_000, 327_680, -4),
         };
         EngineParams {
