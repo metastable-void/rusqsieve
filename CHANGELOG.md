@@ -92,6 +92,16 @@ documentation work deferred from 0.2.1.
   mean by 0.5%; 64-way bit-sliced dependency back-substitution left the 272-bit
   LA tail unchanged; and 272-bit interval/factor-base sweeps merely shifted
   time between sieving and LA without a reliable end-to-end gain.
+- Added opt-in LA subphase profiling and removed repeated scans/XORs over
+  already-zero high words during echelon construction. On the identical
+  9,227×9,619 reduced 256-bit matrix, native echelon time fell from 1.625 s to
+  1.153 s. In real Chromium, the five-case 256-bit LA/extraction mean fell from
+  4.324 s to 2.803 s (−35.2%) and total time from 35.279 s to 33.923 s (−3.8%).
+  The smaller 224-bit corpus also improved: LA/extraction 0.479 s to 0.374 s
+  (−21.8%), total 5.340 s to 5.222 s (−2.2%).
+  On the fixed 272-bit anchor, browser LA/extraction fell from 7.563 s to
+  4.550 s (−39.8%); sieving variance masked most of that gain in total wall
+  time (92.359 s to 91.749 s).
 - Added GitHub Actions for musl-native debug and release-profile tests, the
   feature matrix, fmt, clippy with warnings denied, both Wasm build paths, the
   C smoke executable, and scheduled slow 192–256-bit corpus coverage.

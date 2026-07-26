@@ -159,9 +159,20 @@ impl SparseBinaryMatrix {
             // was 75% SLOWER (f2_dense 2.34 s -> 4.08 s at 256-bit): pivots are installed
             // incrementally, so every insertion invalidates its block's 16-row table and the
             // rebuild cost dominates the XORs it saves. See CHANGELOG 0.2.1.
+            //
+            // Rows shrink monotonically after a pivot word becomes zero. Retaining the original
+            // allocation length made `highest_bit` repeatedly scan dead high words and made later
+            // XORs carry needless zero suffixes. Trimming that suffix reduced the identical
+            // 9,227×9,619 reduced 256-bit matrix's native echelon time from 1.625 s to 1.153 s and
+            // its five-case browser LA/extraction mean from 4.324 s to 2.803 s.
             while let Some(pivot) = highest_bit(&equation) {
                 if let Some(prior) = &basis[pivot] {
                     xor(&mut equation[..=pivot / 64], &prior[..=pivot / 64]);
+                    // Elimination can only move the pivot downward. Drop words that have become
+                    // zero so later pivot searches and XORs never revisit a dead high suffix.
+                    while equation.last() == Some(&0) {
+                        equation.pop();
+                    }
                 } else {
                     equation.truncate(pivot / 64 + 1);
                     basis[pivot] = Some(equation.into_boxed_slice());
@@ -208,6 +219,17 @@ impl SparseBinaryMatrix {
     /// the O(n³) dense step, turning the linear-algebra phase from a bottleneck
     /// into a small fraction of the run at large input sizes.
     pub fn filtered_dependencies(&self) -> Result<DependencySet, MatrixError> {
+        self.filtered_dependencies_profiled(false)
+    }
+
+    pub(crate) fn filtered_dependencies_profiled(
+        &self,
+        profile: bool,
+    ) -> Result<DependencySet, MatrixError> {
+        #[cfg(not(any(unix, windows)))]
+        let _ = profile;
+        #[cfg(any(unix, windows))]
+        let profile_start = std::time::Instant::now();
         let nrows = self.rows();
         let ncols = self.columns();
         if ncols == 0 {
@@ -236,6 +258,8 @@ impl SparseBinaryMatrix {
         let mut stack: Vec<usize> = (0..nrows)
             .filter(|&r| (1..=MAX_STRUCTURED_WEIGHT).contains(&row_cols[r].len()))
             .collect();
+        #[cfg(any(unix, windows))]
+        let adjacency_done = std::time::Instant::now();
 
         while let Some(r) = stack.pop() {
             let weight = row_cols[r].len();
@@ -275,6 +299,8 @@ impl SparseBinaryMatrix {
             col_alive[pivot] = false;
             eliminations.push((pivot, rhs));
         }
+        #[cfg(any(unix, windows))]
+        let filtering_done = std::time::Instant::now();
 
         let alive_cols: Vec<usize> = (0..ncols).filter(|&c| col_alive[c]).collect();
         let mut reduced_rows = 0usize;
@@ -307,6 +333,8 @@ impl SparseBinaryMatrix {
         let Ok(reduced) = SparseBinaryMatrix::from_columns(reduced_rows, &reduced_cols) else {
             return Err(MatrixError::MalformedOffsets);
         };
+        #[cfg(any(unix, windows))]
+        let reduced_done = std::time::Instant::now();
         let words = ncols.div_ceil(64);
         let mut out = Vec::new();
         // Cap the nullspace basis at 64 dependencies. Each one has an independent ~1/2 chance of
@@ -314,7 +342,10 @@ impl SparseBinaryMatrix {
         // back-substitution is O(cols²/64) per dependency and there is no reason to compute the
         // hundreds the residual matrix usually admits. (This bound was previously justified by what
         // "block solvers conventionally return"; this crate has no block solver.)
-        for dep in reduced.row_echelon_dependencies(64).iter() {
+        let reduced_dependencies = reduced.row_echelon_dependencies(64);
+        #[cfg(any(unix, windows))]
+        let echelon_done = std::time::Instant::now();
+        for dep in reduced_dependencies.iter() {
             let mut full = vec![0u64; words];
             for (j, &original_col) in alive_cols.iter().enumerate() {
                 if (dep[j / 64] >> (j % 64)) & 1 != 0 {
@@ -332,6 +363,25 @@ impl SparseBinaryMatrix {
             if self.verify_dependency(&full) {
                 out.push(full.into_boxed_slice());
             }
+        }
+        #[cfg(any(unix, windows))]
+        if profile {
+            let done = std::time::Instant::now();
+            eprintln!(
+                "PROFILE la rows={} cols={} nnz={} reduced_rows={} reduced_cols={} reduced_nnz={} \
+                 adjacency={:.3}s filtering={:.3}s rebuild={:.3}s echelon={:.3}s lift_verify={:.3}s",
+                nrows,
+                ncols,
+                self.nonzeros(),
+                reduced.rows(),
+                reduced.columns(),
+                reduced.nonzeros(),
+                (adjacency_done - profile_start).as_secs_f64(),
+                (filtering_done - adjacency_done).as_secs_f64(),
+                (reduced_done - filtering_done).as_secs_f64(),
+                (echelon_done - reduced_done).as_secs_f64(),
+                (done - echelon_done).as_secs_f64(),
+            );
         }
         Ok(DependencySet { vectors: out })
     }

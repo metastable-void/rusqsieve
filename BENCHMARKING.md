@@ -54,15 +54,22 @@ follows:
 | bits | before | after | change |
 |---:|---:|---:|---:|
 | 216 | 5.097 s | 3.266 s | −35.9% |
-| 224 | 6.417 s | 5.340 s | −16.8% |
+| 224 | 6.417 s | 5.222 s | −18.6% |
 | 232 | 11.258 s | 8.107 s | −28.0% |
 | 240 | 14.733 s | 13.629 s | −7.5% |
-| 256 | 38.334 s | 35.279 s | −8.0% |
+| 256 | 38.334 s | 33.923 s | −11.5% |
 
-The first 272-bit case measured 92.36 s; its phase split was 84.80 s through
-sieving and 7.56 s for LA/extraction. Nearby threshold, interval, factor-base,
+Before the monotone-echelon change, the first 272-bit case measured 92.36 s;
+its phase split was 84.80 s through sieving and 7.56 s for LA/extraction. The
+new LA path measures 4.55 s on that same case (−39.8%), while sieve variance
+left total wall time at 91.75 s. Nearby threshold, interval, factor-base,
 data-layout, and dependency-back-substitution experiments did not produce a
 repeatable 272-bit end-to-end win and were not retained.
+
+The 224- and 256-bit “after” values include the later monotone-echelon
+optimization. It reduces LA/extraction itself by 21.8% and 35.2% respectively;
+the smaller matrix improves as well, so no size dispatch is required for that
+change.
 
 On the development host with Node 24.15/V8 and eight workers, the scoped-SIMD build measured 0.72 s,
 5.04 s, and 37.86 s respectively on 2026-07-25. These are factor-verified engineering measurements,

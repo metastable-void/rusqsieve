@@ -90,6 +90,12 @@ Per main-brief item:
   remains the frontier; interval and factor-base sweeps, a dense prime-only
   stream, and bit-sliced dependency back-substitution produced no reliable
   end-to-end win and were removed.
+- LA subphase profiling identified repeated high-zero-word scans in echelon
+  construction rather than filtering as the immediate bottleneck. Monotone row
+  truncation reduced native echelon time 1.625 s → 1.153 s on the fixed
+  256-bit matrix. Browser LA/extraction means fell 35.2% at 256 bits and 21.8%
+  at 224 bits, improving total means to 33.923 s and 5.222 s without a
+  small-matrix regression.
 - All Phase 2 before/after figures, host details, A/B/A/B method, measured
   rejections, and variance qualifications remain in the 0.2.1 changelog and
   were not re-labeled as new 0.3 measurements.
