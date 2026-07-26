@@ -102,6 +102,16 @@ documentation work deferred from 0.2.1.
   On the fixed 272-bit anchor, browser LA/extraction fell from 7.563 s to
   4.550 s (−39.8%); sieving variance masked most of that gain in total wall
   time (92.359 s to 91.749 s).
+- Added a real eight-pivot M4RI panel solver: each completed panel is reduced
+  once, its 256 combinations are built in one flat table, and every remaining
+  row clears eight pivot columns with one table XOR. Differential tests compare
+  its nullspace with the dense and scalar solvers. A 3,200-column crossover
+  and 64 MiB working-set guard retain the scalar path outside the measured
+  range. On the fixed native 256-bit reduced matrix, echelon time fell from
+  1.153 s to 0.592 s. In Chromium, five-case LA/extraction means fell from
+  0.374 s to 0.317 s at 224 bits (−15.2%) and from 2.803 s to 1.769 s at
+  256 bits (−36.9%); total means became 5.176 s and 32.917 s. The fixed
+  272-bit anchor's LA/extraction fell from 4.550 s to 2.788 s (−38.7%).
 - Added GitHub Actions for musl-native debug and release-profile tests, the
   feature matrix, fmt, clippy with warnings denied, both Wasm build paths, the
   C smoke executable, and scheduled slow 192–256-bit corpus coverage.

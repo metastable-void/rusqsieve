@@ -54,22 +54,25 @@ follows:
 | bits | before | after | change |
 |---:|---:|---:|---:|
 | 216 | 5.097 s | 3.266 s | −35.9% |
-| 224 | 6.417 s | 5.222 s | −18.6% |
+| 224 | 6.417 s | 5.176 s | −19.3% |
 | 232 | 11.258 s | 8.107 s | −28.0% |
 | 240 | 14.733 s | 13.629 s | −7.5% |
-| 256 | 38.334 s | 33.923 s | −11.5% |
+| 256 | 38.334 s | 32.917 s | −14.1% |
 
-Before the monotone-echelon change, the first 272-bit case measured 92.36 s;
-its phase split was 84.80 s through sieving and 7.56 s for LA/extraction. The
-new LA path measures 4.55 s on that same case (−39.8%), while sieve variance
-left total wall time at 91.75 s. Nearby threshold, interval, factor-base,
-data-layout, and dependency-back-substitution experiments did not produce a
-repeatable 272-bit end-to-end win and were not retained.
+Before the LA changes, the first 272-bit case measured 92.36 s; its phase split
+was 84.80 s through sieving and 7.56 s for LA/extraction. Monotone echelon
+truncation first reduced LA/extraction to 4.55 s. The retained eight-pivot M4RI
+solver reduces it again to 2.79 s (−63.1% cumulatively), with a measured total
+of 92.07 s. Nearby threshold, interval, factor-base, data-layout, and
+dependency-back-substitution experiments did not produce a repeatable
+272-bit end-to-end win and were not retained.
 
-The 224- and 256-bit “after” values include the later monotone-echelon
-optimization. It reduces LA/extraction itself by 21.8% and 35.2% respectively;
-the smaller matrix improves as well, so no size dispatch is required for that
-change.
+The 224- and 256-bit “after” values include both retained LA optimizations.
+After monotone truncation, M4RI further reduces five-case LA/extraction means
+from 0.374 s to 0.317 s at 224 bits (−15.2%) and from 2.803 s to 1.769 s at
+256 bits (−36.9%). A 3,200-column crossover keeps smaller residuals on scalar
+echelon, and a 64 MiB estimated working-set cap prevents panel tables from
+expanding unboundedly.
 
 On the development host with Node 24.15/V8 and eight workers, the scoped-SIMD build measured 0.72 s,
 5.04 s, and 37.86 s respectively on 2026-07-25. These are factor-verified engineering measurements,

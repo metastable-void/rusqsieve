@@ -209,6 +209,128 @@ impl SparseBinaryMatrix {
         }
     }
 
+    /// Panelized Method of Four Russians echelon construction.
+    ///
+    /// A panel first selects `K` pivots and triangularizes only those pivot
+    /// rows. It then builds the complete table of their `2^K` linear
+    /// combinations once and clears all `K` pivot columns from every remaining
+    /// row with one table XOR. Tables are never rebuilt after a pivot insertion.
+    fn m4ri_dependencies<const K: usize>(&self, limit: usize) -> DependencySet {
+        debug_assert!(K > 0 && K <= 8);
+        let cols = self.columns();
+        if cols == 0 || limit == 0 {
+            return DependencySet::default();
+        }
+        let words = cols.div_ceil(64);
+        let mut rows = Vec::with_capacity(self.rows());
+        for row in 0..self.rows() {
+            let mut dense = vec![0u64; words];
+            let a = self.csr_offsets[row] as usize;
+            let b = self.csr_offsets[row + 1] as usize;
+            for &column in &self.csr_columns[a..b] {
+                dense[column as usize / 64] ^= 1 << (column % 64);
+            }
+            rows.push(dense);
+        }
+
+        let mut basis: Vec<Option<Box<[u64]>>> = vec![None; cols];
+        let mut active = 0usize;
+        let mut next_column = cols;
+        while active < rows.len() && next_column != 0 {
+            let mut panel: Vec<(usize, Vec<u64>)> = Vec::with_capacity(K);
+            while panel.len() < K && next_column != 0 {
+                next_column -= 1;
+                let pivot = next_column;
+                let mut selected = None;
+                for (row, candidate) in rows.iter_mut().enumerate().skip(active) {
+                    for (prior_pivot, prior) in &panel {
+                        if (candidate[prior_pivot / 64] >> (prior_pivot % 64)) & 1 != 0 {
+                            xor(candidate, prior);
+                        }
+                    }
+                    if (candidate[pivot / 64] >> (pivot % 64)) & 1 != 0 {
+                        selected = Some(row);
+                        break;
+                    }
+                }
+                if let Some(row) = selected {
+                    rows.swap(active, row);
+                    panel.push((pivot, rows[active].clone()));
+                    active += 1;
+                }
+            }
+            if panel.is_empty() {
+                continue;
+            }
+
+            // Put the panel in reduced form at its own pivot columns. Selection
+            // already cleared every earlier (higher) pivot; walking backwards
+            // clears the later (lower) ones.
+            for index in (0..panel.len()).rev() {
+                let (earlier, current) = panel.split_at_mut(index);
+                let (pivot, pivot_row) = &current[0];
+                for (_, row) in earlier {
+                    if (row[*pivot / 64] >> (*pivot % 64)) & 1 != 0 {
+                        xor(row, pivot_row);
+                    }
+                }
+            }
+
+            let combinations = 1usize << panel.len();
+            let mut table = vec![0u64; combinations * words];
+            for mask in 1..combinations {
+                let index = mask.trailing_zeros() as usize;
+                let prior = mask & (mask - 1);
+                let (before, after) = table.split_at_mut(mask * words);
+                let combination = &mut after[..words];
+                combination.copy_from_slice(&before[prior * words..(prior + 1) * words]);
+                xor(combination, &panel[index].1);
+            }
+            for row in &mut rows[active..] {
+                let mut mask = 0usize;
+                for (index, (pivot, _)) in panel.iter().enumerate() {
+                    mask |= (((row[pivot / 64] >> (pivot % 64)) & 1) as usize) << index;
+                }
+                if mask != 0 {
+                    xor(row, &table[mask * words..(mask + 1) * words]);
+                }
+            }
+            for (pivot, row) in panel {
+                basis[pivot] = Some(row.into_boxed_slice());
+            }
+        }
+
+        self.dependencies_from_basis(&basis, limit)
+    }
+
+    fn dependencies_from_basis(&self, basis: &[Option<Box<[u64]>>], limit: usize) -> DependencySet {
+        let cols = self.columns();
+        let words = cols.div_ceil(64);
+        let mut dependencies = Vec::new();
+        for free in (0..cols)
+            .filter(|&column| basis[column].is_none())
+            .take(limit)
+        {
+            let mut dependency = vec![0u64; words];
+            dependency[free / 64] |= 1 << (free % 64);
+            for (pivot, equation) in basis.iter().enumerate() {
+                let Some(equation) = equation else {
+                    continue;
+                };
+                let last = pivot / 64;
+                if parity_dot(&equation[..=last], &dependency[..=last]) != 0 {
+                    dependency[last] ^= 1 << (pivot % 64);
+                }
+            }
+            if self.verify_dependency(&dependency) {
+                dependencies.push(dependency.into_boxed_slice());
+            }
+        }
+        DependencySet {
+            vectors: dependencies,
+        }
+    }
+
     /// Nullspace via SPEC §8 filtering — iterative elimination of every row of weight 1 through
     /// `MAX_STRUCTURED_WEIGHT` (6), with Markowitz-style pivot selection to limit fill-in, not merely
     /// the singleton rows an earlier version of this comment described — followed by dense
@@ -342,7 +464,25 @@ impl SparseBinaryMatrix {
         // back-substitution is O(cols²/64) per dependency and there is no reason to compute the
         // hundreds the residual matrix usually admits. (This bound was previously justified by what
         // "block solvers conventionally return"; this crate has no block solver.)
-        let reduced_dependencies = reduced.row_echelon_dependencies(64);
+        const M4RI_MIN_COLUMNS: usize = 3_200;
+        const M4RI_PANEL: usize = 8;
+        const M4RI_MAX_BYTES: usize = 64 * 1024 * 1024;
+        // The panel solver keeps the dense rows, a full-width echelon basis,
+        // and 2^K table rows live. Keep small residuals on the lower-overhead
+        // scalar path and avoid an excessive browser working set on inputs
+        // beyond the range where M4RI was benchmarked.
+        let m4ri_bytes = reduced
+            .rows()
+            .saturating_mul(2)
+            .saturating_add(1 << M4RI_PANEL)
+            .saturating_mul(reduced.columns().div_ceil(64))
+            .saturating_mul(size_of::<u64>());
+        let use_m4ri = reduced.columns() >= M4RI_MIN_COLUMNS && m4ri_bytes <= M4RI_MAX_BYTES;
+        let reduced_dependencies = if use_m4ri {
+            reduced.m4ri_dependencies::<M4RI_PANEL>(64)
+        } else {
+            reduced.row_echelon_dependencies(64)
+        };
         #[cfg(any(unix, windows))]
         let echelon_done = std::time::Instant::now();
         for dep in reduced_dependencies.iter() {
@@ -368,8 +508,9 @@ impl SparseBinaryMatrix {
         if profile {
             let done = std::time::Instant::now();
             eprintln!(
-                "PROFILE la rows={} cols={} nnz={} reduced_rows={} reduced_cols={} reduced_nnz={} \
+                "PROFILE la solver={} rows={} cols={} nnz={} reduced_rows={} reduced_cols={} reduced_nnz={} \
                  adjacency={:.3}s filtering={:.3}s rebuild={:.3}s echelon={:.3}s lift_verify={:.3}s",
+                if use_m4ri { "m4ri-8" } else { "scalar" },
                 nrows,
                 ncols,
                 self.nonzeros(),
@@ -519,8 +660,13 @@ mod tests {
             }
             let dense = m.dense_dependencies();
             let echelon = m.row_echelon_dependencies(64);
+            let m4ri = m.m4ri_dependencies::<8>(64);
             assert_eq!(echelon.len(), dense.len());
+            assert_eq!(m4ri.len(), dense.len());
             for d in echelon.iter() {
+                assert!(m.verify_dependency(d));
+            }
+            for d in m4ri.iter() {
                 assert!(m.verify_dependency(d));
             }
             // cols > rows guarantees a nontrivial nullspace, so both solvers find one.

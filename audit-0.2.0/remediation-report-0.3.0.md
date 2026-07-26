@@ -34,7 +34,7 @@ Per main-brief item:
 | 2.8 `nvar` | Done in 0.2.1 | Cap raised to nine with memory accounting. |
 | 2.9 `choose_a` | Done in 0.2.1 | Quality window, deduplication, hoisted pool, checked conversion. |
 | 2.10 prepare deduplication | Done in 0.2.1 | One preparation path plus translation regression test. |
-| 2.11 linear algebra/browser | Partial | Coordinator Worker, flat sorted filtering structures, allocation reuse, and scalar parity unroll landed. Full CSR compaction, Wasm SIMD back-substitution, and real M4RI did not; implemented M4RI measured 75% slower. |
+| 2.11 linear algebra/browser | Done/partial | Coordinator Worker, flat sorted filtering structures, allocation reuse, scalar parity unroll, monotone row truncation, and a measured eight-pivot M4RI panel solver landed. Full CSR compaction and Wasm SIMD back-substitution remain non-wins. The earlier table-rebuild-per-pivot imitation was 75% slower and was replaced, not renamed. |
 | 2.12 inner loop | Done as directed | Winning biased scan/wrapping writes retained; unreachable blocked kernel deleted; small-L2 remeasurement remains unavailable. |
 
 ## Phase 3
@@ -96,6 +96,14 @@ Per main-brief item:
   256-bit matrix. Browser LA/extraction means fell 35.2% at 256 bits and 21.8%
   at 224 bits, improving total means to 33.923 s and 5.222 s without a
   small-matrix regression.
+- A fixed-panel M4RI implementation then reduced each panel once and reused a
+  flat 256-combination table across the remaining rows. On the fixed native
+  256-bit matrix, echelon time fell again from 1.153 s to 0.592 s. Chromium
+  five-case LA/extraction means fell from 0.374 s to 0.317 s at 224 bits and
+  from 2.803 s to 1.769 s at 256 bits; corresponding total means are 5.176 s
+  and 32.917 s. The fixed 272-bit anchor fell from 4.550 s to 2.788 s for
+  LA/extraction. A measured crossover and memory guard preserve scalar
+  elimination for smaller or oversized residuals.
 - All Phase 2 before/after figures, host details, A/B/A/B method, measured
   rejections, and variance qualifications remain in the 0.2.1 changelog and
   were not re-labeled as new 0.3 measurements.
