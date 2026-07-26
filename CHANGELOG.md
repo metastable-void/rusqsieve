@@ -91,6 +91,10 @@ documentation work deferred from 0.2.1.
   and 272-bit balanced-semiprime anchors. During sieving above 256 bits it now
   shows sieve-local elapsed time and an approximate ETA calibrated for the
   accelerating partial-cycle relation yield.
+- Replaced the demo's single-line number field with a wrapping, self-expanding
+  textarea. IME composition is never rewritten or intercepted; committed line
+  breaks are rejected, while blur and factorization start normalize CJK
+  full-width digits and remove Unicode whitespace.
 - Rejected several measured non-wins instead of retaining speculative
   optimization code: a dense prime-only hot stream regressed the 240-bit corpus
   mean by 0.5%; 64-way bit-sliced dependency back-substitution left the 272-bit
@@ -123,9 +127,13 @@ documentation work deferred from 0.2.1.
   `(700k,262144,−4)` instead of `(500k,327680,−4)` at 272 bits
   (105.110 s → 94.880 s). Re-sweeps at 216, 232, and 240 bits produced
   no corpus win and were not retained.
-- Added GitHub Actions for musl-native debug and release-profile tests, the
+- Added GitHub Actions for host-native debug and release-profile tests, the
   feature matrix, fmt, clippy with warnings denied, both Wasm build paths, the
   C smoke executable, and scheduled slow 192–256-bit corpus coverage.
+- Moved CI's native and C smoke jobs back to the Ubuntu GNU host target. The
+  prior musl C link mixed `musl-gcc` with Ubuntu's GNU `libgcc_eh.a`, whose
+  `_dl_find_object` dependency cannot be satisfied by musl. GNU and musl
+  release packaging remain unchanged.
 - Added an executable documentation audit: every `SPEC §` source citation must
   resolve to a real heading and source comments may not name absent Markdown
   files.

@@ -11,28 +11,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install musl target
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
       - run: cargo fmt --check
-      - run: cargo clippy --locked --target x86_64-unknown-linux-musl --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --target x86_64-unknown-linux-musl
-      - run: cargo test --locked --target x86_64-unknown-linux-musl --no-default-features
-      - run: cargo test --locked --target x86_64-unknown-linux-musl --features cli
-      - run: cargo test --locked --target x86_64-unknown-linux-musl --profile release-test
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --no-default-features
+      - run: cargo test --locked --features cli
+      - run: cargo test --locked --profile release-test
       - name: Verify documentation references
         run: |
           rustc tools/audit-doc-links.rs -o /tmp/rusqsieve-audit-doc-links
           /tmp/rusqsieve-audit-doc-links
       - name: Compile and run the C ABI smoke test
-        run: |
-          cargo build --locked --release --target x86_64-unknown-linux-musl
-          musl-gcc -std=c11 -Wall -Wextra -Werror -I. tests/c_api_smoke.c \
-            target/x86_64-unknown-linux-musl/release/librusqsieve.a \
-            -lpthread -ldl -lm -o /tmp/rusqsieve-c-smoke
-          /tmp/rusqsieve-c-smoke
+        run: make c-api-smoke
 
   wasm:
     runs-on: ubuntu-latest
@@ -47,8 +37,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-      - run: cargo test --locked --target x86_64-unknown-linux-musl --profile release-test --test factorization -- --ignored
+      - run: cargo test --locked --profile release-test --test factorization -- --ignored

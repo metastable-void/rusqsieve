@@ -27,13 +27,21 @@
       <section class="panel">
         <label for="input">Number to factor</label>
         <div class="entry">
-          <input
-            id="input"
-            inputmode="numeric"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="e.g. 1256983314983137644553747197792065202513411738941"
-          />
+          <div class="input-shell">
+            <textarea
+              id="input"
+              class="number-input"
+              inputmode="numeric"
+              enterkeyhint="go"
+              autocomplete="off"
+              spellcheck="false"
+              aria-multiline="false"
+              rows="1"
+              wrap="soft"
+              placeholder="e.g. 1256983314983137644553747197792065202513411738941"
+            ></textarea>
+            <div id="input-mirror" class="input-mirror" aria-hidden="true"></div>
+          </div>
           <button id="go" disabled>Factor</button>
         </div>
         <p id="input-info" class="input-info"></p>

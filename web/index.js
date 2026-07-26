@@ -13,6 +13,7 @@ const MAX_FAMILIES = 2_000_000;
 
 const els = {
   input: document.getElementById("input"),
+  inputMirror: document.getElementById("input-mirror"),
   inputInfo: document.getElementById("input-info"),
   go: document.getElementById("go"),
   bar: document.getElementById("bar"),
@@ -225,6 +226,10 @@ const PHASE_TEXT = {
   linalg: () => `Linear algebra over GF(2) — extracting a factor…`,
 };
 const digits = (n) => n.toString().length;
+const normalizeNumberText = (text) =>
+  text
+    .replace(/[０-９]/gu, (digit) => String(digit.codePointAt(0) - 0xff10))
+    .replace(/[\p{White_Space}\uFEFF]/gu, "");
 const formatDuration = (seconds) => {
   const rounded = Math.max(0, Math.round(seconds));
   if (rounded < 60) return `${rounded}s`;
@@ -284,7 +289,7 @@ function render(grouped, original, seconds) {
 
 // Live "N digits · M bits" readout for whatever is currently in the input box.
 function updateInputInfo() {
-  const text = els.input.value.trim();
+  const text = normalizeNumberText(els.input.value);
   if (/^\d+$/.test(text) && BigInt(text) > 0n) {
     const N = BigInt(text);
     els.inputInfo.textContent = `${text.length} digit${text.length === 1 ? "" : "s"} · ${bitLength(N)} bits`;
@@ -293,8 +298,28 @@ function updateInputInfo() {
   }
 }
 
+function resizeNumberInput() {
+  // The mirror participates in layout while the textarea overlays it. Updating
+  // the mirror, rather than the control's value, cannot disturb IME state.
+  els.inputMirror.textContent = `${els.input.value}\u200b`;
+}
+
+function normalizeNumberInput() {
+  const normalized = normalizeNumberText(els.input.value);
+  if (normalized !== els.input.value) els.input.value = normalized;
+  resizeNumberInput();
+  updateInputInfo();
+  return normalized;
+}
+
+function insertAtNumberSelection(text) {
+  els.input.setRangeText(text, els.input.selectionStart, els.input.selectionEnd, "end");
+  resizeNumberInput();
+  updateInputInfo();
+}
+
 async function run() {
-  const text = els.input.value.trim();
+  const text = normalizeNumberInput();
   if (!/^\d+$/.test(text)) {
     els.status.textContent = "Enter a positive whole number.";
     return;
@@ -340,9 +365,33 @@ function setBar(fraction, indeterminate) {
 
 els.go.addEventListener("click", run);
 els.input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !els.go.disabled) run();
+  // Enter confirms many IME candidates. Never intercept it while composition
+  // is active (keyCode 229 covers older engines that omit isComposing).
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === "Enter") {
+    e.preventDefault();
+    if (!els.go.disabled) run();
+  }
 });
-els.input.addEventListener("input", updateInputInfo);
+els.input.addEventListener("beforeinput", (e) => {
+  if (e.isComposing) return;
+  const lineAction = e.inputType === "insertLineBreak" || e.inputType === "insertParagraph";
+  const hasLine = typeof e.data === "string" && /[\n\r\u2028\u2029]/u.test(e.data);
+  if (!lineAction && !hasLine) return;
+  e.preventDefault();
+  if (hasLine) insertAtNumberSelection(e.data.replace(/[\n\r\u2028\u2029]/gu, ""));
+});
+els.input.addEventListener("paste", (e) => {
+  const pasted = e.clipboardData?.getData("text");
+  if (pasted == null || !/[\n\r\u2028\u2029]/u.test(pasted)) return;
+  e.preventDefault();
+  insertAtNumberSelection(pasted.replace(/[\n\r\u2028\u2029]/gu, ""));
+});
+els.input.addEventListener("input", () => {
+  resizeNumberInput();
+  updateInputInfo();
+});
+els.input.addEventListener("blur", normalizeNumberInput);
 
 // RSA-style semiprime generator (128–384 bits, in steps of 16).
 els.rsaBits.addEventListener("input", () => {
@@ -357,6 +406,7 @@ els.rsaGen.addEventListener("click", () => {
   requestAnimationFrame(() => {
     try {
       els.input.value = rsaNumber(bits).toString();
+      resizeNumberInput();
       updateInputInfo();
       els.input.focus();
     } catch (e) {
@@ -370,6 +420,7 @@ els.rsaGen.addEventListener("click", () => {
 
 els.go.disabled = true;
 els.status.textContent = "Loading WebAssembly…";
+resizeNumberInput();
 boot().catch((e) => {
   els.status.textContent = "Failed to load: " + (e?.message || e);
 });

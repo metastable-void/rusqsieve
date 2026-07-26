@@ -72,9 +72,16 @@ label {
 }
 .entry {
   display: flex;
+  align-items: flex-start;
   gap: 0.6rem;
 }
-input {
+.input-shell {
+  display: grid;
+  flex: 1 1 0;
+  min-width: 0;
+}
+input,
+textarea {
   flex: 1;
   min-width: 0;
   font-family: var(--mono);
@@ -85,9 +92,35 @@ input {
   background: var(--bg);
   color: var(--ink);
 }
-input:focus {
+input:focus,
+textarea:focus {
   outline: 2px solid var(--accent);
   border-color: transparent;
+}
+.number-input,
+.input-mirror {
+  grid-area: 1 / 1;
+  font-family: var(--mono);
+  font-size: 1rem;
+  line-height: 1.55;
+  min-height: calc(1.55em + 1.4rem + 2px);
+  overflow-wrap: anywhere;
+  padding: 0.7rem 0.8rem;
+  white-space: pre-wrap;
+  width: 100%;
+  word-break: break-all;
+}
+.number-input {
+  height: 100%;
+  max-height: none;
+  overflow: hidden;
+  resize: none;
+}
+.input-mirror {
+  border: 1px solid transparent;
+  color: transparent;
+  pointer-events: none;
+  visibility: hidden;
 }
 button {
   font: inherit;
