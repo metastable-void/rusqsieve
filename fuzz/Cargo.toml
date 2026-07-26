@@ -1,0 +1,36 @@
+[package]
+name = "rusqsieve-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusqsieve = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "worker_packet"
+path = "fuzz_targets/worker_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decimal"
+path = "fuzz_targets/decimal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "c_api"
+path = "fuzz_targets/c_api.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

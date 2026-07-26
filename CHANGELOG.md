@@ -1,5 +1,123 @@
 # Changelog
 
+## 0.3.0 — 2026-07-26
+
+Breaking minor release for the API, environment, dead-code, safety, CI, and
+documentation work deferred from 0.2.1.
+
+### Configuration and supported path
+
+- The library no longer reads `RUSQSIEVE_*` environment variables. All
+  numerical tuning is owned by `FactorConfig`; only `qs-factor` maps the
+  benchmark environment into a doc-hidden tuning constructor. Relation targets
+  are clamped above the dependency threshold rather than accepting the old
+  failure-inducing 50% setting.
+- `FactorConfig` now contains only controls the optimized engine honors:
+  parallelism, progress cadence, an optional deterministic witness seed, and
+  internal benchmark tuning. The silently ignored reference-QS, resource-limit,
+  primality, trial-division, and small-factor fields were removed.
+- Every `Natural<P>` value through 512 significant bits uses the optimized SIQS
+  engine, including `P > 16`. Wider values consistently return
+  `FactorError::InputTooLarge`; the dramatically slower and uncancellable
+  single-polynomial fallback was deleted.
+- Seeded Miller–Rabin witnesses use ChaCha8 and full-width rejection sampling
+  over `[2, n−2]`. No round can be silently consumed by a zero base. Equal
+  seeds reproduce the same stream on native and Wasm; the default remains
+  deterministic and Baillie–PSW remains the primary primality safeguard.
+
+### Removed misleading and unreachable surfaces
+
+- Deleted the public-in-private-module `Montgomery` façade and its
+  non-Montgomery differential test. The old test only asserted ordinary
+  `(a·b) mod m` semantics and could not detect the missing Montgomery domain.
+- Deleted the fake `BlockLanczos` protocol, `F2BlockVector`, never-used sparse
+  matrix multiply jobs/kernels, false identity `provenance` accessor,
+  `MatrixSolver`/`MatrixConfig`, `extended_gcd` result without coefficients,
+  always-zero work metrics, `CombinedRelation`, and the entire unreachable
+  `work` module.
+- Deleted the synchronous `FactorSession` state-machine stub and every
+  `qs_session_*`/worker-import stub export. The active coordinator/worker Wasm
+  protocol remains; the raw Wasm ABI is now version 2.
+- Reduced `qs` to what the optimized engine actually consumes: factor-base
+  construction and tier parameters. The segmented `x²−N` reference sieve and
+  its SIQS-claiming names are gone.
+- Consolidated deterministic `u64` Miller–Rabin, modular exponentiation, modular
+  multiplication, and xorshift into `u64math`, retaining the documented
+  Jaeschke/Sinclair witness provenance.
+- `engine` wire serialization, dependency extraction, and SIQS
+  self-initialization were split into focused submodules. The larger suggested
+  engine-kernel/relation and `natural` pure-move splits remain deferred because
+  combining them with this release's logic changes would make review harder.
+
+### Public API and ABI hardening
+
+- Removed inert Cargo features and the non-additive
+  `limit-to-512-bits` feature. `Natural`'s default identity is fixed at
+  `Natural<16>`. The remaining `cli`, `wasm-simd128`, and `fuzzing` features
+  each gate real code.
+- Added `#[non_exhaustive]` where public enums need room to grow; made parse and
+  buffer error details accessor-based; added the requested `#[must_use]`
+  coverage and `TryFrom<Natural<P>> for u64`.
+- `PrimeFactors` is no longer publicly default-constructible but unpopulatable.
+  Its distinct and expanded iterators are named public types, and
+  `IntoIterator for &PrimeFactors` supports ordinary `for` loops.
+- Release libraries use unwinding, so the C ABI's panic-to-internal-error
+  contract is live. Explicit C and Rust worker counts are capped at 256.
+- The C ABI is version 2 and adds `rusqsieve_abi_version`,
+  `rusqsieve_strerror`, enum-typed statuses, progress/cancellation, and a
+  cancellation status. The C module is visible in rustdoc with explicit
+  safety contracts.
+- Wasm exports that consume caller pointers are `unsafe extern "C"` internally;
+  input is copied after checked linear-memory bounds rather than assigned a
+  fabricated `'static` lifetime. Unsafe allowances are scoped to the raw Wasm
+  boundary and the SIMD kernel.
+- Worker relation packets encode only significant root bytes instead of
+  padding every root to 128 bytes. This wire change is covered by the Wasm ABI
+  bump; no speedup is claimed.
+
+### Tests, CI, and documentation
+
+- Added GitHub Actions for musl-native debug and release-profile tests, the
+  feature matrix, fmt, clippy with warnings denied, both Wasm build paths, the
+  C smoke executable, and scheduled slow 192–256-bit corpus coverage.
+- Added an executable documentation audit: every `SPEC §` source citation must
+  resolve to a real heading and source comments may not name absent Markdown
+  files.
+- Extended differential arithmetic tests to square roots, perfect powers,
+  decimal formatting/parsing, endian serialization (including tolerated zero
+  padding), and shifts at/above word and capacity boundaries.
+- Added public-path tests for 2 and 3, a 127-bit prime square, recursive
+  three-prime input, a large power of two, and `Natural<17>` routing through
+  the optimized engine.
+- Added hostile C tests for non-UTF-8, embedded NUL, one million digits,
+  `SIZE_MAX` threads, independent concurrent result objects, ABI/status
+  helpers, and progress cancellation. `make test` now compiles and runs the C
+  smoke program.
+- Added cargo-fuzz targets for worker-packet deserialization, decimal parsing,
+  and the native C boundary.
+- Reconciled the Makefile and release builder so both SIMD artifacts pass
+  `-C target-feature=+simd128`. Linux release targets cover both GNU and musl.
+- Updated README, SPEC, rustdoc, C header, feature descriptions, supported
+  widths, module map, solver/provenance description, ABI exports, panic
+  behavior, SIMD build claims, side-channel warnings, and release targets to
+  describe the shipped code.
+
+### Deliberately not implemented
+
+- ECM is not included. Addendum A explicitly says to abandon ECM when the fake
+  `Montgomery` type is deleted rather than replaced by real CIOS arithmetic;
+  division-based modular multiplication makes ECM harmful at any useful
+  budget. Pollard p−1 was likewise not inserted as unconditional overhead
+  without the required arithmetic and A/B measurements. The bounded
+  Pollard–Brent-to-SIQS ladder remains.
+- No optional serde dependency was added. The active worker wire is private,
+  versioned, fuzzed, and substantially smaller; adding a general serialization
+  contract was only a “consider” item and would expand the public format
+  surface without serving the current raw-Wasm protocol.
+- No new performance claim is made for 0.3.0. Algorithmic hot paths are
+  unchanged apart from owned tuning access and compact packets; the extensive
+  0.2.1 interleaved measurements and rejected changes remain recorded below.
+
 ## 0.2.1 — 2026-07-25
 
 Patch release: correctness fixes and internal-only performance/resource work.

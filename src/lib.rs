@@ -1,9 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
-#![cfg_attr(
-    not(all(target_arch = "wasm32", target_os = "unknown")),
-    deny(unsafe_code)
-)]
+#![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 // Internal kernels are intentionally compiled in different combinations by
@@ -18,15 +15,12 @@ mod progress;
 mod qs;
 
 #[allow(dead_code)]
+mod engine;
+#[allow(dead_code)]
 mod factor;
 mod factors;
 #[allow(dead_code)]
 mod primality;
-#[allow(dead_code)]
-mod work;
-
-#[allow(dead_code)]
-mod engine;
 
 #[cfg(any(unix, windows))]
 mod native;
@@ -35,21 +29,33 @@ mod native;
 // native crate remains under `deny(unsafe_code)`.
 #[cfg(any(unix, windows))]
 #[allow(unsafe_code)]
-mod capi;
+pub mod capi;
 
 mod smallfactor;
+mod u64math;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[allow(unsafe_code)]
 mod wasm;
 
 pub use factor::{FactorConfig, FactorError, Parallelism, ProgressAction, ResourceLimitKind};
-pub use factors::PrimeFactors;
-pub use natural::{BufferTooSmall, CapacityError, Natural, ParseNaturalError};
+pub use factors::{ExpandedPrimeFactors, PrimeFactorIter, PrimeFactors};
+pub use natural::{BufferTooSmall, CapacityError, InvalidDigit, Natural, ParseNaturalError};
 pub use progress::{ProgressAmount, ProgressPhase, ProgressSnapshot, ProgressTotal, ProgressUnit};
 
-pub(crate) use factor::{AdvanceOutcome, FactorSession, LocalWorkBudget};
+/// Validate a serialized worker packet without executing it.
+///
+/// This hook exists only for the `fuzzing` feature and is not a stable wire
+/// format API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_validate_worker_packet(bytes: &[u8]) -> bool {
+    engine::validate_worker_packet(bytes)
+}
+
 pub(crate) use natural::{PARTS, jacobi_u64, legendre_u32, tonelli_shanks_u32};
-pub(crate) use primality::{PrimalityConfig, is_probable_prime};
+#[cfg(any(unix, windows))]
+pub(crate) use primality::{PrimalityConfig, WitnessPolicy, is_probable_prime};
 
 #[cfg(any(unix, windows))]
 pub use native::{factor, factor_with, factor_with_progress};

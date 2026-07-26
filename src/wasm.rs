@@ -1,10 +1,10 @@
 //! Raw, versioned C ABI for `wasm32-unknown-unknown`.
 use crate::engine::{self, EngineContext, EngineJob, EngineSession};
-use crate::{FactorConfig, FactorSession, LocalWorkBudget, Natural, PARTS};
+use crate::{Natural, PARTS};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const MAX_PACKET: usize = 16 * 1024 * 1024;
 type WasmNatural = Natural;
 struct Slot<T> {
@@ -69,20 +69,23 @@ impl<T> Registry<T> {
         }
     }
 }
-thread_local! {static SESSIONS:RefCell<Registry<FactorSession<PARTS>>>=const{RefCell::new(Registry::new())};static BUFFERS:RefCell<Registry<Box<[u8]>>>=const{RefCell::new(Registry::new())};
+thread_local! {static BUFFERS:RefCell<Registry<Box<[u8]>>>=const{RefCell::new(Registry::new())};
     static COORDS: RefCell<Registry<EngineSession>> = const { RefCell::new(Registry::new()) };
     static WORKERS: RefCell<Registry<EngineContext>> = const { RefCell::new(Registry::new()) };
 }
 fn memory_bytes() -> usize {
     core::arch::wasm32::memory_size(0) * 65536
 }
-fn input(pointer: u32, length: u32) -> Option<&'static [u8]> {
+fn input(pointer: u32, length: u32) -> Option<Vec<u8>> {
     let p = pointer as usize;
     let n = length as usize;
     if n == 0 || n > MAX_PACKET || p.checked_add(n)? > memory_bytes() {
         return None;
     }
-    Some(unsafe { core::slice::from_raw_parts(p as *const u8, n) })
+    // SAFETY: the explicit linear-memory bound check proves that this range is
+    // readable. Copying immediately prevents later registry mutations from
+    // invalidating or aliasing a borrowed caller buffer.
+    Some(unsafe { core::slice::from_raw_parts(p as *const u8, n) }.to_vec())
 }
 fn packet(kind: u16, payload: &[u8]) -> u32 {
     if payload.len() > MAX_PACKET {
@@ -113,11 +116,13 @@ pub extern "C" fn qs_alloc(size: u32, align: u32) -> u32 {
     p as u32
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn qs_dealloc(pointer: u32, size: u32, align: u32) {
+pub unsafe extern "C" fn qs_dealloc(pointer: u32, size: u32, align: u32) {
     let Ok(layout) = Layout::from_size_align(size as usize, align as usize) else {
         return;
     };
     if size != 0 && pointer != 0 {
+        // SAFETY: the caller must pass the same pointer and layout previously
+        // returned by `qs_alloc`, and must not have freed it already.
         unsafe { dealloc(pointer as *mut u8, layout) }
     }
 }
@@ -138,119 +143,6 @@ pub extern "C" fn qs_buffer_length(handle: u32) -> u32 {
 pub extern "C" fn qs_buffer_free(handle: u32) {
     BUFFERS.with(|r| r.borrow_mut().remove(handle))
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_new(
-    input_pointer: u32,
-    input_length: u32,
-    _config_pointer: u32,
-    _config_length: u32,
-) -> u32 {
-    let Some(bytes) = input(input_pointer, input_length) else {
-        return 0;
-    };
-    let Ok(text) = core::str::from_utf8(bytes) else {
-        return 0;
-    };
-    let Ok(n) = WasmNatural::from_decimal(text) else {
-        return 0;
-    };
-    let Ok(s) = FactorSession::new(n, FactorConfig::default()) else {
-        return 0;
-    };
-    SESSIONS.with(|r| r.borrow_mut().insert(s))
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_free(session: u32) {
-    SESSIONS.with(|r| r.borrow_mut().remove(session))
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_phase(session: u32) -> u32 {
-    SESSIONS.with(|r| {
-        r.borrow()
-            .get(session)
-            .map_or(u32::MAX, |s| s.phase() as u32)
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_advance_local(session: u32, _p: u32, _n: u32) -> i32 {
-    SESSIONS.with(|r| match r.borrow_mut().get_mut(session) {
-        Some(s) => match s.advance_local(LocalWorkBudget::default()) {
-            Ok(crate::AdvanceOutcome::Complete) => 1,
-            Ok(_) => 0,
-            Err(_) => -1,
-        },
-        None => -2,
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_export_context(_session: u32) -> u32 {
-    packet(2, &[])
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_take_jobs(_session: u32, _maximum_jobs: u32) -> u32 {
-    packet(3, &[])
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_submit(_session: u32, _pointer: u32, _length: u32) -> i32 {
-    -1
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_take_factors(session: u32) -> u32 {
-    SESSIONS.with(|r| {
-        let mut r = r.borrow_mut();
-        let Some(i) = ((session & 0xffff).checked_sub(1)).map(|x| x as usize) else {
-            return 0;
-        };
-        let Some(slot) = r.slots.get_mut(i) else {
-            return 0;
-        };
-        if slot.generation != (session >> 16) as u16 {
-            return 0;
-        }
-        let Some(s) = slot.value.take() else { return 0 };
-        match s.take_factors() {
-            Ok(fs) => {
-                let mut text = String::new();
-                for (p, e) in fs.iter() {
-                    text.push_str(&p.to_string());
-                    text.push(':');
-                    text.push_str(&e.get().to_string());
-                    text.push('\n')
-                }
-                packet(4, text.as_bytes())
-            }
-            Err(_) => 0,
-        }
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_error(_session: u32) -> u32 {
-    packet(5, &[])
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_session_progress(session: u32) -> u32 {
-    SESSIONS.with(|r| {
-        r.borrow().get(session).map_or(0, |s| {
-            let p = s.progress();
-            let mut v = Vec::new();
-            v.extend_from_slice(&p.revision.to_le_bytes());
-            v.extend_from_slice(&(p.phase as u32).to_le_bytes());
-            v.extend_from_slice(&p.amount.completed.to_le_bytes());
-            packet(6, &v)
-        })
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_worker_context_import(_pointer: u32, _length: u32) -> u32 {
-    0
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_worker_context_free(_context: u32) {}
-#[unsafe(no_mangle)]
-pub extern "C" fn qs_worker_execute(_context: u32, _pointer: u32, _length: u32) -> u32 {
-    0
-}
-
 // ---------------------------------------------------------------------------
 // Parallel SIQS protocol (engine-based) for the Web-Worker demo.
 //
@@ -262,17 +154,17 @@ pub extern "C" fn qs_worker_execute(_context: u32, _pointer: u32, _length: u32) 
 
 fn parse_decimal(pointer: u32, length: u32) -> Option<WasmNatural> {
     let bytes = input(pointer, length)?;
-    let text = core::str::from_utf8(bytes).ok()?;
+    let text = core::str::from_utf8(&bytes).ok()?;
     WasmNatural::from_decimal(text).ok()
 }
 
 /// Prepare a deterministic worker sieve context for the composite `n`.
 #[unsafe(no_mangle)]
-pub extern "C" fn qs_worker_prepare(n_pointer: u32, n_length: u32) -> u32 {
+pub unsafe extern "C" fn qs_worker_prepare(n_pointer: u32, n_length: u32) -> u32 {
     let Some(n) = parse_decimal(n_pointer, n_length) else {
         return 0;
     };
-    let Ok(ctx) = engine::prepare(n) else {
+    let Ok(ctx) = engine::prepare(n, &crate::factor::FactorTuning::default()) else {
         return 0;
     };
     WORKERS.with(|r| r.borrow_mut().insert(ctx))
@@ -307,11 +199,11 @@ pub extern "C" fn qs_worker_free(context: u32) {
 
 /// Create a coordinator collecting relations for the composite `n`.
 #[unsafe(no_mangle)]
-pub extern "C" fn qs_coord_new(n_pointer: u32, n_length: u32) -> u32 {
+pub unsafe extern "C" fn qs_coord_new(n_pointer: u32, n_length: u32) -> u32 {
     let Some(n) = parse_decimal(n_pointer, n_length) else {
         return 0;
     };
-    let Ok(ctx) = engine::prepare(n) else {
+    let Ok(ctx) = engine::prepare(n, &crate::factor::FactorTuning::default()) else {
         return 0;
     };
     COORDS.with(|r| r.borrow_mut().insert(EngineSession::new(ctx)))
@@ -328,7 +220,7 @@ pub extern "C" fn qs_coord_relations(session: u32) -> u32 {
 }
 /// Ingest a worker's `qs_worker_sieve` payload; returns the new relation count.
 #[unsafe(no_mangle)]
-pub extern "C" fn qs_coord_submit(session: u32, pointer: u32, length: u32) -> u32 {
+pub unsafe extern "C" fn qs_coord_submit(session: u32, pointer: u32, length: u32) -> u32 {
     let Some(bytes) = input(pointer, length) else {
         return 0;
     };

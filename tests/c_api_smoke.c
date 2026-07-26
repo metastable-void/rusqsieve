@@ -4,9 +4,21 @@
 #include <stddef.h>
 #include <string.h>
 
+static int cancel_immediately(
+    const struct rusqsieve_progress *progress,
+    void *context
+) {
+    unsigned *calls = context;
+    assert(progress != NULL);
+    ++*calls;
+    return 1;
+}
+
 int main(void) {
     rusqsieve_factors *factors = rusqsieve_factors_new();
     assert(factors != NULL);
+    assert(rusqsieve_abi_version() == 2);
+    assert(strcmp(rusqsieve_strerror(RUSQSIEVE_OK), "success") == 0);
 
     assert(rusqsieve_factor("360", 1, factors) == RUSQSIEVE_OK);
     assert(rusqsieve_factors_len(factors) == 6);
@@ -25,6 +37,13 @@ int main(void) {
 
     assert(rusqsieve_factor("invalid", 1, factors) ==
            RUSQSIEVE_INVALID_DECIMAL);
+    assert(rusqsieve_factors_len(factors) == 0);
+
+    unsigned calls = 0;
+    assert(rusqsieve_factor_with_progress(
+               "1000036000099", 1, factors, cancel_immediately, &calls) ==
+           RUSQSIEVE_CANCELLED);
+    assert(calls == 1);
     assert(rusqsieve_factors_len(factors) == 0);
     rusqsieve_factors_free(factors);
     rusqsieve_factors_free(NULL);

@@ -80,6 +80,7 @@ impl ProgressAmount {
     ///
     /// Estimated totals can change, so this value is informational and is not
     /// guaranteed to increase monotonically.
+    #[must_use]
     pub fn fraction(self) -> Option<f64> {
         match self.total {
             ProgressTotal::Exact(0) | ProgressTotal::Estimated(0) | ProgressTotal::Unknown => None,
@@ -92,6 +93,7 @@ impl ProgressAmount {
 
 /// Availability and confidence of a progress total.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ProgressTotal {
     /// An exact total.
     Exact(u64),
@@ -109,9 +111,6 @@ pub enum ProgressUnit {
     Candidates,
     /// Prime numbers examined or accepted.
     Primes,
-    /// Polynomials or sieve segments processed. The SIQS engine does not emit this unit; only
-    /// the reference `x² − N` path, whose "polynomials" are advancing segments of one polynomial.
-    Polynomials,
     /// Sieve positions processed.
     SievePositions,
     /// Relations collected.
@@ -140,18 +139,10 @@ pub enum ProgressPhase {
     BuildingFactorBase,
     /// Collecting smooth and partial relations.
     Sieving,
-    /// Combining partial relations.
-    CombiningRelations,
-    /// Constructing the sparse parity matrix.
-    BuildingMatrix,
-    /// Reducing the sparse matrix before solving.
-    FilteringMatrix,
     /// Solving for linear dependencies.
     LinearAlgebra,
     /// Recovering a nontrivial divisor from dependencies.
     ExtractingFactor,
-    /// Testing candidate factors for probable primality.
-    PrimalityTesting,
     /// Factorization completed successfully.
     Complete,
 }

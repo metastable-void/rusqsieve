@@ -7,26 +7,48 @@ use core::str::FromStr;
 
 /// A decimal parsing failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ParseNaturalError {
     /// The input contained no digits.
     Empty,
     /// The input contained a byte outside `0` through `9`.
-    InvalidDigit {
-        /// Zero-based byte offset of the invalid byte.
-        index: usize,
-        /// Invalid byte value.
-        byte: u8,
-    },
+    InvalidDigit(InvalidDigit),
     /// The value exceeded the selected fixed capacity.
     Overflow,
+}
+
+/// Details about an invalid byte in a decimal integer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct InvalidDigit {
+    index: usize,
+    byte: u8,
+}
+
+impl InvalidDigit {
+    /// Returns the zero-based byte offset.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.index
+    }
+
+    /// Returns the invalid byte value.
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        self.byte
+    }
 }
 
 impl fmt::Display for ParseNaturalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("empty integer"),
-            Self::InvalidDigit { index, byte } => {
-                write!(f, "invalid decimal byte {byte:#x} at index {index}")
+            Self::InvalidDigit(detail) => {
+                write!(
+                    f,
+                    "invalid decimal byte {:#x} at index {}",
+                    detail.byte, detail.index
+                )
             }
             Self::Overflow => f.write_str("integer exceeds Natural capacity"),
         }
@@ -46,11 +68,23 @@ impl std::error::Error for CapacityError {}
 
 /// A serialization destination was too small.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct BufferTooSmall {
-    /// Minimum number of bytes needed.
-    pub required: usize,
-    /// Number of bytes supplied by the caller.
-    pub available: usize,
+    required: usize,
+    available: usize,
+}
+impl BufferTooSmall {
+    /// Returns the minimum number of bytes needed.
+    #[must_use]
+    pub const fn required(self) -> usize {
+        self.required
+    }
+
+    /// Returns the number of bytes supplied by the caller.
+    #[must_use]
+    pub const fn available(self) -> usize {
+        self.available
+    }
 }
 impl fmt::Display for BufferTooSmall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -63,22 +97,17 @@ impl fmt::Display for BufferTooSmall {
 }
 impl std::error::Error for BufferTooSmall {}
 
-/// The default limb capacity of [`Natural`] and the width the SIQS engine runs
-/// at. 16 limbs (1024 bits) by default; 8 limbs (512 bits) when the
-/// `limit-to-512-bits` feature is enabled. The smaller width only shrinks each
-/// value's storage and the cost of the fixed-capacity (`0..P`) operations; it
-/// does not reduce the sieve's dominant arithmetic, which scales with an
-/// operand's significant limbs rather than its capacity.
-#[cfg(not(feature = "limit-to-512-bits"))]
+/// The fixed default limb capacity of [`Natural`]. The SIQS entry points accept
+/// values through 512 bits while the integer type retains 1024 bits of storage.
 pub const PARTS: usize = 16;
-#[cfg(feature = "limit-to-512-bits")]
-pub const PARTS: usize = 8;
 
 /// A fixed-capacity unsigned integer.
 ///
 /// `PARTS_64` is the number of 64-bit limbs. Storage is inline and never
 /// allocated. Arithmetic operators wrap modulo `2^(64 * PARTS_64)`; use the
 /// `checked_*` methods when overflow must be rejected.
+///
+/// Arithmetic is variable-time and must not be used for secret values.
 #[repr(transparent)]
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct Natural<const PARTS_64: usize = PARTS> {
@@ -111,6 +140,7 @@ impl<const P: usize> Natural<P> {
         &self.parts
     }
     /// The value as a `u64` if it fits (all limbs above the lowest are zero).
+    #[must_use]
     pub fn to_u64(&self) -> Option<u64> {
         if P == 0 {
             return Some(0);
@@ -140,6 +170,7 @@ impl<const P: usize> Natural<P> {
         !self.is_even()
     }
     /// Returns the number of significant bits, or zero for zero.
+    #[must_use]
     pub fn bit_len(&self) -> usize {
         self.parts.iter().rposition(|&x| x != 0).map_or(0, |i| {
             i * 64 + (64 - self.parts[i].leading_zeros() as usize)
@@ -154,6 +185,7 @@ impl<const P: usize> Natural<P> {
             })
     }
     /// Tests a bit, returning `false` when `index` is outside the capacity.
+    #[must_use]
     pub fn bit(&self, index: usize) -> bool {
         index < Self::BITS && (self.parts[index / 64] >> (index % 64)) & 1 != 0
     }
@@ -171,7 +203,10 @@ impl<const P: usize> Natural<P> {
         while i < bytes.len() {
             let b = bytes[i];
             if b < b'0' || b > b'9' {
-                return Err(ParseNaturalError::InvalidDigit { index: i, byte: b });
+                return Err(ParseNaturalError::InvalidDigit(InvalidDigit {
+                    index: i,
+                    byte: b,
+                }));
             }
             let mut carry = (b - b'0') as u128;
             let mut limb = 0;
@@ -221,6 +256,7 @@ impl<const P: usize> Natural<P> {
     /// Writes the shortest unsigned big-endian encoding.
     ///
     /// Returns the number of bytes written. Zero has an empty encoding.
+    #[must_use = "serialization errors and the written byte count must be handled"]
     pub fn write_be_bytes(&self, out: &mut [u8]) -> Result<usize, BufferTooSmall> {
         let n = self.byte_len();
         if out.len() < n {
@@ -238,6 +274,7 @@ impl<const P: usize> Natural<P> {
     /// Writes the shortest unsigned little-endian encoding.
     ///
     /// Returns the number of bytes written. Zero has an empty encoding.
+    #[must_use = "serialization errors and the written byte count must be handled"]
     pub fn write_le_bytes(&self, out: &mut [u8]) -> Result<usize, BufferTooSmall> {
         let n = self.byte_len();
         if out.len() < n {
@@ -342,16 +379,19 @@ impl<const P: usize> Natural<P> {
         (out, overflow)
     }
     /// Adds two values, returning `None` on capacity overflow.
+    #[must_use]
     pub fn checked_add(&self, rhs: &Self) -> Option<Self> {
         let (v, o) = self.overflowing_add(rhs);
         (!o).then_some(v)
     }
     /// Subtracts `rhs`, returning `None` when the result would be negative.
+    #[must_use]
     pub fn checked_sub(&self, rhs: &Self) -> Option<Self> {
         let (v, o) = self.overflowing_sub(rhs);
         (!o).then_some(v)
     }
     /// Multiplies two values, returning `None` on capacity overflow.
+    #[must_use]
     pub fn checked_mul(&self, rhs: &Self) -> Option<Self> {
         let (v, o) = self.overflowing_mul(rhs);
         (!o).then_some(v)
@@ -454,6 +494,7 @@ impl<const P: usize> Natural<P> {
         Some((q, r as u64))
     }
     /// Binary (Stein) GCD: shifts and subtraction only, no division.
+    #[must_use]
     pub fn gcd(&self, rhs: &Self) -> Self {
         if self.is_zero() {
             return rhs.clone();
@@ -477,10 +518,6 @@ impl<const P: usize> Natural<P> {
         }
         a << shift
     }
-    pub(crate) fn extended_gcd(&self, rhs: &Self) -> ExtendedGcdResult<P> {
-        ExtendedGcdResult { gcd: self.gcd(rhs) }
-    }
-
     pub(crate) fn sqrt_rem(&self) -> (Self, Self) {
         if self.is_zero() {
             return (Self::ZERO, Self::ZERO);
@@ -491,11 +528,16 @@ impl<const P: usize> Natural<P> {
         }
         loop {
             let q = self.div_rem(&x).unwrap().0;
-            let sum = x.checked_add(&q).expect("square-root iterate fits");
+            // Newton maintains x <= 2^(BITS/2) and q <= self/x, so
+            // x + q <= 2^(BITS/2+1), which fits for every nondegenerate width.
+            debug_assert!(x.checked_add(&q).is_some(), "square-root iterate fits");
+            let sum = x.wrapping_add(&q);
             let next = sum >> 1usize;
             if next >= x {
-                let sq = x.checked_mul(&x).unwrap();
-                return (x, self.checked_sub(&sq).unwrap());
+                debug_assert!(x.checked_mul(&x).is_some(), "floor square root fits");
+                let sq = x.wrapping_mul(&x);
+                debug_assert!(self.checked_sub(&sq).is_some(), "floor square is <= input");
+                return (x, self.wrapping_sub(&sq));
             }
             x = next;
         }
@@ -538,7 +580,7 @@ impl<const P: usize> Natural<P> {
         }
         let bits = self.bit_len() as u32;
         for e in 3..=bits {
-            if !is_prime_u32(e) {
+            if !crate::u64math::is_prime(e as u64) {
                 continue;
             }
             let mut lo = Self::ONE;
@@ -590,20 +632,6 @@ impl<const P: usize> Natural<P> {
     pub(crate) fn mod_u64(&self, m: u64) -> u64 {
         self.rem_u64(m)
     }
-}
-
-fn is_prime_u32(n: u32) -> bool {
-    if n < 2 {
-        return false;
-    }
-    let mut d = 2;
-    while d * d <= n {
-        if n.is_multiple_of(d) {
-            return false;
-        }
-        d += 1
-    }
-    true
 }
 
 /// Number of significant (nonzero through) limbs in a little-endian slice.
@@ -803,6 +831,22 @@ impl<const P: usize> From<u64> for Natural<P> {
     }
 }
 
+impl<const P: usize> TryFrom<Natural<P>> for u64 {
+    type Error = CapacityError;
+
+    fn try_from(value: Natural<P>) -> Result<Self, Self::Error> {
+        value.to_u64().ok_or(CapacityError)
+    }
+}
+
+impl<const P: usize> TryFrom<&Natural<P>> for u64 {
+    type Error = CapacityError;
+
+    fn try_from(value: &Natural<P>) -> Result<Self, Self::Error> {
+        value.to_u64().ok_or(CapacityError)
+    }
+}
+
 impl<const P: usize> fmt::Display for Natural<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_zero() {
@@ -909,24 +953,36 @@ impl<const P: usize> Mul<Natural<P>> for &Natural<P> {
         self.mul(&rhs)
     }
 }
+/// # Panics
+///
+/// Panics when the divisor is zero.
 impl<const P: usize> Div for Natural<P> {
     type Output = Self;
     fn div(self, rhs: Self) -> Self {
         self.div_rem(&rhs).expect("division by zero").0
     }
 }
+/// # Panics
+///
+/// Panics when the divisor is zero.
 impl<const P: usize> Rem for Natural<P> {
     type Output = Self;
     fn rem(self, rhs: Self) -> Self {
         self.div_rem(&rhs).expect("division by zero").1
     }
 }
+/// # Panics
+///
+/// Panics when the divisor is zero.
 impl<const P: usize> Div<&Natural<P>> for &Natural<P> {
     type Output = Natural<P>;
     fn div(self, rhs: &Natural<P>) -> Natural<P> {
         self.div_rem(rhs).expect("division by zero").0
     }
 }
+/// # Panics
+///
+/// Panics when the divisor is zero.
 impl<const P: usize> Rem<&Natural<P>> for &Natural<P> {
     type Output = Natural<P>;
     fn rem(self, rhs: &Natural<P>) -> Natural<P> {
@@ -952,21 +1008,33 @@ impl<const P: usize> MulAssign for Natural<P> {
         *self *= &rhs
     }
 }
+/// # Panics
+///
+/// Panics when the divisor is zero.
 impl<const P: usize> DivAssign<&Self> for Natural<P> {
     fn div_assign(&mut self, r: &Self) {
         *self = self.clone() / r.clone()
     }
 }
+/// # Panics
+///
+/// Panics when the divisor is zero.
 impl<const P: usize> RemAssign<&Self> for Natural<P> {
     fn rem_assign(&mut self, r: &Self) {
         *self = self.clone() % r.clone()
     }
 }
+/// # Panics
+///
+/// Panics when the divisor is zero.
 impl<const P: usize> DivAssign for Natural<P> {
     fn div_assign(&mut self, rhs: Self) {
         *self /= &rhs
     }
 }
+/// # Panics
+///
+/// Panics when the divisor is zero.
 impl<const P: usize> RemAssign for Natural<P> {
     fn rem_assign(&mut self, rhs: Self) {
         *self %= &rhs
@@ -1160,83 +1228,6 @@ impl<const P: usize> WideNatural<P> {
     }
 }
 
-/// Extended-GCD result. Coefficients are intentionally private pending a public signed type.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExtendedGcdResult<const P: usize> {
-    pub gcd: Natural<P>,
-}
-
-/// Invalid Montgomery modulus.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MontgomeryError {
-    ZeroModulus,
-    EvenModulus,
-}
-impl fmt::Display for MontgomeryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::ZeroModulus => "zero Montgomery modulus",
-            Self::EvenModulus => "Montgomery modulus must be odd",
-        })
-    }
-}
-impl std::error::Error for MontgomeryError {}
-
-/// Modular arithmetic context for an odd modulus.
-pub struct Montgomery<const P: usize> {
-    modulus: Natural<P>,
-}
-impl<const P: usize> Montgomery<P> {
-    pub fn new(modulus: Natural<P>) -> Result<Self, MontgomeryError> {
-        if modulus.is_zero() {
-            Err(MontgomeryError::ZeroModulus)
-        } else if modulus.is_even() {
-            Err(MontgomeryError::EvenModulus)
-        } else {
-            Ok(Self { modulus })
-        }
-    }
-    pub fn encode(&self, v: &Natural<P>) -> Natural<P> {
-        v.div_rem(&self.modulus).unwrap().1
-    }
-    pub fn decode(&self, v: &Natural<P>) -> Natural<P> {
-        self.encode(v)
-    }
-    pub fn mul(&self, a: &Natural<P>, b: &Natural<P>) -> Natural<P> {
-        a.mul_mod(b, &self.modulus)
-    }
-    pub fn square(&self, a: &Natural<P>) -> Natural<P> {
-        self.mul(a, a)
-    }
-    pub fn pow(&self, a: &Natural<P>, e: &Natural<P>) -> Natural<P> {
-        a.pow_mod(e, &self.modulus)
-    }
-    pub fn inv(&self, v: &Natural<P>) -> Option<Natural<P>> {
-        if v.gcd(&self.modulus) != Natural::ONE {
-            return None;
-        }
-        // Extended Euclid with coefficients represented modulo the modulus.
-        let mut old_r = self.modulus.clone();
-        let mut r = v.div_rem(&self.modulus)?.1;
-        let mut old_t = Natural::ZERO;
-        let mut t = Natural::ONE;
-        while !r.is_zero() {
-            let (q, next_r) = old_r.div_rem(&r)?;
-            old_r = r;
-            r = next_r;
-            let qt = q.mul_mod(&t, &self.modulus);
-            let next_t = if old_t >= qt {
-                old_t.wrapping_sub(&qt)
-            } else {
-                self.modulus.wrapping_sub(&qt.wrapping_sub(&old_t))
-            };
-            old_t = t;
-            t = next_t;
-        }
-        Some(old_t)
-    }
-}
-
 pub fn jacobi_u64(mut a: u64, mut n: u64) -> i8 {
     if n == 0 || n & 1 == 0 {
         return 0;
@@ -1294,7 +1285,7 @@ pub fn tonelli_shanks_u32(n: u32, p: u32) -> Option<u32> {
         return None;
     }
     if p & 3 == 3 {
-        return Some(modpow_u64(n as u64, ((p + 1) / 4) as u64, p as u64) as u32);
+        return Some(crate::u64math::pow_mod(n as u64, ((p + 1) / 4) as u64, p as u64) as u32);
     }
     let mut q = p - 1;
     let mut s = 0;
@@ -1306,9 +1297,9 @@ pub fn tonelli_shanks_u32(n: u32, p: u32) -> Option<u32> {
     while legendre_u32(z, p) != -1 {
         z += 1
     }
-    let mut c = modpow_u64(z as u64, q as u64, p as u64);
-    let mut x = modpow_u64(n as u64, q.div_ceil(2) as u64, p as u64);
-    let mut t = modpow_u64(n as u64, q as u64, p as u64);
+    let mut c = crate::u64math::pow_mod(z as u64, q as u64, p as u64);
+    let mut x = crate::u64math::pow_mod(n as u64, q.div_ceil(2) as u64, p as u64);
+    let mut t = crate::u64math::pow_mod(n as u64, q as u64, p as u64);
     let mut m = s;
     while t != 1 {
         let mut i = 1;
@@ -1320,7 +1311,7 @@ pub fn tonelli_shanks_u32(n: u32, p: u32) -> Option<u32> {
                 return None;
             }
         }
-        let b = modpow_u64(c, 1u64 << (m - i - 1), p as u64);
+        let b = crate::u64math::pow_mod(c, 1u64 << (m - i - 1), p as u64);
         x = x * b % p as u64;
         t = t * b % p as u64 * b % p as u64;
         c = b * b % p as u64;
@@ -1328,18 +1319,6 @@ pub fn tonelli_shanks_u32(n: u32, p: u32) -> Option<u32> {
     }
     Some(x as u32)
 }
-fn modpow_u64(mut a: u64, mut e: u64, m: u64) -> u64 {
-    let mut r = 1;
-    while e != 0 {
-        if e & 1 != 0 {
-            r = (r as u128 * a as u128 % m as u128) as u64
-        }
-        a = (a as u128 * a as u128 % m as u128) as u64;
-        e >>= 1
-    }
-    r
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1408,7 +1387,7 @@ mod tests {
     fn jacobi_and_legendre_agree_with_the_euler_criterion() {
         for p in [3u64, 5, 7, 11, 13, 17, 19, 23, 29, 31, 97, 101, 8191] {
             for n in 0..p.min(200) {
-                let euler = modpow_u64(n, (p - 1) / 2, p);
+                let euler = crate::u64math::pow_mod(n, (p - 1) / 2, p);
                 let expected = match euler {
                     0 => 0i8,
                     1 => 1,
@@ -1442,12 +1421,6 @@ mod tests {
                 assert_eq!(r.to_string(), (a % b).to_string());
             }
         }
-    }
-    #[test]
-    fn inverse_for_composite_modulus() {
-        let m = Montgomery::<1>::new(Natural::from_u64(15)).unwrap();
-        let inverse = m.inv(&Natural::from_u64(2)).unwrap();
-        assert_eq!(inverse, Natural::from_u64(8));
     }
 }
 
@@ -1594,32 +1567,91 @@ mod difftests {
     }
 
     #[test]
-    fn diff_montgomery() {
-        let mut rng = Rng(0x5a5a_a5a5_1357_9bdf);
-        for _ in 0..2000 {
-            let lm = 1 + (rng.next() as usize % P);
-            let mut m = rng.natural(lm);
-            m.as_mut_parts()[0] |= 1; // odd
-            if m < Natural::from_u64(3) {
-                m = Natural::from_u64(3);
+    fn diff_sqrt_and_perfect_power() {
+        let mut rng = Rng(0x3141_5926_5358_9793);
+        for _ in 0..1000 {
+            let limbs = 1 + rng.next() as usize % 8;
+            let value = rng.natural(limbs);
+            let big = to_big(&value);
+            let expected = big.sqrt();
+            let (root, remainder) = value.sqrt_rem();
+            assert_eq!(to_big(&root), expected);
+            assert_eq!(to_big(&remainder), &big - &expected * &expected);
+            assert_eq!(value.floor_sqrt(), root);
+            let ceil = if remainder.is_zero() {
+                root
+            } else {
+                root.wrapping_add(&Natural::ONE)
+            };
+            assert_eq!(value.ceil_sqrt(), ceil);
+        }
+
+        for exponent in 2..=12u32 {
+            for base in [2u64, 3, 5, 17, 257, 65_537] {
+                let big = BigUint::from(base).pow(exponent);
+                let value = Natural::<P>::from_le_bytes(&big.to_bytes_le()).unwrap();
+                let (root, power) = value
+                    .perfect_power()
+                    .unwrap_or_else(|| panic!("{base}^{exponent} was not recognized"));
+                assert_eq!(to_big(&root).pow(power), big);
+                assert!(power >= 2);
             }
-            let mont = Montgomery::<P>::new(m.clone()).unwrap();
-            let bm = to_big(&m);
-            let a = rng.natural(P).div_rem(&m).unwrap().1;
-            let b = rng.natural(P).div_rem(&m).unwrap().1;
-            // encode/decode round-trip
-            assert_eq!(to_big(&mont.decode(&mont.encode(&a))), to_big(&a));
-            // multiplication in Montgomery domain equals modular product
-            assert_eq!(
-                to_big(&mont.mul(&a, &b)),
-                (to_big(&a) * to_big(&b)) % &bm,
-                "mont.mul m={bm}"
-            );
-            let e = rng.natural(2);
-            assert_eq!(
-                to_big(&mont.pow(&a, &e)),
-                to_big(&a).modpow(&to_big(&e), &bm)
-            );
+        }
+    }
+
+    #[test]
+    fn diff_decimal_and_byte_round_trips() {
+        let mut rng = Rng(0x2718_2818_2845_9045);
+        for _ in 0..2000 {
+            let limbs = rng.next() as usize % (P + 1);
+            let value = rng.natural(limbs);
+            let big = to_big(&value);
+            let decimal = big.to_str_radix(10);
+            assert_eq!(value.to_string(), decimal);
+            assert_eq!(Natural::<P>::from_decimal(&decimal).unwrap(), value);
+
+            let significant_bytes = value.bit_len().div_ceil(8);
+            let mut little = vec![0u8; significant_bytes];
+            let little_len = value.write_le_bytes(&mut little).unwrap();
+            assert_eq!(little_len, significant_bytes);
+            let mut little_padded = little.clone();
+            little_padded.extend_from_slice(&[0; 7]);
+            assert_eq!(Natural::<P>::from_le_bytes(&little_padded).unwrap(), value);
+
+            let mut big_endian = vec![0u8; significant_bytes];
+            let big_len = value.write_be_bytes(&mut big_endian).unwrap();
+            assert_eq!(big_len, significant_bytes);
+            let mut big_padded = vec![0u8; 7];
+            big_padded.extend_from_slice(&big_endian);
+            assert_eq!(Natural::<P>::from_be_bytes(&big_padded).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn shifts_match_biguint_at_word_boundaries() {
+        let mut rng = Rng(0x1618_0339_8874_9894);
+        let modulus = BigUint::from(1u8) << Natural::<P>::BITS;
+        for shift in [
+            0,
+            1,
+            63,
+            64,
+            65,
+            127,
+            128,
+            Natural::<P>::BITS - 1,
+            Natural::<P>::BITS,
+            Natural::<P>::BITS + 64,
+        ] {
+            for _ in 0..32 {
+                let value = rng.natural(P);
+                let big = to_big(&value);
+                assert_eq!(
+                    to_big(&(value.clone() << shift)),
+                    (&big << shift) % &modulus
+                );
+                assert_eq!(to_big(&(value >> shift)), &big >> shift);
+            }
         }
     }
 }

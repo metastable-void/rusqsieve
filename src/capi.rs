@@ -1,18 +1,58 @@
 //! Minimal owning C ABI for the high-level native factorization interface.
 
-use crate::{FactorConfig, Natural, PARTS, Parallelism, ParseNaturalError, factor_with};
-use core::ffi::{c_char, c_int};
+use crate::{
+    FactorConfig, FactorError, Natural, PARTS, Parallelism, ParseNaturalError, ProgressAction,
+    ProgressPhase, ProgressSnapshot, ProgressTotal, ProgressUnit, factor_with_progress,
+};
+use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use std::ffi::{CStr, CString};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-const RUSQSIEVE_OK: c_int = 0;
-const RUSQSIEVE_INVALID_ARGUMENT: c_int = 1;
-const RUSQSIEVE_INVALID_DECIMAL: c_int = 2;
-const RUSQSIEVE_INPUT_OUT_OF_RANGE: c_int = 3;
-const RUSQSIEVE_FACTORIZATION_FAILED: c_int = 4;
-const RUSQSIEVE_INTERNAL_ERROR: c_int = 5;
+/// Status returned by the native C ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RusqsieveStatus {
+    /// Operation completed successfully.
+    Ok = 0,
+    /// A null pointer, zero worker count, or another invalid argument was supplied.
+    InvalidArgument = 1,
+    /// The input was not an unsigned decimal integer.
+    InvalidDecimal = 2,
+    /// The input was zero, exceeded capacity, or exceeded the 512-bit SIQS range.
+    InputOutOfRange = 3,
+    /// No complete factorization was found.
+    FactorizationFailed = 4,
+    /// A panic was caught at the ABI boundary.
+    InternalError = 5,
+    /// A progress callback requested cancellation.
+    Cancelled = 6,
+}
+
 const AUTO_THREAD_CAP: usize = 48;
+const EXPLICIT_THREAD_CAP: usize = 256;
+const C_ABI_VERSION: u32 = 2;
+
+/// Return the native C ABI version.
+#[unsafe(no_mangle)]
+pub extern "C" fn rusqsieve_abi_version() -> u32 {
+    C_ABI_VERSION
+}
+
+/// Return a static description for a status code.
+#[unsafe(no_mangle)]
+pub extern "C" fn rusqsieve_strerror(status: c_int) -> *const c_char {
+    match status {
+        0 => c"success".as_ptr(),
+        1 => c"invalid argument".as_ptr(),
+        2 => c"invalid decimal integer".as_ptr(),
+        3 => c"input out of supported range".as_ptr(),
+        4 => c"factorization failed".as_ptr(),
+        5 => c"internal error".as_ptr(),
+        6 => c"factorization cancelled".as_ptr(),
+        _ => c"unknown rusqsieve status".as_ptr(),
+    }
+}
 
 /// Rust-owned implementation of the incomplete C type `rusqsieve_factors`.
 ///
@@ -28,6 +68,26 @@ struct FactorAllocation {
     pointers: Box<[*const c_char]>,
 }
 
+/// Progress snapshot passed to a native C callback.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RusqsieveProgress {
+    /// Stable phase code documented in `rusqsieve.h`.
+    pub phase: u32,
+    /// Completed work in `unit`.
+    pub completed: u64,
+    /// Total work, or zero when `total_kind` is unknown.
+    pub total: u64,
+    /// Zero for unknown, one for exact, and two for estimated.
+    pub total_kind: u32,
+    /// Stable unit code documented in `rusqsieve.h`.
+    pub unit: u32,
+}
+
+/// Native progress callback. Return zero to continue or nonzero to cancel.
+pub type RusqsieveProgressCallback =
+    unsafe extern "C" fn(*const RusqsieveProgress, *mut c_void) -> c_int;
+
 /// Allocate a new empty factorization result.
 #[unsafe(no_mangle)]
 pub extern "C" fn rusqsieve_factors_new() -> *mut RusqsieveFactors {
@@ -35,6 +95,11 @@ pub extern "C" fn rusqsieve_factors_new() -> *mut RusqsieveFactors {
 }
 
 /// Destroy a factorization result and all strings it owns.
+///
+/// # Safety
+///
+/// A non-null pointer must have been returned by
+/// [`rusqsieve_factors_new`] and must be freed exactly once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rusqsieve_factors_free(factors: *mut RusqsieveFactors) {
     if factors.is_null() {
@@ -46,6 +111,11 @@ pub unsafe extern "C" fn rusqsieve_factors_free(factors: *mut RusqsieveFactors) 
 }
 
 /// Return the number of prime factors, including multiplicity.
+///
+/// # Safety
+///
+/// A non-null pointer must designate a live result object and must not be
+/// concurrently mutated or destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rusqsieve_factors_len(factors: *const RusqsieveFactors) -> usize {
     if factors.is_null() {
@@ -61,6 +131,12 @@ pub unsafe extern "C" fn rusqsieve_factors_len(factors: *const RusqsieveFactors)
 }
 
 /// Return one borrowed decimal factor, or null when `index` is out of bounds.
+///
+/// # Safety
+///
+/// A non-null pointer must designate a live result object and must not be
+/// concurrently mutated or destroyed. The returned string is borrowed from
+/// that object.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rusqsieve_factors_get(
     factors: *const RusqsieveFactors,
@@ -83,15 +159,23 @@ pub unsafe extern "C" fn rusqsieve_factors_get(
 /// Factor a positive decimal integer (`1` has an empty factorization).
 ///
 /// `threads == 0` selects available parallelism capped at 48. A nonzero value
-/// requests that exact worker count (the engine may still cap tiny inputs).
+/// is capped at 256; the engine may cap smaller inputs further.
+///
+/// This function is not constant-time and must not process secret values.
+///
+/// # Safety
+///
+/// `n` must point to a readable NUL-terminated string. `factors` must point to
+/// a live object returned by [`rusqsieve_factors_new`] and must be exclusively
+/// accessible for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rusqsieve_factor(
     n: *const c_char,
     threads: usize,
     factors: *mut RusqsieveFactors,
-) -> c_int {
+) -> RusqsieveStatus {
     if n.is_null() || factors.is_null() {
-        return RUSQSIEVE_INVALID_ARGUMENT;
+        return RusqsieveStatus::InvalidArgument;
     }
 
     // Copy before clearing the prior result. This permits a caller to use a
@@ -104,26 +188,86 @@ pub unsafe extern "C" fn rusqsieve_factor(
     let factors = unsafe { &mut *factors };
     factors.allocation = None;
 
-    match catch_unwind(AssertUnwindSafe(|| factor_impl(&input, threads))) {
+    let mut observer = continue_progress;
+    match catch_unwind(AssertUnwindSafe(|| {
+        factor_impl(&input, threads, &mut observer)
+    })) {
         Ok(Ok(allocation)) => {
             factors.allocation = allocation;
-            RUSQSIEVE_OK
+            RusqsieveStatus::Ok
         }
         Ok(Err(status)) => status,
-        Err(_) => RUSQSIEVE_INTERNAL_ERROR,
+        Err(_) => RusqsieveStatus::InternalError,
     }
 }
 
-fn factor_impl(input: &[u8], threads: usize) -> Result<Option<Box<FactorAllocation>>, c_int> {
-    let text = core::str::from_utf8(input).map_err(|_| RUSQSIEVE_INVALID_DECIMAL)?;
-    let n = Natural::<PARTS>::from_decimal(text).map_err(|error| match error {
-        ParseNaturalError::Overflow => RUSQSIEVE_INPUT_OUT_OF_RANGE,
-        ParseNaturalError::Empty | ParseNaturalError::InvalidDigit { .. } => {
-            RUSQSIEVE_INVALID_DECIMAL
+/// Factor while reporting progress to a native callback.
+///
+/// A null callback behaves like [`rusqsieve_factor`]. A nonzero callback
+/// return requests cooperative cancellation.
+///
+/// # Safety
+///
+/// The pointer requirements of [`rusqsieve_factor`] apply. In addition,
+/// `context` must remain valid according to the callback's own contract for
+/// the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rusqsieve_factor_with_progress(
+    n: *const c_char,
+    threads: usize,
+    factors: *mut RusqsieveFactors,
+    callback: Option<RusqsieveProgressCallback>,
+    context: *mut c_void,
+) -> RusqsieveStatus {
+    if n.is_null() || factors.is_null() {
+        return RusqsieveStatus::InvalidArgument;
+    }
+    // SAFETY: inherited from this function's caller contract.
+    let input = unsafe { CStr::from_ptr(n) }.to_bytes().to_vec();
+    // SAFETY: inherited from this function's caller contract.
+    let factors = unsafe { &mut *factors };
+    factors.allocation = None;
+    let mut observer = |snapshot: &ProgressSnapshot| {
+        let Some(callback) = callback else {
+            return ProgressAction::Continue;
+        };
+        let progress = c_progress(snapshot);
+        // SAFETY: the function pointer and context validity are caller
+        // obligations documented above.
+        if unsafe { callback(&progress, context) } == 0 {
+            ProgressAction::Continue
+        } else {
+            ProgressAction::Cancel
         }
+    };
+    match catch_unwind(AssertUnwindSafe(|| {
+        factor_impl(&input, threads, &mut observer)
+    })) {
+        Ok(Ok(allocation)) => {
+            factors.allocation = allocation;
+            RusqsieveStatus::Ok
+        }
+        Ok(Err(status)) => status,
+        Err(_) => RusqsieveStatus::InternalError,
+    }
+}
+
+fn factor_impl(
+    input: &[u8],
+    threads: usize,
+    observer: &mut dyn FnMut(&ProgressSnapshot) -> ProgressAction,
+) -> Result<Option<Box<FactorAllocation>>, RusqsieveStatus> {
+    let text = core::str::from_utf8(input).map_err(|_| RusqsieveStatus::InvalidDecimal)?;
+    let n = Natural::<PARTS>::from_decimal(text).map_err(|error| match error {
+        ParseNaturalError::Overflow => RusqsieveStatus::InputOutOfRange,
+        ParseNaturalError::Empty | ParseNaturalError::InvalidDigit(_) => {
+            RusqsieveStatus::InvalidDecimal
+        }
+        #[allow(unreachable_patterns)]
+        _ => RusqsieveStatus::InvalidDecimal,
     })?;
-    if n.is_zero() {
-        return Err(RUSQSIEVE_INPUT_OUT_OF_RANGE);
+    if n.is_zero() || n.bit_len() > 512 {
+        return Err(RusqsieveStatus::InputOutOfRange);
     }
 
     let workers = if threads == 0 {
@@ -131,16 +275,20 @@ fn factor_impl(input: &[u8], threads: usize) -> Result<Option<Box<FactorAllocati
             .map_or(1, usize::from)
             .min(AUTO_THREAD_CAP)
     } else {
-        threads
+        threads.min(EXPLICIT_THREAD_CAP)
     };
-    let parallelism = Parallelism::threads(workers).ok_or(RUSQSIEVE_INVALID_ARGUMENT)?;
+    let parallelism = Parallelism::threads(workers).ok_or(RusqsieveStatus::InvalidArgument)?;
     let config = FactorConfig::default().with_parallelism(parallelism);
-    let result = factor_with(n, config).map_err(|_| RUSQSIEVE_FACTORIZATION_FAILED)?;
+    let result = factor_with_progress(n, config, observer).map_err(|error| match error {
+        FactorError::Cancelled => RusqsieveStatus::Cancelled,
+        _ => RusqsieveStatus::FactorizationFailed,
+    })?;
 
     let mut strings = Vec::with_capacity(result.distinct_len());
     let mut multiplicities = Vec::with_capacity(result.distinct_len());
     for (prime, exponent) in result.iter() {
-        let decimal = CString::new(prime.to_string()).map_err(|_| RUSQSIEVE_INTERNAL_ERROR)?;
+        let decimal =
+            CString::new(prime.to_string()).map_err(|_| RusqsieveStatus::InternalError)?;
         strings.push(decimal);
         multiplicities.push(exponent.get());
     }
@@ -160,6 +308,50 @@ fn factor_impl(input: &[u8], threads: usize) -> Result<Option<Box<FactorAllocati
     })))
 }
 
+fn continue_progress(_: &ProgressSnapshot) -> ProgressAction {
+    ProgressAction::Continue
+}
+
+fn c_progress(snapshot: &ProgressSnapshot) -> RusqsieveProgress {
+    let amount = snapshot.amount();
+    let (total, total_kind) = match amount.total() {
+        ProgressTotal::Unknown => (0, 0),
+        ProgressTotal::Exact(total) => (total, 1),
+        ProgressTotal::Estimated(total) => (total, 2),
+        #[allow(unreachable_patterns)]
+        _ => (0, 0),
+    };
+    RusqsieveProgress {
+        phase: match snapshot.phase() {
+            ProgressPhase::Preprocessing => 0,
+            ProgressPhase::BuildingFactorBase => 1,
+            ProgressPhase::Sieving => 2,
+            ProgressPhase::LinearAlgebra => 6,
+            ProgressPhase::ExtractingFactor => 7,
+            ProgressPhase::Complete => 9,
+            #[allow(unreachable_patterns)]
+            _ => u32::MAX,
+        },
+        completed: amount.completed(),
+        total,
+        total_kind,
+        unit: match amount.unit() {
+            ProgressUnit::Candidates => 0,
+            ProgressUnit::Primes => 1,
+            ProgressUnit::SievePositions => 3,
+            ProgressUnit::Relations => 4,
+            ProgressUnit::MatrixRows => 5,
+            ProgressUnit::MatrixColumns => 6,
+            ProgressUnit::MatrixNonzeros => 7,
+            ProgressUnit::Iterations => 8,
+            ProgressUnit::MatrixProducts => 9,
+            ProgressUnit::Tasks => 10,
+            #[allow(unreachable_patterns)]
+            _ => u32::MAX,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,7 +362,7 @@ mod tests {
         assert!(!output.is_null());
         let input = CString::new("360").unwrap();
         let status = unsafe { rusqsieve_factor(input.as_ptr(), 1, output) };
-        assert_eq!(status, RUSQSIEVE_OK);
+        assert_eq!(status, RusqsieveStatus::Ok);
         assert_eq!(unsafe { rusqsieve_factors_len(output) }, 6);
         let actual: Vec<&str> = (0..6)
             .map(|index| unsafe {
@@ -185,7 +377,7 @@ mod tests {
         let one = CString::new("1").unwrap();
         assert_eq!(
             unsafe { rusqsieve_factor(one.as_ptr(), 0, output) },
-            RUSQSIEVE_OK
+            RusqsieveStatus::Ok
         );
         assert_eq!(unsafe { rusqsieve_factors_len(output) }, 0);
         assert!(unsafe { rusqsieve_factors_get(output, 0) }.is_null());
@@ -198,15 +390,58 @@ mod tests {
         let valid = CString::new("15").unwrap();
         assert_eq!(
             unsafe { rusqsieve_factor(valid.as_ptr(), 1, output) },
-            RUSQSIEVE_OK
+            RusqsieveStatus::Ok
         );
         let invalid = CString::new("not-a-number").unwrap();
         assert_eq!(
             unsafe { rusqsieve_factor(invalid.as_ptr(), 1, output) },
-            RUSQSIEVE_INVALID_DECIMAL
+            RusqsieveStatus::InvalidDecimal
         );
         assert_eq!(unsafe { rusqsieve_factors_len(output) }, 0);
         unsafe { rusqsieve_factors_free(output) };
         unsafe { rusqsieve_factors_free(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn hostile_inputs_and_thread_count_are_bounded() {
+        let output = rusqsieve_factors_new();
+        let non_utf8 = CString::new(vec![0xff]).unwrap();
+        assert_eq!(
+            unsafe { rusqsieve_factor(non_utf8.as_ptr(), usize::MAX, output) },
+            RusqsieveStatus::InvalidDecimal
+        );
+
+        let million_digits = CString::new(vec![b'9'; 1_000_000]).unwrap();
+        assert_eq!(
+            unsafe { rusqsieve_factor(million_digits.as_ptr(), usize::MAX, output) },
+            RusqsieveStatus::InputOutOfRange
+        );
+
+        let embedded_nul = b"15\0ignored\0";
+        assert_eq!(
+            unsafe { rusqsieve_factor(embedded_nul.as_ptr().cast(), usize::MAX, output) },
+            RusqsieveStatus::Ok
+        );
+        assert_eq!(unsafe { rusqsieve_factors_len(output) }, 2);
+        unsafe { rusqsieve_factors_free(output) };
+    }
+
+    #[test]
+    fn independent_results_are_concurrent() {
+        let handles = ["1000036000099", "1000070001221"].map(|input| {
+            std::thread::spawn(move || {
+                let output = rusqsieve_factors_new();
+                let input = CString::new(input).unwrap();
+                let status = unsafe { rusqsieve_factor(input.as_ptr(), 2, output) };
+                let len = unsafe { rusqsieve_factors_len(output) };
+                unsafe { rusqsieve_factors_free(output) };
+                (status, len)
+            })
+        });
+        for handle in handles {
+            let (status, len) = handle.join().unwrap();
+            assert_eq!(status, RusqsieveStatus::Ok);
+            assert_eq!(len, 2);
+        }
     }
 }

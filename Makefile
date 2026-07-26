@@ -1,5 +1,6 @@
 # Native build/install and browser demo packaging.
 CARGO       ?= cargo
+CC          ?= cc
 INSTALL     ?= install
 PREFIX      ?= /usr/local
 DESTDIR     ?=
@@ -31,7 +32,7 @@ DOCS_FILES  := $(addprefix $(DOCS)/,$(ASSETS)) $(DOCS)/rusqsieve.wasm \
 	$(DOCS)/rusqsieve-simd.wasm $(DOCS)/.nojekyll
 
 .DEFAULT_GOAL := native
-.PHONY: native install docs docs-verify wasm serve test clean
+.PHONY: native install docs docs-verify wasm serve test c-api-smoke clean
 
 native:
 	$(CARGO) build --release
@@ -82,7 +83,8 @@ $(WASM_SCALAR): $(shell find src -name '*.rs') Cargo.toml
 	$(CARGO) build --release --target $(WASM_TARGET) --target-dir target/wasm-scalar --lib --no-default-features
 
 $(WASM_SIMD): $(shell find src -name '*.rs') Cargo.toml
-	$(CARGO) build --release --target $(WASM_TARGET) --target-dir target/wasm-simd --lib --no-default-features --features wasm-simd128
+	RUSTFLAGS="$(RUSTFLAGS) -C target-feature=+simd128" \
+		$(CARGO) build --release --target $(WASM_TARGET) --target-dir target/wasm-simd --lib --no-default-features --features wasm-simd128
 
 # Keep LLVM's speed-optimized output intact. Binaryen 120's -O3 and -Oz both
 # regress the measured 192-bit sieve by roughly 50%, despite saving about 20 KiB.
@@ -108,8 +110,15 @@ serve: docs
 # Native + wasm correctness checks. The browser architecture check drives the real
 # coordinator-Worker/sieve-Worker protocol on node worker threads, which is otherwise
 # only ever exercised by hand in a browser.
+c-api-smoke: native
+	$(CC) -std=c11 -Wall -Wextra -Werror -I. tests/c_api_smoke.c \
+		-Ltarget/release -lrusqsieve -Wl,-rpath,'$$ORIGIN/release' \
+		-o target/c-api-smoke
+	target/c-api-smoke
+
 test:
 	$(CARGO) test
+	$(MAKE) c-api-smoke
 	$(MAKE) wasm
 	$(MAKE) docs-verify
 	node tools/browser-arch-check.mjs

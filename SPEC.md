@@ -1,11 +1,11 @@
-# rusqsieve 0.2 implementation specification
+# rusqsieve 0.3 implementation specification
 
 This document specifies the supported behavior and current architecture of
-rusqsieve 0.2. It describes the implementation that is shipped, not an
+rusqsieve 0.3. It describes the implementation that is shipped, not an
 aspirational module layout or a compatibility promise for private internals.
 
 Normative requirements use **must**. Descriptions of tuning and implementation
-strategy document the 0.2 release and may change in later compatible releases
+strategy document the 0.3 release and may change in later compatible releases
 when observable behavior is preserved.
 
 ## 1. Purpose and scope
@@ -25,7 +25,7 @@ The factorization pipeline combines trial division, probable-prime testing,
 perfect-power detection, Pollard–Brent rho, and a self-initializing quadratic
 sieve (SIQS).
 
-The following are explicitly outside the 0.2 scope:
+The following are explicitly outside the 0.3 scope:
 
 - ECM and the General Number Field Sieve;
 - constant-time or side-channel-resistant arithmetic;
@@ -45,17 +45,18 @@ balanced-RSA path.
 
 ### 2.1 Supported public interfaces
 
-The supported interfaces in 0.2 are:
+The supported interfaces in 0.3 are:
 
 1. the items re-exported from `src/lib.rs`;
-2. the five functions and opaque type declared in `rusqsieve.h`;
+2. the factor/result functions, ABI query, status formatter, and opaque type
+   declared in `rusqsieve.h`;
 3. the `qs-factor` command-line behavior documented below;
 4. the Wasm exports used by `web/abi.js`, `web/index.js`, and `web/worker.js`.
 
 Everything else in `src/` is private implementation detail even when an
 internal item uses Rust's `pub` visibility inside its private module.
 
-Minor 0.2 releases may retune parameters, change internal representations, add
+Minor 0.3 releases may retune parameters, change internal representations, add
 non-exhaustive error/progress variants, or replace private algorithms. They
 must not expose invalid relation, matrix, pointer, or scheduler states through
 the safe Rust API.
@@ -74,15 +75,15 @@ The release builder supports:
 ```text
 x86_64-unknown-linux-gnu
 x86_64-unknown-linux-musl
-aarch64-unknown-linux-musl
 aarch64-unknown-linux-gnu
+aarch64-unknown-linux-musl
 x86_64-unknown-freebsd
 x86_64-pc-windows-msvc
 aarch64-apple-darwin
 wasm32-unknown-unknown
 ```
 
-The musl archives contain the CLI and static library. Other native archives
+The musl archives contain the CLI and static library. GNU and other native archives
 contain the CLI, static library, shared library, header, pkg-config metadata,
 and an installer. The Wasm archive contains scalar and SIMD128 modules plus the
 deployable browser frontend.
@@ -97,15 +98,14 @@ src/
 ├── native.rs           safe blocking native driver
 ├── capi.rs             native C ownership/pointer boundary
 ├── engine.rs           optimized SIQS engine and portable jobs
-├── qs/mod.rs           reference SIQS types and relation invariants
+├── qs/mod.rs           factor-base construction and SIQS tier parameters
 ├── f2/mod.rs           sparse filtering and dependency solving
 ├── natural/mod.rs      fixed-capacity unsigned arithmetic
 ├── smallfactor.rs      cached small primes and u64 Pollard–Brent
 ├── primality.rs        probable-prime testing
-├── factor.rs           recursive policy and internal session types
+├── factor.rs           public configuration and error vocabulary
 ├── factors.rs          owned factor result
 ├── progress.rs         public progress vocabulary
-├── work/mod.rs         private portable work packets
 ├── wasm.rs             raw Wasm ABI and handle registries
 └── bin/qs-factor.rs    native CLI
 ```
@@ -117,10 +117,8 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 ```
 
 The default Cargo feature enables the CLI. The `wasm-simd128` feature enables
-only the scoped SIMD128 linear-algebra kernel. The `limit-to-512-bits` feature
-changes the default `Natural`/engine capacity from 16 to 8 limbs. The remaining
-features are internal development or portability switches and do not widen the
-supported public API.
+the SIMD128 linear-algebra kernel. Cargo features are additive: none changes the
+identity or default const-generic width of a public type.
 
 ## 4. Public Rust API
 
@@ -132,9 +130,9 @@ The crate root exports only:
 pub use factor::{
     FactorConfig, FactorError, Parallelism, ProgressAction, ResourceLimitKind,
 };
-pub use factors::PrimeFactors;
+pub use factors::{ExpandedPrimeFactors, PrimeFactorIter, PrimeFactors};
 pub use natural::{
-    BufferTooSmall, CapacityError, Natural, ParseNaturalError,
+    BufferTooSmall, CapacityError, InvalidDigit, Natural, ParseNaturalError,
 };
 pub use progress::{
     ProgressAmount, ProgressPhase, ProgressSnapshot, ProgressTotal, ProgressUnit,
@@ -188,15 +186,18 @@ calls.
 
 ### 4.3 Configuration
 
-`FactorConfig` is an owned, encapsulated configuration. In 0.2 its supported
+`FactorConfig` is an owned, encapsulated configuration. In 0.3 its supported
 controls are:
 
 - `parallelism()` / `with_parallelism(...)`;
-- `progress_interval()` / `with_progress_interval(...)`.
+- `progress_interval()` / `with_progress_interval(...)`;
+- `with_witness_seed(...)` for a reproducible ChaCha8 Miller–Rabin witness
+  stream.
 
-Algorithm parameters, random seeds, primality witnesses, relation limits, and
-SIQS tuning remain private so the implementation can be improved without
-breaking callers.
+SIQS parameters and relation limits remain private so the implementation can be
+improved without breaking callers. A doc-hidden tuning constructor exists only
+so the CLI can map benchmark environment variables into an owned configuration;
+the library itself never reads ambient environment state.
 
 `Parallelism::Auto` detects available native parallelism when factorization
 begins. `Parallelism::Threads(NonZeroUsize)` requests a nonzero worker count.
@@ -238,10 +239,9 @@ to abandon queued work, joins them, and returns `FactorError::Cancelled`.
 `Natural<const P: usize>` is a `repr(transparent)`, inline, fixed-capacity
 unsigned integer containing `P` little-endian `u64` limbs.
 
-The default capacity is:
-
-- `Natural<16>` / 1024 bits normally;
-- `Natural<8>` / 512 bits with `limit-to-512-bits`.
+The default capacity is fixed at `Natural<16>` / 1024 bits. Blocking
+factorization consistently rejects values wider than 512 bits, independent of
+the const-generic storage width selected by the caller.
 
 This is a storage limit, not a practical factorization claim. NFS is appropriate
 for hard composites substantially beyond this project's SIQS range.
@@ -382,19 +382,19 @@ ascending family order. Native workers and Web Workers execute the same
 Matrix columns correspond to combined relations. Rows correspond to the sign
 and factor-base-prime exponent parities.
 
-The 0.2 solver is:
+The 0.3 solver is:
 
 1. sparse structured elimination, including singleton removal and deterministic
    low-weight row elimination through weight six;
-2. exact provenance tracking back to original relation columns;
+2. compact pivot records used to expand residual dependencies back into the
+   original relation-column space;
 3. a compact row-echelon solve on the residual matrix;
 4. expansion of at most 64 useful dependencies;
 5. verification of every expanded dependency against the original parity
    matrix.
 
-Despite retained internal naming, 0.2 does **not** implement a Montgomery
-block-Lanczos recurrence. Documentation and performance planning must call the
-current residual solver compact dense Gaussian/row-echelon elimination.
+The crate does **not** implement a block-Lanczos recurrence. The current
+residual solver is compact dense Gaussian/row-echelon elimination.
 
 For a verified dependency, extraction constructs:
 
@@ -432,6 +432,8 @@ NUL-terminated decimal strings:
 ```c
 typedef struct rusqsieve_factors rusqsieve_factors;
 
+uint32_t rusqsieve_abi_version(void);
+const char *rusqsieve_strerror(int status);
 rusqsieve_factors *rusqsieve_factors_new(void);
 void rusqsieve_factors_free(rusqsieve_factors *factors);
 size_t rusqsieve_factors_len(const rusqsieve_factors *factors);
@@ -439,10 +441,17 @@ const char *rusqsieve_factors_get(
     const rusqsieve_factors *factors,
     size_t index
 );
-int rusqsieve_factor(
+enum rusqsieve_status rusqsieve_factor(
     const char *n,
     size_t threads,
     rusqsieve_factors *factors
+);
+enum rusqsieve_status rusqsieve_factor_with_progress(
+    const char *n,
+    size_t threads,
+    rusqsieve_factors *factors,
+    rusqsieve_progress_callback callback,
+    void *context
 );
 ```
 
@@ -459,21 +468,24 @@ Ownership and lifetime rules:
   reused as the next input on the same result;
 - operations on the same result must not overlap across threads;
 - independent result objects may be used concurrently;
-- unwinding builds catch Rust panics inside `rusqsieve_factor` and map them to
-  `RUSQSIEVE_INTERNAL_ERROR`; the release profile uses `panic = "abort"`, so
-  internal invariants must be defended before the ABI call can reach them.
+- Rust panics are caught inside `rusqsieve_factor` and mapped to
+  `RUSQSIEVE_INTERNAL_ERROR`; shipped library profiles use unwinding so this
+  contract remains active.
 
-`threads == 0` uses available parallelism capped at 48. Positive values request
-that worker count, subject to internal small-input caps.
+`threads == 0` uses available parallelism capped at 48. Positive values are
+capped at 256 and remain subject to internal small-input caps.
 
 The shared library must export only:
 
 ```text
 rusqsieve_factor
+rusqsieve_factor_with_progress
+rusqsieve_abi_version
 rusqsieve_factors_free
 rusqsieve_factors_get
 rusqsieve_factors_len
 rusqsieve_factors_new
+rusqsieve_strerror
 ```
 
 ## 11. WebAssembly architecture
@@ -700,7 +712,7 @@ same-browser competitor protocol described there.
 
 ## 17. Current limitations and future work
 
-The 0.2 release is optimized for balanced semiprimes. Its principal known gaps
+The 0.3 release is optimized for balanced semiprimes. Its principal known gaps
 are:
 
 - no ECM for medium factors in unbalanced composites;

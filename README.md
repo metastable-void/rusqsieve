@@ -5,7 +5,7 @@ self-initializing quadratic sieve. Its primary target is balanced, RSA-style
 semiprimes from **192 through 256 bits**, including browser execution across
 independent Web Workers without shared memory.
 
-Version 0.2 exposes a deliberately small, safe Rust API and an opaque native C
+Version 0.3 exposes a deliberately small, safe Rust API and an opaque native C
 ABI. SIQS relations, matrix kernels, worker packets, scheduler state, primality
 policy, and mutable limbs remain private implementation details.
 
@@ -35,13 +35,13 @@ must not be used where operand-dependent timing reveals a secret.
 Add the Rust library:
 
 ```sh
-cargo add rusqsieve@0.2.0
+cargo add rusqsieve@0.3.0
 ```
 
 Install the native CLI:
 
 ```sh
-cargo install rusqsieve --version 0.2.0
+cargo install rusqsieve --version 0.3.0
 ```
 
 Or build the optimized native library and CLI from source:
@@ -83,15 +83,29 @@ Use `factor` for defaults, `factor_with` for configuration, or
 cancellation. The ordinary no-observer path is separately monomorphized so
 callback and progress-clock machinery is compiled out.
 
-The default `Natural` has a 1024-bit storage capacity. This is not a claim that
-hard 1024-bit semiprimes are practical; NFS is the appropriate algorithm at
-that scale. Arithmetic operators on `Natural` wrap at capacity, while
-`checked_*` methods report overflow.
+The default `Natural` has a fixed 1024-bit storage capacity. The factorization
+entry points consistently accept values through 512 bits; this is not a claim
+that hard 512-bit semiprimes are practical, and NFS is the appropriate
+algorithm at that scale. Arithmetic operators on `Natural` wrap at capacity,
+while `checked_*` methods report overflow.
 
 All supported public items are covered by rustdoc, enforced with
-`deny(missing_docs)`. The complete 0.2 contract and implementation architecture
+`deny(missing_docs)`. The complete 0.3 contract and implementation architecture
 are documented in [SPEC.md](SPEC.md); breaking changes from 0.1 are summarized
 in [CHANGELOG.md](CHANGELOG.md).
+
+## Architecture
+
+The native driver validates and converts the public const-generic `Natural`
+into the engine’s fixed working width. The engine performs trial division,
+primality and perfect-power checks, bounded Pollard–Brent, then schedules SIQS
+polynomial families. Completed families flow through deterministic
+single-large-prime relation collection, sparse matrix filtering, verified
+row-echelon dependency recovery, and GCD extraction. The Wasm worker and
+coordinator exports use the same family kernel and collector through
+serialized, ownership-checked packets. `qs` owns factor-base construction and
+tier parameters; `natural`, `smallfactor`, `primality`, and `f2` provide the
+arithmetic kernels.
 
 ## Native C API
 
@@ -107,7 +121,7 @@ int main(void) {
     if (factors == NULL)
         return 1;
 
-    int status = rusqsieve_factor("360", 0, factors);
+    enum rusqsieve_status status = rusqsieve_factor("360", 0, factors);
     if (status == RUSQSIEVE_OK) {
         for (size_t i = 0; i < rusqsieve_factors_len(factors); ++i)
             puts(rusqsieve_factors_get(factors, i));
@@ -121,7 +135,9 @@ int main(void) {
 The result type is completely opaque and Rust-owned. Factor strings are
 borrowed until the next call using that result or until
 `rusqsieve_factors_free`; callers must not free individual strings.
-`threads == 0` selects available parallelism capped at 48.
+`threads == 0` selects available parallelism capped at 48; explicit counts are
+capped at 256. Callers can check `rusqsieve_abi_version()` and render statuses
+with `rusqsieve_strerror()`.
 
 Install libraries, CLI, header, and pkg-config metadata under `/usr/local`:
 
@@ -170,8 +186,9 @@ Notable performance work includes:
 - scoped Wasm SIMD128 XOR acceleration;
 - two-family jobs and a measured 48-worker cap.
 
-Whole-program Wasm SIMD and Binaryen `wasm-opt -O3`/`-Oz` are not used because
-they regressed the measured sieve.
+The SIMD artifact enables the Wasm SIMD128 target feature consistently in both
+release build paths. Binaryen `wasm-opt -O3`/`-Oz` is not used because it
+regressed the measured sieve.
 
 ## Command-line interface
 
@@ -197,7 +214,7 @@ with its cofactor.
 Proof-of-work is resource pricing, not authentication. Retain the normal
 authentication mechanism, and never use a modulus belonging to a real RSA key.
 
-ECM is not part of the 0.2 default path. If added later, it must be opt-in
+ECM is not part of the 0.3 default path. If added later, it must be opt-in
 behind a non-default feature and shipped in a separate general-purpose Wasm
 artifact. The balanced-RSA artifact must contain no ECM code or initialization;
 the fixed 192/224/256-bit corpus remains an A/B gate for runtime, download size,
@@ -216,7 +233,7 @@ becomes a future concern for matrices beyond the current practical range.
 
 ## Release builds
 
-`build-release.sh` creates versioned archives for Linux GNU/musl, FreeBSD,
+`build-release.sh` creates versioned archives for Linux GNU and musl, FreeBSD,
 Windows MSVC, Apple arm64, and WebAssembly:
 
 ```sh

@@ -1,9 +1,14 @@
 //! Portable SIQS engine and scheduler-facing work kernels.
+mod extract;
+mod siqs;
+mod wire;
+
 use crate::f2::SparseBinaryMatrix;
-use crate::qs::{AutoOr, FactorBaseEntry, MultiplierChoice, QsConfig, prepare_siqs};
+use crate::factor::FactorTuning;
+use crate::qs::{AutoOr, FactorBaseEntry, MultiplierChoice, QsConfig, prepare_factor_base};
 use crate::{Natural, PARTS, jacobi_u64};
 #[cfg(any(unix, windows))]
-use crate::{PrimalityConfig, is_probable_prime};
+use crate::{PrimalityConfig, WitnessPolicy, is_probable_prime};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -84,6 +89,10 @@ struct Context {
     single_limit: u64,
     /// Whether double-large-prime cofactors are captured and combined.
     double_enabled: bool,
+    relation_percent: Option<usize>,
+    small_skip: u32,
+    threshold_margin: i32,
+    profile: bool,
 }
 
 /// Large-prime cofactor content of a relation.
@@ -167,119 +176,9 @@ pub struct EngineJobResult {
     pub relations: usize,
 }
 
-impl EngineJobResult {
-    /// Serialize this family's relations for transport to a coordinator (e.g. from a
-    /// Web Worker back to the main thread). Format is little-endian:
-    /// `family:u64, polynomials:u64, count:u32`, then per relation
-    /// `root:PARTS×u64, sign:u8, large:{tag:u8, 0/1/2 × u64}, powers_len:u32, [index:u32, exp:u16]…`.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let capacity = 20
-            + self
-                .inner
-                .relations
-                .iter()
-                .map(|relation| {
-                    PARTS * 8
-                        + 2
-                        + match relation.large {
-                            LargePrime::None => 0,
-                            LargePrime::One(_) => 8,
-                            LargePrime::Two(_, _) => 16,
-                        }
-                        + 4
-                        + relation.powers.len() * 6
-                })
-                .sum::<usize>();
-        let mut v = Vec::with_capacity(capacity);
-        v.extend_from_slice(&self.inner.family.to_le_bytes());
-        v.extend_from_slice(&self.inner.polynomials.to_le_bytes());
-        v.extend_from_slice(&(self.inner.relations.len() as u32).to_le_bytes());
-        for r in &self.inner.relations {
-            for limb in r.root.as_parts() {
-                v.extend_from_slice(&limb.to_le_bytes());
-            }
-            v.push(r.sign as u8);
-            match r.large {
-                LargePrime::None => v.push(0),
-                LargePrime::One(a) => {
-                    v.push(1);
-                    v.extend_from_slice(&a.to_le_bytes());
-                }
-                LargePrime::Two(a, b) => {
-                    v.push(2);
-                    v.extend_from_slice(&a.to_le_bytes());
-                    v.extend_from_slice(&b.to_le_bytes());
-                }
-            }
-            v.extend_from_slice(&(r.powers.len() as u32).to_le_bytes());
-            for &(i, e) in &r.powers {
-                v.extend_from_slice(&i.to_le_bytes());
-                v.extend_from_slice(&e.to_le_bytes());
-            }
-        }
-        v
-    }
-}
-
-/// Inverse of [`EngineJobResult::to_bytes`].
-fn deserialize_family(b: &[u8]) -> Option<FamilyResult> {
-    struct Cur<'a> {
-        b: &'a [u8],
-        o: usize,
-    }
-    impl Cur<'_> {
-        fn take(&mut self, n: usize) -> Option<&[u8]> {
-            let s = self.b.get(self.o..self.o + n)?;
-            self.o += n;
-            Some(s)
-        }
-        fn u8(&mut self) -> Option<u8> {
-            Some(self.take(1)?[0])
-        }
-        fn u16(&mut self) -> Option<u16> {
-            Some(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-        }
-        fn u32(&mut self) -> Option<u32> {
-            Some(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-        }
-        fn u64(&mut self) -> Option<u64> {
-            Some(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-        }
-    }
-    let mut c = Cur { b, o: 0 };
-    let family = c.u64()?;
-    let polynomials = c.u64()?;
-    let count = c.u32()? as usize;
-    let mut relations = Vec::with_capacity(count.min(1 << 20));
-    for _ in 0..count {
-        let root = Natural::from_le_bytes(c.take(PARTS * 8)?).ok()?;
-        let sign = c.u8()? != 0;
-        let large = match c.u8()? {
-            0 => LargePrime::None,
-            1 => LargePrime::One(c.u64()?),
-            2 => LargePrime::Two(c.u64()?, c.u64()?),
-            _ => return None,
-        };
-        let plen = c.u32()? as usize;
-        let mut powers = Vec::with_capacity(plen.min(1 << 16));
-        for _ in 0..plen {
-            let i = c.u32()?;
-            let e = c.u16()?;
-            powers.push((i, e));
-        }
-        relations.push(Relation {
-            root,
-            sign,
-            powers,
-            large,
-        });
-    }
-    Some(FamilyResult {
-        family,
-        polynomials,
-        relations,
-        survivors: 0,
-    })
+#[cfg(feature = "fuzzing")]
+pub(crate) fn validate_worker_packet(bytes: &[u8]) -> bool {
+    wire::deserialize_family(bytes).is_some()
 }
 
 /// Pollard-Brent iteration budget for an `n`-bit input, sized as a small fraction of what SIQS on
@@ -349,8 +248,14 @@ pub(crate) mod stage_counts {
 const MAX_FAMILIES: u64 = 100_000;
 
 /// Prepare an immutable context without creating threads.
-pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
-    let p = crate::qs::parameters::engine_params(n.bit_len());
+pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, EngineError> {
+    let mut p = crate::qs::parameters::engine_params(n.bit_len());
+    if let Some(bound) = tuning.factor_base_bound {
+        p.factor_base_bound = bound;
+    }
+    if let Some(half_width) = tuning.sieve_half_width {
+        p.sieve_half_width = half_width;
+    }
     let k = knuth_schroeppel(&n);
     let sieve_n = n
         .checked_mul(&Natural::from_u64(k))
@@ -358,22 +263,22 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
     let qcfg = QsConfig {
         factor_base_bound: AutoOr::Value(p.factor_base_bound),
         multiplier: MultiplierChoice::Value(k as u32),
-        ..QsConfig::default()
     };
-    let prepared = prepare_siqs(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
+    let prepared = prepare_factor_base(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
     let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
     // Expected log weight of the tiny primes that are skipped by the score pass: `Σ log(p)/(p−1)`
     // over the skipped set, which is what the threshold must give back. Derived once here rather
     // than carried as a hand-tuned constant, and cheap to keep out of the per-polynomial path.
-    let small_slack = small_slack(&base, small_skip());
+    let small_skip = tuning.small_skip.unwrap_or(100);
+    let small_slack = small_slack(&base, small_skip);
     let interval_mod_p: Arc<[u32]> = base.iter().map(|e| p.sieve_half_width % e.prime).collect();
     let target_a = sieve_n
         .floor_sqrt()
         .div_rem_u64(p.sieve_half_width as u64)
         .unwrap()
         .0;
-    let (a_all, a_pool, a_factor_count) = build_a_candidates(&base, &target_a);
+    let (a_all, a_pool, a_factor_count) = siqs::build_a_candidates(&base, &target_a);
     let (single_limit, double_enabled) =
         large_prime_policy(p.factor_base_bound, p.large_prime_mult);
     let context = Arc::new(Context {
@@ -392,15 +297,19 @@ pub fn prepare(n: Natural) -> Result<EngineContext, EngineError> {
         // the cofactor width or no double can ever survive it — the second, independent blocker that
         // made `LargePrime::Two` unreachable in v0.2.0 even with its gate forced open.
         lp_bits: (64 - single_limit.leading_zeros()) as usize * if double_enabled { 2 } else { 1 },
-        thresh_adj: p.thresh_adj + env_delta("RUSQSIEVE_THRESH_ADJ"),
+        thresh_adj: p.thresh_adj + tuning.threshold_adjustment.unwrap_or(0),
         single_limit,
         double_enabled,
+        relation_percent: tuning.relation_percent,
+        small_skip,
+        threshold_margin: tuning.threshold_margin.unwrap_or(0),
+        profile: tuning.profile,
     });
     // A famine here is a parameter-selection failure, not a search failure: if no `A` can be built
     // for family 0 then none can be built for any family, and every scheduler would otherwise burn
     // through its whole family budget producing nothing. Diagnose it once, at the only choke point
     // both the native and the WASM/session schedulers pass through.
-    if choose_a(&context, 0).is_none() {
+    if siqs::choose_a(&context, 0).is_none() {
         let message = format!(
             "polynomial-coefficient selection has no viable A for {}-bit input \
              (factor base {}, target A {} bits, {} candidate primes)",
@@ -444,7 +353,7 @@ fn large_prime_policy(bound: u32, large_prime_mult: u32) -> (u64, bool) {
 /// Execute a job using only the caller's thread and owned scratch memory.
 pub fn execute(context: &EngineContext, job: EngineJob) -> EngineJobResult {
     let mut scratch = EngineScratch::default();
-    let inner = sieve_family(&context.0, job.family, &mut scratch);
+    let inner = siqs::sieve_family(&context.0, job.family, &mut scratch);
     EngineJobResult {
         family: inner.family,
         polynomials: inner.polynomials,
@@ -467,7 +376,7 @@ pub struct EngineSession {
 }
 impl EngineSession {
     pub fn new(context: EngineContext) -> Self {
-        let target = relation_target(context.0.base.len());
+        let target = relation_target(context.0.base.len(), context.0.relation_percent);
         Self {
             context,
             target,
@@ -506,7 +415,7 @@ impl EngineSession {
     /// Returns whether enough relations have now been collected. Used by the WASM/Web-Worker
     /// scheduler to feed relations sieved in other threads back into the coordinator.
     pub fn submit_bytes(&mut self, bytes: &[u8]) -> bool {
-        if let Some(fr) = deserialize_family(bytes) {
+        if let Some(fr) = wire::deserialize_family(bytes) {
             self.buffered.insert(fr.family, fr);
             self.drain_buffered();
         }
@@ -524,8 +433,8 @@ impl EngineSession {
             // itself and never calls `take_jobs`, so filtering there left the browser path
             // unprotected. A 110-bit semiprime that the native path factors in 14 ms produced 3
             // duplicate families out of 56 and failed outright in the browser.
-            let unique =
-                choose_a(&self.context.0, r.family).is_some_and(|(a, _)| self.seen_a.insert(a));
+            let unique = siqs::choose_a(&self.context.0, r.family)
+                .is_some_and(|(a, _)| self.seen_a.insert(a));
             if !unique {
                 continue;
             }
@@ -549,79 +458,15 @@ impl EngineSession {
         self.polynomials
     }
     pub fn extract_factor(&self) -> Result<Natural, EngineError> {
-        extract(&self.context.0, &self.collector.columns)
+        extract::extract(&self.context.0, &self.collector.columns)
     }
 }
 
-fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural, EngineError> {
-    let matrix_cols: Vec<Vec<u32>> = columns
-        .iter()
-        .map(|c| {
-            let mut v = Vec::new();
-            if c.sign {
-                v.push(0)
-            }
-            for &(i, e) in &c.powers {
-                if e & 1 != 0 {
-                    v.push(i + 1)
-                }
-            }
-            v
-        })
-        .collect();
-    let matrix = SparseBinaryMatrix::from_columns(ctx.base.len() + 1, &matrix_cols)
-        .map_err(|_| EngineError::InvalidDependency)?;
-    let dependencies = matrix
-        .filtered_dependencies()
-        .map_err(|_| EngineError::ResourceLimit)?;
-    for dep in dependencies.iter() {
-        if !matrix.verify_dependency(dep) {
-            return Err(EngineError::InvalidDependency);
-        }
-        let mut x = Natural::ONE;
-        let mut y = Natural::ONE;
-        let mut sums = vec![0u32; ctx.base.len()];
-        for (j, c) in columns.iter().enumerate() {
-            if (dep[j / 64] >> (j % 64)) & 1 == 0 {
-                continue;
-            }
-            x = x.mul_mod(&c.root, &ctx.n);
-            for &lp in &c.extra_sqrt {
-                y = y.mul_mod(&Natural::from_u64(lp), &ctx.n);
-            }
-            for &(i, e) in &c.powers {
-                sums[i as usize] += e
-            }
-        }
-        for (e, &s) in ctx.base.iter().zip(&sums) {
-            for _ in 0..s / 2 {
-                y = y.mul_mod(&Natural::from_u64(e.prime as u64), &ctx.n)
-            }
-        }
-        let d = if x >= y {
-            x.wrapping_sub(&y)
-        } else {
-            y.wrapping_sub(&x)
-        };
-        let g = d.gcd(&ctx.n);
-        if !g.is_one() && g != ctx.n {
-            return Ok(g);
-        }
-        let g = x.add_mod(&y, &ctx.n).gcd(&ctx.n);
-        if !g.is_one() && g != ctx.n {
-            return Ok(g);
-        }
-    }
-    Err(EngineError::NoFactor)
-}
-
-fn relation_target(base_len: usize) -> usize {
-    #[cfg(any(unix, windows))]
-    if let Some(percent) = std::env::var("RUSQSIEVE_REL_PERCENT")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        return (base_len * percent.clamp(50, 110) / 100).max(64);
+fn relation_target(base_len: usize, percent: Option<usize>) -> usize {
+    if let Some(percent) = percent {
+        // Fewer than one relation per factor-base row cannot produce the
+        // dependencies SIQS needs, so reject misleading under-target tuning.
+        return (base_len * percent.clamp(100, 110) / 100).max(base_len + 1);
     }
     base_len + 64
 }
@@ -630,12 +475,17 @@ fn relation_target(base_len: usize) -> usize {
 pub fn factor(
     mut n: Natural,
     threads: usize,
+    tuning: &FactorTuning,
+    witness_seed: Option<[u8; 32]>,
     mut progress: impl FnMut(EngineProgress) -> bool,
 ) -> Result<Vec<Natural>, EngineError> {
     if n.is_zero() {
         return Err(EngineError::Setup("zero has no prime factorization".into()));
     }
-    let primality = PrimalityConfig::default();
+    let mut primality = PrimalityConfig::default();
+    if let Some(seed) = witness_seed {
+        primality.witnesses = WitnessPolicy::Seeded { seed };
+    }
     let mut factors = Vec::new();
     for &p in crate::smallfactor::small_primes() {
         if p > 10_000 {
@@ -653,7 +503,14 @@ pub fn factor(
     if n.is_one() {
         return Ok(factors);
     }
-    factor_node(n, threads.max(1), &primality, &mut progress, &mut factors)?;
+    factor_node(
+        n,
+        threads.max(1),
+        &primality,
+        tuning,
+        &mut progress,
+        &mut factors,
+    )?;
     factors.sort();
     Ok(factors)
 }
@@ -663,6 +520,7 @@ fn factor_node(
     n: Natural,
     threads: usize,
     pc: &PrimalityConfig,
+    tuning: &FactorTuning,
     progress: &mut impl FnMut(EngineProgress) -> bool,
     out: &mut Vec<Natural>,
 ) -> Result<(), EngineError> {
@@ -704,7 +562,7 @@ fn factor_node(
     }
     if let Some((root, k)) = n.perfect_power() {
         let mut fs = Vec::new();
-        factor_node(root, threads, pc, progress, &mut fs)?;
+        factor_node(root, threads, pc, tuning, progress, &mut fs)?;
         for _ in 0..k {
             out.extend(fs.iter().cloned())
         }
@@ -722,7 +580,7 @@ fn factor_node(
         Some(factor) => {
             #[cfg(test)]
             stage_counts::bump(&stage_counts::RHO);
-            if std::env::var_os("RUSQSIEVE_PROFILE").is_some() {
+            if tuning.profile {
                 eprintln!(
                     "PROFILE rho input_bits={} factor_bits={} siqs=false",
                     n.bit_len(),
@@ -731,20 +589,21 @@ fn factor_node(
             }
             factor
         }
-        None => find_factor(n.clone(), threads, progress)?,
+        None => find_factor(n.clone(), threads, tuning, progress)?,
     };
     if d.is_one() || d == n {
         return Err(EngineError::NoFactor);
     }
     let q = n.div_rem(&d).unwrap().0;
-    factor_node(d, threads, pc, progress, out)?;
-    factor_node(q, threads, pc, progress, out)
+    factor_node(d, threads, pc, tuning, progress, out)?;
+    factor_node(q, threads, pc, tuning, progress, out)
 }
 
 #[cfg(any(unix, windows))]
 fn find_factor(
     n: Natural,
     threads: usize,
+    tuning: &FactorTuning,
     progress: &mut impl FnMut(EngineProgress) -> bool,
 ) -> Result<Natural, EngineError> {
     // Small inputs finish faster than 96 OS threads take to spawn and join, so
@@ -767,10 +626,10 @@ fn find_factor(
     }
     #[cfg(test)]
     stage_counts::bump(&stage_counts::SIQS);
-    let prof = std::env::var_os("RUSQSIEVE_PROFILE").is_some();
+    let prof = tuning.profile;
     let t_fb = std::time::Instant::now();
-    let ctx = prepare(n.clone())?.0;
-    let target = relation_target(ctx.base.len());
+    let ctx = prepare(n.clone(), tuning)?.0;
+    let target = relation_target(ctx.base.len(), ctx.relation_percent);
     if prof {
         eprintln!(
             "PROFILE fb_build={:.3}s nfb={} interval={} target={}",
@@ -802,7 +661,7 @@ fn find_factor(
                         if cancellation.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        if tx.send(sieve_family(&c, f, &mut scratch)).is_err() {
+                        if tx.send(siqs::sieve_family(&c, f, &mut scratch)).is_err() {
                             break;
                         }
                     }
@@ -837,7 +696,7 @@ fn find_factor(
         buffered.insert(result.family, result);
         while let Some(r) = buffered.remove(&next_merge) {
             next_merge += 1;
-            let unique_a = choose_a(&ctx, r.family)
+            let unique_a = siqs::choose_a(&ctx, r.family)
                 .map(|(a, _)| seen_a.insert(a))
                 .unwrap_or(false);
             if !unique_a {
@@ -920,7 +779,7 @@ fn find_factor(
         return Err(EngineError::Cancelled);
     }
     let t_la = std::time::Instant::now();
-    let result = extract(&ctx, &collector.columns);
+    let result = extract::extract(&ctx, &collector.columns);
     if prof {
         eprintln!(
             "PROFILE extract(LA)={:.3}s columns={}",
@@ -940,273 +799,7 @@ fn find_factor(
     result
 }
 
-fn sieve_family(ctx: &Context, family: u64, scratch: &mut EngineScratch) -> FamilyResult {
-    let empty = |family| FamilyResult {
-        family,
-        polynomials: 0,
-        relations: Vec::new(),
-        survivors: 0,
-    };
-    let Some((a, aidx)) = choose_a(ctx, family) else {
-        return empty(family);
-    };
-    let base = &ctx.base;
-    let nfb = base.len();
-    let s = aidx.len();
-    let nvar = (s - 1).min(9); // number of sign bits varied per family
-    let variants = 1u64 << nvar;
-
-    // SIQS B-values: b = Σ ±Bⱼ, with Bⱼ ≡ ±sqrt(n) (mod qⱼ), 0 (mod other q).
-    // Keep the true signed B instead of reducing it modulo A. This is the standard self-init
-    // representation used by FLINT and makes every Gray-code root update one conditional
-    // add/subtract, without a per-prime correction for modular-A wraps.
-    let mut bvals: Vec<Natural> = Vec::with_capacity(s);
-    for &i in &aidx {
-        let q = base[i as usize].prime;
-        let Some((ap, _)) = a.div_rem_u64(q as u64) else {
-            return empty(family);
-        };
-        let Some(apinv) = inv_u32(ap.mod_u64(q as u64) as u32, q) else {
-            return empty(family);
-        };
-        let mut coeff = (base[i as usize].sqrt_n as u64 * apinv as u64) % q as u64;
-        coeff = coeff.min(q as u64 - coeff);
-        bvals.push(ap.checked_mul(&Natural::from_u64(coeff)).unwrap());
-    }
-    let mut b = Natural::ZERO;
-    for bj in &bvals {
-        b = b.checked_add(bj).unwrap();
-    }
-    let mut bneg = false;
-    let two_full: Vec<Natural> = bvals[..nvar].iter().map(|bj| bj.wrapping_add(bj)).collect();
-
-    // Per-prime precompute for the initial polynomial: both roots and, for each
-    // varying B-value, the O(1) root advance `2·Bⱼ·a⁻¹ mod p`.
-    scratch.root1.clear();
-    scratch.root1.resize(nfb, u32::MAX);
-    scratch.root2.clear();
-    scratch.root2.resize(nfb, 0);
-    scratch.bainv.clear();
-    scratch.bainv.resize(nvar * nfb, 0);
-    for (idx, e) in base.iter().enumerate() {
-        let p = e.prime;
-        if p == 2 {
-            continue;
-        }
-        let ap = a.mod_u64(p as u64) as u32;
-        if ap == 0 {
-            continue; // p | a: linear fallback per polynomial (root1 stays MAX)
-        }
-        let Some(ainvp) = inv_u32(ap, p) else {
-            continue;
-        };
-        let mut bp = b.mod_u64(p as u64) as u32;
-        if bneg && bp != 0 {
-            bp = p - bp;
-        }
-        let xroot1 = mulmod_u32((e.sqrt_n + p - bp) % p, ainvp, p);
-        let xroot2 = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, ainvp, p);
-        let r1 = add_mod_u32(xroot1, ctx.interval_mod_p[idx], p);
-        let r2 = add_mod_u32(xroot2, ctx.interval_mod_p[idx], p);
-        scratch.root1[idx] = r1.min(r2);
-        scratch.root2[idx] = r1.max(r2);
-        for (j, bj) in bvals.iter().take(nvar).enumerate() {
-            let bjp = bj.mod_u64(p as u64) as u32;
-            let two_bjp = (2 * bjp as u64 % p as u64) as u32;
-            scratch.bainv[j * nfb + idx] = mulmod_u32(two_bjp, ainvp, p);
-        }
-    }
-
-    // Sieve every polynomial in Gray-code order, advancing the roots in O(1) per
-    // prime between consecutive polynomials instead of recomputing them.
-    let mut relations = Vec::new();
-    let mut survivors = 0u64;
-    for v in 0..variants {
-        survivors += sieve_one_poly(
-            ctx,
-            &a,
-            &b,
-            bneg,
-            &aidx,
-            &scratch.root1,
-            &scratch.root2,
-            &mut scratch.scores,
-            &mut scratch.candidates,
-            &mut relations,
-        ) as u64;
-        if v + 1 >= variants {
-            break;
-        }
-        let j = (v + 1).trailing_zeros() as usize;
-        let gray = v ^ (v >> 1);
-        let flip_to_one = (gray >> j) & 1 == 0;
-        let add_bainv = if flip_to_one {
-            (b, bneg) = signed_add(&b, bneg, &two_full[j], true);
-            true
-        } else {
-            (b, bneg) = signed_add(&b, bneg, &two_full[j], false);
-            false
-        };
-        let off = j * nfb;
-        if add_bainv {
-            for idx in 0..nfb {
-                if scratch.root1[idx] == u32::MAX {
-                    continue;
-                }
-                let p = base[idx].prime;
-                let d = scratch.bainv[off + idx];
-                let r1 = add_mod_u32(scratch.root1[idx], d, p);
-                let r2 = add_mod_u32(scratch.root2[idx], d, p);
-                scratch.root1[idx] = r1.min(r2);
-                scratch.root2[idx] = r1.max(r2);
-            }
-        } else {
-            for idx in 0..nfb {
-                if scratch.root1[idx] == u32::MAX {
-                    continue;
-                }
-                let p = base[idx].prime;
-                let d = scratch.bainv[off + idx];
-                let r1 = sub_mod_u32(scratch.root1[idx], d, p);
-                let r2 = sub_mod_u32(scratch.root2[idx], d, p);
-                scratch.root1[idx] = r1.min(r2);
-                scratch.root2[idx] = r1.max(r2);
-            }
-        }
-    }
-    FamilyResult {
-        family,
-        polynomials: variants,
-        relations,
-        survivors,
-    }
-}
-
-fn signed_add(a: &Natural, aneg: bool, b: &Natural, bneg: bool) -> (Natural, bool) {
-    if aneg == bneg {
-        let sum = a.checked_add(b).expect("signed SIQS coefficient overflow");
-        let neg = aneg && !sum.is_zero();
-        (sum, neg)
-    } else if a >= b {
-        let diff = a.wrapping_sub(b);
-        let neg = aneg && !diff.is_zero();
-        (diff, neg)
-    } else {
-        let diff = b.wrapping_sub(a);
-        let neg = bneg && !diff.is_zero();
-        (diff, neg)
-    }
-}
-
-fn build_a_candidates(
-    base: &[FactorBaseEntry],
-    target_a: &Natural,
-) -> (Arc<[usize]>, Arc<[usize]>, usize) {
-    let target_bits = target_a.bit_len();
-    let factor_count = target_bits.div_ceil(14).clamp(3, 10);
-    let ideal_bits = target_bits.div_ceil(factor_count);
-    let minimum_bits = ideal_bits.saturating_sub(1).max(2);
-    let all: Vec<usize> = base
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| (32 - e.prime.leading_zeros()) as usize >= minimum_bits)
-        .map(|(i, _)| i)
-        .collect();
-    if all.len() < factor_count {
-        return (all.into(), Arc::from([]), factor_count);
-    }
-    let mut window = 1usize;
-    let pool = loop {
-        let candidates = all
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let bits = (32 - base[i].prime.leading_zeros()) as usize;
-                bits.abs_diff(ideal_bits) <= window
-            })
-            .collect::<Vec<_>>();
-        if candidates.len() >= factor_count * 2 || window >= 31 {
-            break candidates;
-        }
-        window += 1;
-    };
-    debug_assert!(!pool.is_empty(), "choose_a constraints must be satisfiable");
-    (all.into(), pool.into(), factor_count)
-}
-
-fn choose_a(ctx: &Context, family: u64) -> Option<(Natural, Vec<u32>)> {
-    let all = &ctx.a_all;
-    let pool = &ctx.a_pool;
-    let factor_count = ctx.a_factor_count;
-    if all.len() < factor_count || pool.len() < factor_count {
-        return None;
-    }
-    let mut state = family ^ 0x9e3779b97f4a7c15;
-    let mut best = None;
-    for _ in 0..32 {
-        let mut a = Natural::ONE;
-        let mut idx = Vec::with_capacity(factor_count);
-        while idx.len() + 1 < factor_count {
-            state = xorshift(state);
-            let i = pool[state as usize % pool.len()];
-            if idx.contains(&(i as u32)) {
-                continue;
-            }
-            a = a.checked_mul(&Natural::from_u64(ctx.base[i].prime as u64))?;
-            idx.push(i as u32)
-        }
-        let desired_u64 = ctx.target_a.div_rem(&a)?.0.to_u64()?;
-        let last = all
-            .iter()
-            .copied()
-            .filter(|&i| !idx.contains(&(i as u32)))
-            .min_by_key(|&i| (ctx.base[i].prime as u64).abs_diff(desired_u64))?;
-        a = a.checked_mul(&Natural::from_u64(ctx.base[last].prime as u64))?;
-        idx.push(last as u32);
-        let close = a
-            .checked_mul(&Natural::from_u64(5))
-            .zip(ctx.target_a.checked_mul(&Natural::from_u64(4)))
-            .is_some_and(|(lhs, rhs)| lhs >= rhs)
-            && ctx
-                .target_a
-                .checked_mul(&Natural::from_u64(5))
-                .zip(a.checked_mul(&Natural::from_u64(4)))
-                .is_some_and(|(lhs, rhs)| lhs >= rhs);
-        if close {
-            return Some((a, idx));
-        }
-        let distance = if a >= ctx.target_a {
-            a.wrapping_sub(&ctx.target_a)
-        } else {
-            ctx.target_a.wrapping_sub(&a)
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(prior, _, _): &(Natural, Natural, Vec<u32>)| distance < *prior)
-        {
-            best = Some((distance, a, idx));
-        }
-    }
-    best.map(|(_, a, idx)| (a, idx))
-}
-
-/// Tiny-prime skipping: primes below `small_skip()` are not added to the byte scores. They account
-/// for a large share of the score-write traffic (∑ 2·len/p) but contribute little log weight, and
-/// they are still divided out during factoring, so skipping them only removes sieve work. The score
-/// threshold gives their expected contribution back via [`small_slack`].
-///
-/// Raising the skip further was swept at 224-bit (100 / 200 / 400 / 800 / 1600 / 3200) against the
-/// threshold offset and did not win: the score pass gets cheaper but each skipped prime widens the
-/// gap between a smooth value's score and its true log, so more smooth values fall under the
-/// threshold and the polynomial count rises faster. `RUSQSIEVE_SMALL_SKIP` overrides it for tuning.
-fn small_skip() -> u32 {
-    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_default("RUSQSIEVE_SMALL_SKIP", 100) as u32)
-}
-
-/// Expected log weight the score pass loses by skipping the tiny primes: `Σ w(p)/(p−1)` over the
-/// skipped set, since `p^k` divides a random value with probability `1/(p^k)` and the exponents sum
-/// geometrically. Derived from the actual factor base rather than the hardcoded 8 bits v0.2.0 used.
+/// Expected log weight lost by skipping tiny primes.
 fn small_slack(base: &[FactorBaseEntry], skip: u32) -> usize {
     base.iter()
         .filter(|entry| entry.prime < skip)
@@ -1224,47 +817,6 @@ fn small_slack(base: &[FactorBaseEntry], skip: u32) -> usize {
 fn score_weight(prime: u32) -> u8 {
     (32 - prime.leading_zeros()) as u8
 }
-/// Extra score bits required above the smooth threshold. Raising the bar a few bits sharply cuts
-/// false-positive survivors (≈99% of survivors are non-smooth) at the cost of a few more
-/// polynomials. `RUSQSIEVE_THRESH_MARGIN` overrides it for tuning.
-fn thresh_margin() -> i32 {
-    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_default("RUSQSIEVE_THRESH_MARGIN", 0) as i32)
-}
-/// Read a signed tuning delta, zero when unset or unparsable. Used to sweep a tuned parameter
-/// relative to its shipped value without editing the table.
-fn env_delta(name: &str) -> i32 {
-    #[cfg(any(unix, windows))]
-    {
-        std::env::var(name)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = name;
-        0
-    }
-}
-
-/// Read an unsigned tuning override, defaulting when unset or non-Unix. Callers cache the result
-/// in a per-knob `OnceLock` so the hot path never touches the environment or a lock.
-fn env_default(name: &str, default: usize) -> usize {
-    #[cfg(any(unix, windows))]
-    {
-        std::env::var(name)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = name;
-        default
-    }
-}
-
 /// Add the two root strides for one factor-base prime. Interleaving the roots and unrolling two
 /// hits at a time mirrors FLINT's flat sieve kernel and cuts loop-control overhead in the dominant
 /// score-write pass.
@@ -1442,8 +994,7 @@ fn sieve_one_poly(
 ) -> usize {
     let base = &ctx.base;
     let len = (ctx.interval as usize) * 2;
-    // Tuning knobs read once per polynomial (cached), never in the per-prime hot loops.
-    let small_skip = small_skip();
+    let small_skip = ctx.small_skip;
     let bb = b.checked_mul(b).unwrap();
     let (c, csign) = if bb >= ctx.sieve_n {
         (bb.wrapping_sub(&ctx.sieve_n).div_rem(a).unwrap().0, false)
@@ -1456,7 +1007,7 @@ fn sieve_one_poly(
     // `small_slack` gives back the tiny primes that are not scored, and `thresh_adj` is the measured
     // per-tier offset trading survivors against polynomials (see `qs::parameters`).
     let threshold = (g_bits as i32 - ctx.lp_bits as i32 - ctx.small_slack as i32
-        + thresh_margin()
+        + ctx.threshold_margin
         + ctx.thresh_adj)
         .clamp(1, u8::MAX as i32) as u8;
     // Factor-base entries with `prime < small_skip` occupy the low indices (the base is sorted
@@ -1513,7 +1064,7 @@ fn sieve_one_poly(
         let xabs = x.unsigned_abs();
         let ax = a.checked_mul(&Natural::from_u64(xabs)).unwrap();
         // t = a·x + b, needed for the relation's square root.
-        let (t, tneg) = signed_add(&ax, x < 0, b, bneg);
+        let (t, tneg) = siqs::signed_add(&ax, x < 0, b, bneg);
         // Value to factor: g(x) = Q(x)/a = a·x² + 2b·x + c, computed directly with
         // signs (c_math = ∓c per csign). This avoids the wide t² squaring and the
         // division by a — a is guaranteed to divide Q since b² ≡ n (mod a).
@@ -1522,8 +1073,8 @@ fn sieve_one_poly(
             .wrapping_add(b)
             .checked_mul(&Natural::from_u64(xabs))
             .unwrap();
-        let (gx, gxneg) = signed_add(&ax2, false, &two_bx, bneg ^ (x < 0));
-        let (mut q, sign) = signed_add(&gx, gxneg, &c, csign);
+        let (gx, gxneg) = siqs::signed_add(&ax2, false, &two_bx, bneg ^ (x < 0));
+        let (mut q, sign) = siqs::signed_add(&gx, gxneg, &c, csign);
         if q.is_zero() {
             continue;
         }
@@ -1675,7 +1226,7 @@ fn combine_cycle<'a>(rels: impl IntoIterator<Item = &'a Relation>, n: &Natural) 
 /// Classify a factored-out cofactor (>1, fits in `u64`) as a single or double
 /// large prime, or reject it. Portable (no threads / native-only deps).
 fn classify_cofactor(q: u64, single_limit: u64, double_enabled: bool) -> Option<LargePrime> {
-    if is_prime64(q) {
+    if crate::u64math::is_prime(q) {
         return (q <= single_limit).then_some(LargePrime::One(q));
     }
     if !double_enabled {
@@ -1683,7 +1234,13 @@ fn classify_cofactor(q: u64, single_limit: u64, double_enabled: bool) -> Option<
     }
     let d = pollard_u64(q)?;
     let e = q / d;
-    if d > 1 && e > 1 && d <= single_limit && e <= single_limit && is_prime64(d) && is_prime64(e) {
+    if d > 1
+        && e > 1
+        && d <= single_limit
+        && e <= single_limit
+        && crate::u64math::is_prime(d)
+        && crate::u64math::is_prime(e)
+    {
         Some(LargePrime::Two(d.min(e), d.max(e)))
     } else {
         None
@@ -2063,13 +1620,6 @@ fn fastmod(a: u32, p: u32, c: u64) -> u32 {
     let lowbits = c.wrapping_mul(a as u64);
     ((lowbits as u128 * p as u128) >> 64) as u32
 }
-fn xorshift(mut x: u64) -> u64 {
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    x
-}
-
 /// Knuth-Schroeppel multiplier selection. Chooses a small `k` such that `k·n` is a quadratic
 /// residue modulo many small primes, raising the density of smooth `Q(x)` values (a standard
 /// 2–3× QS speed-up). Ported from FLINT's `qsieve_knuth_schroeppel`. Returns `k` (>= 1).
@@ -2095,7 +1645,7 @@ fn knuth_schroeppel(n: &Natural) -> u64 {
     let mut p = 3u64;
     let mut seen = 0usize;
     while seen < KS_PRIMES {
-        if is_prime64(p) {
+        if crate::u64math::is_prime(p) {
             seen += 1;
             let nmod = n.mod_u64(p);
             if nmod != 0 {
@@ -2123,57 +1673,6 @@ fn knuth_schroeppel(n: &Natural) -> u64 {
     }
     k
 }
-fn is_prime64(n: u64) -> bool {
-    if n < 2 {
-        return false;
-    }
-    for p in [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
-        if n == p {
-            return true;
-        }
-        if n.is_multiple_of(p) {
-            return false;
-        }
-    }
-    let (mut d, mut s) = (n - 1, 0);
-    while d % 2 == 0 {
-        d /= 2;
-        s += 1
-    }
-    for a in [2u64, 325, 9375, 28178, 450775, 9780504, 1795265022] {
-        if a % n == 0 {
-            continue;
-        }
-        let mut x = powmod64(a % n, d, n);
-        if x == 1 || x == n - 1 {
-            continue;
-        }
-        let mut ok = false;
-        for _ in 1..s {
-            x = (x as u128 * x as u128 % n as u128) as u64;
-            if x == n - 1 {
-                ok = true;
-                break;
-            }
-        }
-        if !ok {
-            return false;
-        }
-    }
-    true
-}
-fn powmod64(mut a: u64, mut e: u64, n: u64) -> u64 {
-    let mut r = 1;
-    while e != 0 {
-        if e & 1 != 0 {
-            r = (r as u128 * a as u128 % n as u128) as u64
-        }
-        a = (a as u128 * a as u128 % n as u128) as u64;
-        e >>= 1
-    }
-    r
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2188,7 +1687,9 @@ mod tests {
     fn interval_translation_matches_the_signed_coordinate_shift() {
         let p = Natural::from_u64(18_446_744_073_709_551_557);
         let q = Natural::from_u64(18_446_744_073_709_551_533);
-        let ctx = prepare(p.checked_mul(&q).unwrap()).unwrap().0;
+        let ctx = prepare(p.checked_mul(&q).unwrap(), &FactorTuning::default())
+            .unwrap()
+            .0;
         let params = crate::qs::parameters::engine_params(ctx.n.bit_len());
         assert_eq!(ctx.interval, params.sieve_half_width as i32);
         assert!(ctx.interval > 0);
@@ -2226,7 +1727,7 @@ mod tests {
             sqrt_n: 1,
         }];
         let target = Natural::from_u64(1 << 40);
-        let (all, pool, count) = build_a_candidates(&base, &target);
+        let (all, pool, count) = siqs::build_a_candidates(&base, &target);
         assert!(
             all.len() < count || pool.is_empty(),
             "a one-prime factor base cannot supply {count} coefficient factors"
@@ -2252,7 +1753,7 @@ mod tests {
     fn portable_jobs_are_deterministic() {
         let p = Natural::from_u64(18_446_744_073_709_551_557);
         let q = Natural::from_u64(18_446_744_073_709_551_533);
-        let context = prepare(p.checked_mul(&q).unwrap()).unwrap();
+        let context = prepare(p.checked_mul(&q).unwrap(), &FactorTuning::default()).unwrap();
         let a = execute(&context, EngineJob { family: 7 });
         let b = execute(&context, EngineJob { family: 7 });
         assert_eq!(a.family, b.family);
@@ -2272,7 +1773,7 @@ mod tests {
         use std::str::FromStr;
         // 110-bit semiprime that produced 3 duplicate families out of 56 on the native path.
         let n = Natural::from_str("668319744971798315493259725219859").unwrap();
-        let context = prepare(n).unwrap();
+        let context = prepare(n, &FactorTuning::default()).unwrap();
 
         // Feed every family in order, as the coordinator does, and count what is accepted.
         let mut session = EngineSession::new(context.clone());
@@ -2292,7 +1793,7 @@ mod tests {
         // Every accepted family must have contributed a distinct A.
         let mut seen = HashSet::new();
         for family in 0..64u64 {
-            if let Some((a, _)) = choose_a(&context.0, family) {
+            if let Some((a, _)) = siqs::choose_a(&context.0, family) {
                 seen.insert(a);
             }
         }
@@ -2307,7 +1808,7 @@ mod tests {
     fn collector_accepts_out_of_order_results() {
         let p = Natural::from_u64(18_446_744_073_709_551_557);
         let q = Natural::from_u64(18_446_744_073_709_551_533);
-        let context = prepare(p.checked_mul(&q).unwrap()).unwrap();
+        let context = prepare(p.checked_mul(&q).unwrap(), &FactorTuning::default()).unwrap();
         let mut session = EngineSession::new(context.clone());
         let jobs = session.take_jobs(2);
         session.submit(execute(&context, jobs[1]));
@@ -2322,7 +1823,7 @@ mod tests {
         let p = Natural::from_u64(18_446_744_073_709_551_557);
         let q = Natural::from_u64(18_446_744_073_709_551_533);
         let n = p.checked_mul(&q).unwrap();
-        let factors = factor(n.clone(), 2, |_| true).unwrap();
+        let factors = factor(n.clone(), 2, &FactorTuning::default(), None, |_| true).unwrap();
         assert_eq!(factors, [q, p]);
         assert_eq!(
             factors
@@ -2354,8 +1855,8 @@ mod tests {
         use std::str::FromStr;
         for case in DEAD_ZONE {
             let n = Natural::from_str(case).unwrap();
-            let context =
-                prepare(n.clone()).unwrap_or_else(|e| panic!("{case} ({} bits): {e}", n.bit_len()));
+            let context = prepare(n.clone(), &FactorTuning::default())
+                .unwrap_or_else(|e| panic!("{case} ({} bits): {e}", n.bit_len()));
             assert!(
                 !context.0.a_pool.is_empty(),
                 "{case} ({} bits): empty A candidate pool",
@@ -2378,7 +1879,7 @@ mod tests {
         use std::str::FromStr;
         for case in DEAD_ZONE {
             let n = Natural::from_str(case).unwrap();
-            let d = find_factor(n.clone(), 2, &mut |_| true)
+            let d = find_factor(n.clone(), 2, &FactorTuning::default(), &mut |_| true)
                 .unwrap_or_else(|e| panic!("{case} ({} bits): {e}", n.bit_len()));
             assert!(!d.is_one() && d != n, "{case}: trivial factor {d}");
             assert!(
@@ -2408,7 +1909,7 @@ mod tests {
         for case in cases {
             let n = Natural::from_str(case).unwrap();
             stage_counts::reset();
-            let factors = factor(n.clone(), 2, |_| true).unwrap();
+            let factors = factor(n.clone(), 2, &FactorTuning::default(), None, |_| true).unwrap();
             assert_eq!(
                 factors
                     .iter()
@@ -2441,7 +1942,7 @@ mod tests {
         let q = Natural::from_u64(18_446_744_073_709_551_533);
         let n = p.checked_mul(&q).unwrap();
         stage_counts::reset();
-        factor(n, 2, |_| true).unwrap();
+        factor(n, 2, &FactorTuning::default(), None, |_| true).unwrap();
         assert!(stage_counts::siqs() > 0, "128-bit input skipped SIQS");
     }
 

@@ -38,24 +38,6 @@ pub fn sieve_primes(limit: u32) -> Vec<u32> {
     out
 }
 
-#[inline(always)]
-fn mulmod(a: u64, b: u64, m: u64) -> u64 {
-    ((a as u128 * b as u128) % m as u128) as u64
-}
-
-fn powmod(mut a: u64, mut e: u64, m: u64) -> u64 {
-    let mut r = 1u64 % m;
-    a %= m;
-    while e != 0 {
-        if e & 1 == 1 {
-            r = mulmod(r, a, m);
-        }
-        a = mulmod(a, a, m);
-        e >>= 1;
-    }
-    r
-}
-
 #[inline]
 fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
@@ -69,41 +51,7 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
 /// Deterministic Miller–Rabin. The 7-base set is a proven witness set for all
 /// n < 2^64 (Jaeschke / Sinclair), so this is an exact primality test here.
 pub fn is_prime_u64(n: u64) -> bool {
-    if n < 2 {
-        return false;
-    }
-    for &p in &[2u64, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
-        if n == p {
-            return true;
-        }
-        if n.is_multiple_of(p) {
-            return false;
-        }
-    }
-    let mut d = n - 1;
-    let mut s = 0u32;
-    while d & 1 == 0 {
-        d >>= 1;
-        s += 1;
-    }
-    'witness: for &a in &[2u64, 325, 9375, 28178, 450775, 9780504, 1795265022] {
-        let a = a % n;
-        if a == 0 {
-            continue;
-        }
-        let mut x = powmod(a, d, n);
-        if x == 1 || x == n - 1 {
-            continue;
-        }
-        for _ in 1..s {
-            x = mulmod(x, x, n);
-            if x == n - 1 {
-                continue 'witness;
-            }
-        }
-        return false;
-    }
-    true
+    crate::u64math::is_prime(n)
 }
 
 /// Brent's improvement to Pollard's rho with batched GCD. Returns a nontrivial factor of the
@@ -143,7 +91,7 @@ fn pollard_brent(n: u64, cancelled: &mut impl FnMut() -> bool) -> Option<u64> {
                     y = f(y);
                     let diff = x.abs_diff(y);
                     if diff != 0 {
-                        q = mulmod(q, diff, n);
+                        q = crate::u64math::mul_mod(q, diff, n);
                     }
                 }
                 g = gcd_u64(q, n);

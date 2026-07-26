@@ -1,34 +1,5 @@
 //! Sparse binary matrices and verified dependencies.
 use core::fmt;
-use core::ops::Range;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MatrixOperation {
-    Matrix,
-    Transpose,
-}
-#[derive(Clone, Copy, Debug)]
-pub enum MatrixSolver {
-    Auto,
-    DenseGaussian,
-    BlockLanczos,
-}
-#[derive(Clone, Debug)]
-pub struct MatrixConfig {
-    pub solver: MatrixSolver,
-    pub dense_threshold: usize,
-    pub structured_elimination_limit: usize,
-}
-impl Default for MatrixConfig {
-    fn default() -> Self {
-        Self {
-            solver: MatrixSolver::Auto,
-            dense_threshold: 512,
-            structured_elimination_limit: 10_000,
-        }
-    }
-}
-pub type CombinationId = u32;
 
 /// A matrix stored in both row- and column-oriented sparse formats.
 #[derive(Clone, Debug)]
@@ -39,7 +10,6 @@ pub struct SparseBinaryMatrix {
     csr_columns: Box<[u32]>,
     csc_offsets: Box<[u32]>,
     csc_rows: Box<[u32]>,
-    provenance: Box<[CombinationId]>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MatrixError {
@@ -89,7 +59,6 @@ impl SparseBinaryMatrix {
             csr_columns: csr_c.into_boxed_slice(),
             csc_offsets: csc_o.into_boxed_slice(),
             csc_rows: csc_r.into_boxed_slice(),
-            provenance: (0..c).collect::<Vec<_>>().into_boxed_slice(),
         })
     }
     pub fn rows(&self) -> usize {
@@ -100,33 +69,6 @@ impl SparseBinaryMatrix {
     }
     pub fn nonzeros(&self) -> usize {
         self.csc_rows.len()
-    }
-    pub fn provenance(&self) -> &[CombinationId] {
-        &self.provenance
-    }
-    pub fn mul_m_rows(&self, input: &[u64], range: Range<usize>, output: &mut [u64]) {
-        assert!(range.end <= self.rows());
-        assert!(input.len() >= self.columns());
-        assert_eq!(output.len(), range.len());
-        for (row, out) in range.zip(output) {
-            let a = self.csr_offsets[row] as usize;
-            let b = self.csr_offsets[row + 1] as usize;
-            *out = self.csr_columns[a..b]
-                .iter()
-                .fold(0, |v, &c| v ^ input[c as usize]);
-        }
-    }
-    pub fn mul_mt_columns(&self, input: &[u64], range: Range<usize>, output: &mut [u64]) {
-        assert!(range.end <= self.columns());
-        assert!(input.len() >= self.rows());
-        assert_eq!(output.len(), range.len());
-        for (col, out) in range.zip(output) {
-            let a = self.csc_offsets[col] as usize;
-            let b = self.csc_offsets[col + 1] as usize;
-            *out = self.csc_rows[a..b]
-                .iter()
-                .fold(0, |v, &r| v ^ input[r as usize]);
-        }
     }
     pub fn verify_dependency(&self, selected: &[u64]) -> bool {
         if selected.len() < self.columns().div_ceil(64) {
@@ -266,8 +208,6 @@ impl SparseBinaryMatrix {
     /// the O(n³) dense step, turning the linear-algebra phase from a bottleneck
     /// into a small fraction of the run at large input sizes.
     pub fn filtered_dependencies(&self) -> Result<DependencySet, MatrixError> {
-        #[cfg(any(unix, windows))]
-        let filter_started = std::time::Instant::now();
         let nrows = self.rows();
         let ncols = self.columns();
         if ncols == 0 {
@@ -345,16 +285,6 @@ impl SparseBinaryMatrix {
                 reduced_rows += 1;
             }
         }
-        #[cfg(any(unix, windows))]
-        if std::env::var_os("RUSQSIEVE_PROFILE").is_some() {
-            eprintln!(
-                "PROFILE filter={}x{} -> {}x{}",
-                nrows,
-                ncols,
-                reduced_rows,
-                alive_cols.len()
-            );
-        }
         if alive_cols.len() == ncols || alive_cols.len() <= reduced_rows {
             let dense_bytes = ncols.saturating_mul(nrows.div_ceil(64)).saturating_mul(16);
             if dense_bytes > 256 * 1024 * 1024 {
@@ -377,8 +307,6 @@ impl SparseBinaryMatrix {
         let Ok(reduced) = SparseBinaryMatrix::from_columns(reduced_rows, &reduced_cols) else {
             return Err(MatrixError::MalformedOffsets);
         };
-        #[cfg(any(unix, windows))]
-        let dense_started = std::time::Instant::now();
         let words = ncols.div_ceil(64);
         let mut out = Vec::new();
         // Cap the nullspace basis at 64 dependencies. Each one has an independent ~1/2 chance of
@@ -404,15 +332,6 @@ impl SparseBinaryMatrix {
             if self.verify_dependency(&full) {
                 out.push(full.into_boxed_slice());
             }
-        }
-        #[cfg(any(unix, windows))]
-        if std::env::var_os("RUSQSIEVE_PROFILE").is_some() {
-            eprintln!(
-                "PROFILE f2_filter={:.3}s f2_dense={:.3}s dependencies={}",
-                dense_started.duration_since(filter_started).as_secs_f64(),
-                dense_started.elapsed().as_secs_f64(),
-                out.len()
-            );
         }
         Ok(DependencySet { vectors: out })
     }
@@ -463,6 +382,7 @@ fn xor(a: &mut [u64], b: &[u64]) {
 }
 
 #[cfg(all(feature = "wasm-simd128", target_arch = "wasm32"))]
+#[allow(unsafe_code)]
 fn xor(a: &mut [u64], b: &[u64]) {
     // The feature explicitly opts the whole wasm artifact into the simd128
     // baseline, so calling the specialized function is valid.
@@ -470,6 +390,7 @@ fn xor(a: &mut [u64], b: &[u64]) {
 }
 
 #[cfg(all(feature = "wasm-simd128", target_arch = "wasm32"))]
+#[allow(unsafe_code)]
 #[target_feature(enable = "simd128")]
 unsafe fn xor_wasm_simd(a: &mut [u64], b: &[u64]) {
     use core::arch::wasm32::{v128, v128_load, v128_store, v128_xor};
@@ -504,71 +425,6 @@ impl DependencySet {
         self.vectors.is_empty()
     }
 }
-#[derive(Clone, Debug)]
-pub struct F2BlockVector {
-    words: Box<[u64]>,
-}
-impl F2BlockVector {
-    pub fn new(len: usize) -> Self {
-        Self {
-            words: vec![0; len].into_boxed_slice(),
-        }
-    }
-    pub fn as_slice(&self) -> &[u64] {
-        &self.words
-    }
-    pub fn as_mut_slice(&mut self) -> &mut [u64] {
-        &mut self.words
-    }
-}
-#[derive(Clone, Debug)]
-pub struct BlockLanczos {
-    dependencies: DependencySet,
-    complete: bool,
-}
-pub enum LanczosRequest<'a> {
-    MultiplyM { input: &'a [u64] },
-    MultiplyMt { input: &'a [u64] },
-    Complete,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LanczosProgress {
-    Progressed,
-    Complete,
-}
-#[derive(Clone, Debug)]
-pub enum LinearAlgebraError {
-    WrongProductLength,
-    InvalidDependency,
-}
-impl fmt::Display for LinearAlgebraError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "linear algebra error: {self:?}")
-    }
-}
-impl std::error::Error for LinearAlgebraError {}
-impl BlockLanczos {
-    pub fn begin(matrix: &SparseBinaryMatrix) -> Self {
-        Self {
-            dependencies: matrix.filtered_dependencies().unwrap_or_default(),
-            complete: true,
-        }
-    }
-    pub fn request(&self) -> LanczosRequest<'_> {
-        LanczosRequest::Complete
-    }
-    pub fn submit_product(&mut self, _: &[u64]) -> Result<LanczosProgress, LinearAlgebraError> {
-        Ok(if self.complete {
-            LanczosProgress::Complete
-        } else {
-            LanczosProgress::Progressed
-        })
-    }
-    pub fn dependencies(&self) -> Option<&DependencySet> {
-        self.complete.then_some(&self.dependencies)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,13 +434,6 @@ mod tests {
         let d = m.dense_dependencies();
         assert_eq!(d.len(), 1);
         assert!(m.verify_dependency(d.iter().next().unwrap()));
-    }
-    #[test]
-    fn multiply() {
-        let m = SparseBinaryMatrix::from_columns(2, &[vec![0], vec![0, 1]]).unwrap();
-        let mut out = [0; 2];
-        m.mul_m_rows(&[3, 5], 0..2, &mut out);
-        assert_eq!(out, [6, 5]);
     }
 
     #[test]

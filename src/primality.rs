@@ -68,19 +68,15 @@ pub fn is_probable_prime<const P: usize>(n: &Natural<P>, config: &PrimalityConfi
     let nm1 = n.checked_sub(&one).unwrap();
     let s = nm1.trailing_zeros();
     let d = nm1.clone() >> s;
-    let mut rng = seed_state(config, n);
+    let mut rng = match config.witnesses {
+        WitnessPolicy::FirstPrimes => None,
+        WitnessPolicy::Seeded { seed } => Some(ChaCha8::new(seed)),
+    };
     for round in 0..config.rounds.get() {
-        let a = match config.witnesses {
-            WitnessPolicy::FirstPrimes => Natural::from_u64(SMALL[round as usize % SMALL.len()]),
-            WitnessPolicy::Seeded { .. } => {
-                rng = xorshift(rng);
-                Natural::from_u64(2u64.wrapping_add(rng))
-            }
+        let a = match &mut rng {
+            None => Natural::from_u64(SMALL[round as usize % SMALL.len()]),
+            Some(rng) => seeded_witness(n, rng),
         };
-        let a = a.div_rem(n).unwrap().1;
-        if a.is_zero() {
-            continue;
-        }
         let mut x = a.pow_mod(&d, n);
         if x == one || x == nm1 {
             continue;
@@ -242,25 +238,108 @@ fn half_mod<const P: usize>(value: &Natural<P>, n: &Natural<P>) -> Natural<P> {
         (value.clone() >> 1).add_mod(&((n.clone() >> 1).wrapping_add(&Natural::ONE)), n)
     }
 }
-fn seed_state<const P: usize>(c: &PrimalityConfig, n: &Natural<P>) -> u64 {
-    let mut s = 0x9e3779b97f4a7c15;
-    for &x in n.as_parts() {
-        s ^= x;
-        s = xorshift(s)
-    }
-    if let WitnessPolicy::Seeded { seed } = c.witnesses {
-        for chunk in seed.chunks_exact(8) {
-            s ^= u64::from_le_bytes(chunk.try_into().unwrap());
-            s = xorshift(s)
+fn seeded_witness<const P: usize>(n: &Natural<P>, rng: &mut ChaCha8) -> Natural<P> {
+    let range = n.wrapping_sub(&Natural::from_u64(3));
+    let bits = range.bit_len();
+    loop {
+        let mut bytes = vec![0u8; P * 8];
+        for chunk in bytes.chunks_mut(8) {
+            let random = rng.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&random[..chunk.len()]);
+        }
+        if !bits.is_multiple_of(8) {
+            bytes[bits / 8] &= (1u8 << (bits % 8)) - 1;
+        }
+        bytes[bits.div_ceil(8)..].fill(0);
+        let candidate = Natural::from_le_bytes(&bytes).unwrap();
+        if candidate < range {
+            return candidate.wrapping_add(&Natural::from_u64(2));
         }
     }
-    s
 }
-fn xorshift(mut x: u64) -> u64 {
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    x
+
+struct ChaCha8 {
+    state: [u32; 16],
+    block: [u32; 16],
+    cursor: usize,
+}
+
+impl ChaCha8 {
+    fn new(seed: [u8; 32]) -> Self {
+        let mut state = [
+            0x6170_7865,
+            0x3320_646e,
+            0x7962_2d32,
+            0x6b20_6574,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        for (word, bytes) in state[4..12].iter_mut().zip(seed.chunks_exact(4)) {
+            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+        }
+        Self {
+            state,
+            block: [0; 16],
+            cursor: 16,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        if self.cursor == 16 {
+            self.refill();
+        }
+        let low = self.block[self.cursor] as u64;
+        let high = self.block[self.cursor + 1] as u64;
+        self.cursor += 2;
+        low | (high << 32)
+    }
+
+    fn refill(&mut self) {
+        let mut working = self.state;
+        for _ in 0..4 {
+            quarter_round(&mut working, 0, 4, 8, 12);
+            quarter_round(&mut working, 1, 5, 9, 13);
+            quarter_round(&mut working, 2, 6, 10, 14);
+            quarter_round(&mut working, 3, 7, 11, 15);
+            quarter_round(&mut working, 0, 5, 10, 15);
+            quarter_round(&mut working, 1, 6, 11, 12);
+            quarter_round(&mut working, 2, 7, 8, 13);
+            quarter_round(&mut working, 3, 4, 9, 14);
+        }
+        for (out, (mixed, original)) in self
+            .block
+            .iter_mut()
+            .zip(working.into_iter().zip(self.state))
+        {
+            *out = mixed.wrapping_add(original);
+        }
+        self.cursor = 0;
+        self.state[12] = self.state[12].wrapping_add(1);
+        if self.state[12] == 0 {
+            self.state[13] = self.state[13].wrapping_add(1);
+        }
+    }
+}
+
+fn quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(7);
 }
 
 #[cfg(test)]
@@ -275,6 +354,27 @@ mod tests {
         for n in [0, 1, 4, 91, 561, 1105] {
             assert!(!is_probable_prime(&Natural::<2>::from_u64(n), &c))
         }
+    }
+
+    #[test]
+    fn seeded_witnesses_are_reproducible_and_in_range() {
+        let n = Natural::<4>::from_decimal("170141183460469231731687303715884105727").unwrap();
+        let seed = [0x5au8; 32];
+        let mut first = ChaCha8::new(seed);
+        let mut second = ChaCha8::new(seed);
+        let lower = Natural::from_u64(2);
+        let upper = n.wrapping_sub(&lower);
+        for _ in 0..128 {
+            let a = seeded_witness(&n, &mut first);
+            assert_eq!(a, seeded_witness(&n, &mut second));
+            assert!(a >= lower && a <= upper);
+        }
+
+        let config = PrimalityConfig {
+            rounds: NonZero::new(16).unwrap(),
+            witnesses: WitnessPolicy::Seeded { seed },
+        };
+        assert!(is_probable_prime(&n, &config));
     }
 
     /// Below 2^64 the witness set is not Baillie-PSW but the fixed `SMALL` table, so these are the

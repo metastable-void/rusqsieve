@@ -68,7 +68,17 @@ fn run() -> Result<(), String> {
     }
     let parallelism = Parallelism::threads(thread_count)
         .ok_or_else(|| "thread count must be nonzero".to_string())?;
-    let config = FactorConfig::default().with_parallelism(parallelism);
+    let config = FactorConfig::default()
+        .with_parallelism(parallelism)
+        .with_tuning_overrides(
+            env_parse("RUSQSIEVE_REL_PERCENT"),
+            env_parse("RUSQSIEVE_SMALL_SKIP"),
+            env_parse("RUSQSIEVE_THRESH_MARGIN"),
+            env_parse("RUSQSIEVE_THRESH_ADJ"),
+            env_parse("RUSQSIEVE_FB_BOUND"),
+            env_parse("RUSQSIEVE_HALFW"),
+            std::env::var_os("RUSQSIEVE_PROFILE").is_some(),
+        );
     let factors = factor_with_progress(natural.clone(), config, |snapshot| {
         if show_progress {
             let amount = snapshot.amount();
@@ -84,6 +94,11 @@ fn run() -> Result<(), String> {
                         thread_count
                     ),
                     rusqsieve::ProgressTotal::Unknown => eprint!(
+                        "\nsieving: {} relations, {} workers",
+                        amount.completed(),
+                        thread_count
+                    ),
+                    _ => eprint!(
                         "\nsieving: {} relations, {} workers",
                         amount.completed(),
                         thread_count
@@ -139,6 +154,10 @@ fn run() -> Result<(), String> {
 
 fn default_parallelism() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+fn env_parse<T: core::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok()?.parse().ok()
 }
 
 fn parse_options() -> Result<Options, String> {

@@ -37,6 +37,46 @@ fn zero_and_one() {
         Err(FactorError::ZeroHasNoPrimeFactorization)
     ));
     assert!(factor(one).unwrap().is_empty());
+    for prime in [2u64, 3] {
+        let input: Natural = Natural::from_u64(prime);
+        let factors = factor(input.clone()).unwrap();
+        assert_eq!(factors.total_len(), 1);
+        assert!(factors.verify_product(&input));
+    }
+}
+
+#[test]
+fn widths_above_the_engine_capacity_use_the_real_siqs_path() {
+    let input =
+        Natural::<17>::from_decimal("18446744400127067027").expect("65-bit value fits 17 limbs");
+    let factors = factor(input.clone()).unwrap();
+    assert!(factors.verify_product(&input));
+    assert_eq!(factors.distinct_len(), 2);
+}
+
+#[test]
+fn perfect_power_and_recursive_multifactor_inputs() {
+    let prime = Natural::<16>::from_decimal("170141183460469231731687303715884105727").unwrap();
+    let square = prime.checked_mul(&prime).unwrap();
+    let factors = factor(square.clone()).unwrap();
+    assert!(factors.verify_product(&square));
+    assert_eq!(factors.multiplicity(&prime).unwrap().get(), 2);
+
+    let three_prime = Natural::<16>::from_decimal("10007000160112000630441").unwrap();
+    // 10007 × 1000000007 × 1000000009
+    let factors = factor(three_prime.clone()).unwrap();
+    assert!(factors.verify_product(&three_prime));
+    assert_eq!(factors.total_len(), 3);
+
+    let odd = Natural::<16>::from_u64(1_000_003);
+    let power_of_two_input = odd.clone() << 180;
+    let factors = factor(power_of_two_input.clone()).unwrap();
+    assert!(factors.verify_product(&power_of_two_input));
+    assert_eq!(
+        factors.multiplicity(&Natural::from_u64(2)).unwrap().get(),
+        180
+    );
+    assert_eq!(factors.multiplicity(&odd).unwrap().get(), 1);
 }
 
 #[test]

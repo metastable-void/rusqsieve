@@ -2,6 +2,7 @@
 #define RUSQSIEVE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,8 +21,29 @@ enum rusqsieve_status {
     RUSQSIEVE_INVALID_DECIMAL = 2,
     RUSQSIEVE_INPUT_OUT_OF_RANGE = 3,
     RUSQSIEVE_FACTORIZATION_FAILED = 4,
-    RUSQSIEVE_INTERNAL_ERROR = 5
+    RUSQSIEVE_INTERNAL_ERROR = 5,
+    RUSQSIEVE_CANCELLED = 6
 };
+
+struct rusqsieve_progress {
+    uint32_t phase;
+    uint64_t completed;
+    uint64_t total;
+    uint32_t total_kind;
+    uint32_t unit;
+};
+
+/* Return 0 to continue or nonzero to request cooperative cancellation. */
+typedef int (*rusqsieve_progress_callback)(
+    const struct rusqsieve_progress *progress,
+    void *context
+);
+
+/* Return the ABI version implemented by this library (currently 2). */
+uint32_t rusqsieve_abi_version(void);
+
+/* Return a process-lifetime static description for a status code. */
+const char *rusqsieve_strerror(int status);
 
 /* Allocate a new empty result. */
 rusqsieve_factors *rusqsieve_factors_new(void);
@@ -54,8 +76,8 @@ const char *rusqsieve_factors_get(
 /*
  * Factor the positive base-10 integer n ("1" has an empty factorization).
  *
- * threads == 0 uses available parallelism capped at 48. A nonzero value
- * requests that worker count, although the engine may cap tiny inputs.
+ * threads == 0 uses available parallelism capped at 48. A nonzero value is
+ * capped at 256; the engine may cap smaller inputs further.
  *
  * On success, factors is replaced with the complete sorted factorization.
  * Prime factors are repeated according to multiplicity; n == "1" succeeds
@@ -67,10 +89,30 @@ const char *rusqsieve_factors_get(
  * Calls that read, factor into, or free the same result must not overlap across
  * threads. Independent result objects may be used concurrently.
  */
-int rusqsieve_factor(
+enum rusqsieve_status rusqsieve_factor(
     const char *n,
     size_t threads,
     rusqsieve_factors *factors
+);
+
+/*
+ * Factor with progress and cancellation. callback may be NULL. The callback
+ * runs on the calling thread; context is passed through unchanged.
+ *
+ * Stable phase codes are preprocessing=0, factor-base=1, sieving=2,
+ * linear-algebra=6, extraction=7, complete=9.
+ *
+ * total_kind is unknown=0, exact=1, estimated=2. Unit codes are candidates=0,
+ * primes=1, sieve-positions=3, relations=4, matrix-rows=5,
+ * matrix-columns=6, matrix-nonzeros=7, iterations=8, matrix-products=9,
+ * tasks=10.
+ */
+enum rusqsieve_status rusqsieve_factor_with_progress(
+    const char *n,
+    size_t threads,
+    rusqsieve_factors *factors,
+    rusqsieve_progress_callback callback,
+    void *context
 );
 
 #ifdef __cplusplus

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl target
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --target x86_64-unknown-linux-musl --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --target x86_64-unknown-linux-musl
+      - run: cargo test --locked --target x86_64-unknown-linux-musl --no-default-features
+      - run: cargo test --locked --target x86_64-unknown-linux-musl --features cli
+      - run: cargo test --locked --target x86_64-unknown-linux-musl --profile release-test
+      - name: Verify documentation references
+        run: |
+          rustc tools/audit-doc-links.rs -o /tmp/rusqsieve-audit-doc-links
+          /tmp/rusqsieve-audit-doc-links
+      - name: Compile and run the C ABI smoke test
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-musl
+          musl-gcc -std=c11 -Wall -Wextra -Werror -I. tests/c_api_smoke.c \
+            target/x86_64-unknown-linux-musl/release/librusqsieve.a \
+            -lpthread -ldl -lm -o /tmp/rusqsieve-c-smoke
+          /tmp/rusqsieve-c-smoke
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown
+      - run: make wasm
+      - run: ./build-release.sh wasm32-unknown-unknown
+
+  slow-factorization:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - run: cargo test --locked --target x86_64-unknown-linux-musl --profile release-test --test factorization -- --ignored
