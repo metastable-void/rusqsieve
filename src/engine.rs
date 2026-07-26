@@ -5,6 +5,8 @@ mod wire;
 
 use crate::f2::SparseBinaryMatrix;
 use crate::factor::FactorTuning;
+#[cfg(any(unix, windows))]
+use crate::natural::MontgomeryContext;
 use crate::qs::{AutoOr, FactorBaseEntry, MultiplierChoice, QsConfig, prepare_factor_base};
 use crate::{Natural, PARTS, jacobi_u64};
 #[cfg(any(unix, windows))]
@@ -197,11 +199,12 @@ pub(crate) fn validate_worker_packet(bytes: &[u8]) -> bool {
 /// it. Hence a budget rather than a bit-length gate.
 ///
 /// `factor_base_bound × sieve_half_width` from the tier table is used as the SIQS cost proxy; it
-/// tracks measured sieve time within about 3× across 90-256 bits. The divisor is calibrated against
-/// a measured ~530 ns per iteration — one `Natural::mul_mod`, which is a full Knuth division on this
-/// crate's arithmetic — to hold the stage near 1% of the estimated sieve: 1 024 iterations (the
-/// floor) up to 128 bits, ~18 k at 192, ~131 k at 224, ~328 k at 256, measured at 0.7-1.5% of total
-/// wall time on balanced semiprimes at those sizes.
+/// tracks measured sieve time within about 3× across 90-256 bits. The divisor was calibrated when
+/// each iteration used division-based `Natural::mul_mod`, holding the stage near 1% of the estimated
+/// sieve: 1 024 iterations (the floor) up to 128 bits, ~18 k at 192, ~131 k at 224, ~328 k at 256.
+/// Real Montgomery REDC subsequently made the repeated modular arithmetic cheaper. The iteration
+/// counts deliberately remain unchanged: this reduces unsuccessful-rho overhead on balanced inputs
+/// without silently spending the saving on a deeper search.
 ///
 /// Brent finds a factor `p` in roughly `1.2·sqrt(p)` iterations, so this covers factors up to about
 /// 2^26 at 192 bits and 2^34 at 256 — above the 10^4 trial-division bound and below the 2^64 point
@@ -1259,6 +1262,10 @@ fn pollard_brent_natural(
     if n.is_even() {
         return Ok(Some(Natural::from_u64(2)));
     }
+    // One conversion at each boundary amortizes across the entire rho stage.
+    // All polynomial values and batched products remain Montgomery residues;
+    // gcd(qR mod n, n) == gcd(q, n) because odd n makes R invertible.
+    let montgomery = MontgomeryContext::new(n).expect("rho modulus is odd and engine-sized");
     let mut iterations = 0u64;
     for c_value in 1..=8u64 {
         if iterations >= iteration_limit {
@@ -1267,8 +1274,8 @@ fn pollard_brent_natural(
         if !keep_going() {
             return Err(EngineError::Cancelled);
         }
-        let c = Natural::from_u64(c_value);
-        let mut y = Natural::from_u64(2);
+        let c = montgomery.encode(&Natural::from_u64(c_value));
+        let mut y = montgomery.encode(&Natural::from_u64(2));
         let mut r = 1u64;
         let mut g = Natural::ONE;
         let mut x = Natural::ZERO;
@@ -1276,7 +1283,7 @@ fn pollard_brent_natural(
         while g.is_one() && iterations < iteration_limit {
             x = y.clone();
             for _ in 0..r {
-                y = y.mul_mod(&y, n).add_mod(&c, n);
+                y = montgomery.add(&montgomery.square(&y), &c);
                 iterations += 1;
                 if iterations >= iteration_limit {
                     break;
@@ -1288,17 +1295,17 @@ fn pollard_brent_natural(
                     return Err(EngineError::Cancelled);
                 }
                 ys = y.clone();
-                let mut q = Natural::ONE;
+                let mut q = montgomery.one();
                 let batch = (r - k).min(128);
                 for _ in 0..batch {
-                    y = y.mul_mod(&y, n).add_mod(&c, n);
+                    y = montgomery.add(&montgomery.square(&y), &c);
                     let difference = if x >= y {
                         x.wrapping_sub(&y)
                     } else {
                         y.wrapping_sub(&x)
                     };
                     if !difference.is_zero() {
-                        q = q.mul_mod(&difference, n);
+                        q = montgomery.multiply(&q, &difference);
                     }
                     iterations += 1;
                     if iterations >= iteration_limit {
@@ -1315,7 +1322,7 @@ fn pollard_brent_natural(
                 if !keep_going() {
                     return Err(EngineError::Cancelled);
                 }
-                ys = ys.mul_mod(&ys, n).add_mod(&c, n);
+                ys = montgomery.add(&montgomery.square(&ys), &c);
                 let difference = if x >= ys {
                     x.wrapping_sub(&ys)
                 } else {

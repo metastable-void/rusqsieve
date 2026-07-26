@@ -634,6 +634,160 @@ impl<const P: usize> Natural<P> {
     }
 }
 
+/// Reusable Montgomery arithmetic for one odd modulus.
+///
+/// Values returned by [`Self::encode`] remain multiplied by `R = 2^(64·limbs)`
+/// modulo `modulus`. Keeping a whole modular-arithmetic loop in that domain
+/// amortizes the two conversions and replaces Knuth division with word
+/// multiplication and carry propagation.
+#[cfg(any(unix, windows, test))]
+pub(crate) struct MontgomeryContext<const P: usize> {
+    modulus: Natural<P>,
+    negative_inverse: u64,
+    limbs: usize,
+    r2: Natural<P>,
+    one: Natural<P>,
+}
+
+#[cfg(any(unix, windows, test))]
+impl<const P: usize> MontgomeryContext<P> {
+    /// Constructs a context for an odd modulus supported by the inline REDC
+    /// workspace. Shipped factorization uses `P == 16`; wider user-selected
+    /// integer capacities retain the division-based arithmetic.
+    pub(crate) fn new(modulus: &Natural<P>) -> Option<Self> {
+        let limbs = sig_len(modulus.as_parts());
+        if limbs == 0 || modulus.is_even() || P > 16 {
+            return None;
+        }
+
+        // Newton iteration doubles the number of correct low bits each round.
+        // Starting from 1 (correct modulo 2), six rounds produce n^-1 mod 2^64.
+        let mut inverse = 1u64;
+        for _ in 0..6 {
+            inverse = inverse
+                .wrapping_mul(2u64.wrapping_sub(modulus.as_parts()[0].wrapping_mul(inverse)));
+        }
+        let negative_inverse = inverse.wrapping_neg();
+        debug_assert_eq!(
+            modulus.as_parts()[0].wrapping_mul(negative_inverse),
+            u64::MAX
+        );
+
+        // R² mod n is a one-time context cost. Repeated doubling avoids needing
+        // a 2P+1-bit temporary merely to express 2^(128·limbs).
+        let mut r2 = Natural::ONE;
+        if r2 >= *modulus {
+            r2 = r2.div_rem(modulus)?.1;
+        }
+        for _ in 0..(128 * limbs) {
+            r2 = r2.add_mod(&r2, modulus);
+        }
+
+        let mut context = Self {
+            modulus: modulus.clone(),
+            negative_inverse,
+            limbs,
+            r2,
+            one: Natural::ZERO,
+        };
+        context.one = context.encode(&Natural::ONE);
+        Some(context)
+    }
+
+    pub(crate) fn encode(&self, value: &Natural<P>) -> Natural<P> {
+        debug_assert!(value < &self.modulus);
+        self.multiply_reduced(value, &self.r2)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode(&self, value: &Natural<P>) -> Natural<P> {
+        self.multiply_reduced(value, &Natural::ONE)
+    }
+
+    pub(crate) fn one(&self) -> Natural<P> {
+        self.one.clone()
+    }
+
+    pub(crate) fn add(&self, lhs: &Natural<P>, rhs: &Natural<P>) -> Natural<P> {
+        lhs.add_mod(rhs, &self.modulus)
+    }
+
+    pub(crate) fn multiply(&self, lhs: &Natural<P>, rhs: &Natural<P>) -> Natural<P> {
+        self.multiply_reduced(lhs, rhs)
+    }
+
+    pub(crate) fn square(&self, value: &Natural<P>) -> Natural<P> {
+        self.multiply_reduced(value, value)
+    }
+
+    fn multiply_reduced(&self, lhs: &Natural<P>, rhs: &Natural<P>) -> Natural<P> {
+        debug_assert!(lhs < &self.modulus && rhs < &self.modulus);
+        let product = lhs.widening_mul(rhs);
+        let k = self.limbs;
+        let mut work = [0u64; MAX_DIV_LIMBS];
+        for (index, slot) in work[..2 * k].iter_mut().enumerate() {
+            *slot = if index < P {
+                product.low[index]
+            } else {
+                product.high[index - P]
+            };
+        }
+
+        // REDC: choose m so each low limb becomes zero, then discard it.
+        // The extra word carries overflow from the final reduction column.
+        for i in 0..k {
+            let m = work[i].wrapping_mul(self.negative_inverse);
+            let mut carry = 0u128;
+            for j in 0..k {
+                let value = work[i + j] as u128 + m as u128 * self.modulus.parts[j] as u128 + carry;
+                work[i + j] = value as u64;
+                carry = value >> 64;
+            }
+            let mut at = i + k;
+            let value = work[at] as u128 + carry;
+            work[at] = value as u64;
+            let mut overflow = (value >> 64) as u64;
+            while overflow != 0 {
+                at += 1;
+                let (value, next) = work[at].overflowing_add(overflow);
+                work[at] = value;
+                overflow = next as u64;
+            }
+            debug_assert_eq!(work[i], 0);
+        }
+
+        let mut result = Natural::ZERO;
+        result.parts[..k].copy_from_slice(&work[k..2 * k]);
+        let high = work[2 * k];
+        if high != 0 {
+            let borrowed = self.subtract_modulus(&mut result);
+            debug_assert_eq!(high - borrowed as u64, 0, "REDC result is below 2n");
+        } else if result >= self.modulus {
+            let borrowed = self.subtract_modulus(&mut result);
+            debug_assert!(!borrowed);
+        }
+        debug_assert!(
+            result < self.modulus,
+            "REDC not canonical: limbs={k} high={high} result={result} modulus={}",
+            self.modulus
+        );
+        result
+    }
+
+    /// Subtract the significant modulus limbs, returning the borrow into the
+    /// implicit `R` word used by REDC.
+    fn subtract_modulus(&self, value: &mut Natural<P>) -> bool {
+        let mut borrow = false;
+        for i in 0..self.limbs {
+            let (difference, first) = value.parts[i].overflowing_sub(self.modulus.parts[i]);
+            let (difference, second) = difference.overflowing_sub(borrow as u64);
+            value.parts[i] = difference;
+            borrow = first || second;
+        }
+        borrow
+    }
+}
+
 /// Number of significant (nonzero through) limbs in a little-endian slice.
 #[inline]
 fn sig_len(limbs: &[u64]) -> usize {
@@ -1564,6 +1718,74 @@ mod difftests {
                 to_big(&am).modpow(&to_big(&e), &bm)
             );
         }
+    }
+
+    #[test]
+    fn diff_montgomery_arithmetic() {
+        let mut rng = Rng(0x6d6f_6e74_676f_6d65);
+        for limbs in 1..=P {
+            for _ in 0..100 {
+                let mut modulus = rng.natural(limbs);
+                modulus.as_mut_parts()[0] |= 1;
+                if modulus < Natural::from_u64(3) {
+                    modulus = Natural::from_u64(3);
+                }
+                let context = MontgomeryContext::new(&modulus).expect("odd supported modulus");
+                let a = rng.natural(P).div_rem(&modulus).unwrap().1;
+                let b = rng.natural(P).div_rem(&modulus).unwrap().1;
+                let encoded_a = context.encode(&a);
+                let encoded_b = context.encode(&b);
+
+                assert_eq!(context.decode(&encoded_a), a);
+                assert_eq!(context.decode(&context.one()), Natural::ONE);
+                assert_eq!(
+                    context.decode(&context.add(&encoded_a, &encoded_b)),
+                    a.add_mod(&b, &modulus)
+                );
+                assert_eq!(
+                    context.decode(&context.multiply(&encoded_a, &encoded_b)),
+                    a.mul_mod(&b, &modulus)
+                );
+                assert_eq!(
+                    context.decode(&context.square(&encoded_a)),
+                    a.mul_mod(&a, &modulus)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual Montgomery-versus-division modular-multiply measurement"]
+    fn profile_montgomery_mul() {
+        let modulus: Natural<P> =
+            "115792089237316195423570985008687907852837564279074904382605163141518161494337"
+                .parse()
+                .unwrap();
+        let context = MontgomeryContext::new(&modulus).unwrap();
+        let seed = Natural::from_u64(0xdead_beef_cafe_babe);
+        let repeats = 100_000;
+
+        let mut division_value = seed.clone();
+        let started = std::time::Instant::now();
+        for _ in 0..repeats {
+            division_value =
+                std::hint::black_box(division_value.mul_mod(&division_value, &modulus));
+        }
+        let division_elapsed = started.elapsed();
+
+        let mut montgomery_value = context.encode(&seed);
+        let started = std::time::Instant::now();
+        for _ in 0..repeats {
+            montgomery_value = std::hint::black_box(context.square(&montgomery_value));
+        }
+        let montgomery_elapsed = started.elapsed();
+        assert_eq!(context.decode(&montgomery_value), division_value);
+        eprintln!(
+            "BENCH modular_square_100k division={:.6}s montgomery={:.6}s speedup={:.2}x",
+            division_elapsed.as_secs_f64(),
+            montgomery_elapsed.as_secs_f64(),
+            division_elapsed.as_secs_f64() / montgomery_elapsed.as_secs_f64()
+        );
     }
 
     #[test]

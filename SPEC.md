@@ -266,6 +266,13 @@ division, binary GCD, and modular helpers. Mathematical code must use checked,
 widening, or modular operations wherever wrapping would invalidate an
 invariant.
 
+Native big-integer Pollard–Brent constructs one real Montgomery context for its
+odd modulus. Polynomial values and batched products remain encoded throughout
+the stage; REDC uses limb multiplication and carry propagation rather than
+division. The iteration budget is unchanged from the division-based version,
+so this optimization reduces failed-rho overhead rather than deepening the
+search on balanced semiprimes.
+
 ## 6. Native factorization pipeline
 
 The optimized blocking engine performs:

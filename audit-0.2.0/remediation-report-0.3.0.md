@@ -25,7 +25,7 @@ Per main-brief item:
 | 1.4 cancellation/panics | Done in 0.2.1 | u64 cancellation and first worker panic propagation. |
 | 1.5 Baillie–PSW | Done in 0.2.1 | Rust and browser paths, Lucas execution hook, extended pseudoprime tests, measured +12.6% on primality-only calls and 0.007% of a 256-bit run. |
 | 2.1 resieving | Skipped after implementation/measurement | Net loss at every tested cutoff; full figures are in `CHANGELOG.md`. |
-| 2.2 arithmetic wins | Done/partial in 0.2.1 | All measured material wins landed; the survivor power-list linear scan remains intentionally unchanged at roughly 15 elements. |
+| 2.2 arithmetic wins | Done/partial | All measured material 0.2.1 wins landed; 0.3.0 additionally adds real fixed-limb Montgomery REDC for native big rho. The survivor power-list linear scan remains intentionally unchanged at roughly 15 elements. |
 | 2.3 threshold retune | Partial by numeric criterion | Correct model and per-tier offsets landed; measured gains were about 4%/2%, not the requested 10%. |
 | 2.4 large-prime bound | Partial by numeric criterion | Correct independent bound landed; memory fell 2.2×, not 10×. |
 | 2.5 u64 rho | Done in 0.2.1 | Real Montgomery/Brent batching, 18.4–20.8× on measured cofactors. |
@@ -43,7 +43,7 @@ Per main-brief item:
 |---|---|---|
 | 3.1 environment | Done | No library `std::env` reads remain. CLI maps all tuning variables into owned config; profiling is config-driven. |
 | 3.2 effective config/path | Done | `FactorConfig` contains only honored controls. Every value through 512 significant bits, including `Natural<P>` for `P > 16`, uses optimized SIQS. |
-| 3.3 dead/misnamed code | Done | Removed fake Montgomery/xgcd/Lanczos/provenance/matrix config/session/work/reference-QS/metrics surfaces. Consolidated machine-word primality, powmod, mulmod, and xorshift. Kept `is_square` for BPSW. |
+| 3.3 dead/misnamed code | Done | Removed the fake Montgomery façade and later added a distinct, real REDC context with domain conversions and differential tests. Removed fake xgcd/Lanczos/provenance/matrix config/session/work/reference-QS/metrics surfaces. Consolidated machine-word primality, powmod, mulmod, and xorshift. Kept `is_square` for BPSW. |
 | 3.4 features | Done | Removed three inert features and the type-identity-changing width feature. Remaining features gate CLI, Wasm SIMD, or fuzz hooks. |
 | 3.5 C/Wasm safety | Done | Unwinding release libraries, 256 explicit-thread cap, unsafe pointer exports, copied Wasm input, ABI/status helpers, enum status return, and C progress/cancellation. |
 | 3.6 public hardening | Done except serde | Non-exhaustive enums, accessor errors, must-use queries, named iterators, `IntoIterator`, `TryFrom`, consistent 512-bit bound, compact worker roots. Serde deliberately skipped: the active private wire does not use it and a new public format contract was unjustified. |
@@ -63,11 +63,12 @@ Per main-brief item:
 
 ## Addenda
 
-- Addendum A (ECM): deliberately closed under its own A.7 rule. Phase 3 chose
-  deletion of the false `Montgomery` façade rather than implementation of CIOS.
-  The addendum says ECM on division-based modular arithmetic is not worth
-  building in that case. Pollard p−1 was also not inserted as unmeasured
-  unconditional overhead.
+- Addendum A (ECM): ECM remains deliberately absent. A later standalone
+  experiment added real Montgomery REDC and retained it after measurement, but
+  no ECM budget was introduced: on balanced RSA-like inputs it would remain
+  unsuccessful overhead. Any future ECM stage must be separately opt-in or
+  default-zero and pass the addendum's unbalanced-input acceptance tests.
+  Pollard p−1 was also not inserted as unconditional overhead.
 - Addendum B: all B.1/B.2 lying or stub surfaces were removed; all B.3 text
   defects and reference checks were addressed. B.4’s honestly named
   `pollard_u64` and `Forest` behavior was not changed. The web/tools naming
@@ -78,8 +79,10 @@ Per main-brief item:
 - 0.2.1: patch; private correctness/performance changes only.
 - 0.3.0: breaking minor; public Rust/C/Wasm removals, additions, enum changes,
   feature removals, supported-range enforcement, and wire ABI 2.
-- No new hot-path performance claim is made for 0.3.0. The only wire-size
-  change removes root padding, and no runtime improvement is claimed.
+- Native big-rho Montgomery arithmetic measured 3.10× faster for a 256-bit
+  modular-square kernel and 2.33 s → 1.33–1.34 s over 200 fresh invocations of
+  the fixed unbalanced 224-bit rho case. Interleaved balanced 224-bit runs were
+  a wash (5.55–5.58 s before, 5.55–5.62 s after); no SIQS speedup is claimed.
 - All Phase 2 before/after figures, host details, A/B/A/B method, measured
   rejections, and variance qualifications remain in the 0.2.1 changelog and
   were not re-labeled as new 0.3 measurements.

@@ -102,21 +102,36 @@ documentation work deferred from 0.2.1.
   behavior, SIMD build claims, side-channel warnings, and release targets to
   describe the shipped code.
 
+### Montgomery arithmetic
+
+- Added a real fixed-limb Montgomery context for native big-integer
+  Pollard–Brent. It computes `−N⁻¹ mod 2⁶⁴`, `R² mod N`, maintains encoded
+  residues across the complete rho loop, and performs REDC with word
+  multiplication and carry propagation. Randomized differential tests cover
+  every significant width from one through sixteen limbs.
+- At 256 bits, 100 000 modular squares measured 0.034880 s with
+  division-based reduction and 0.011247 s with Montgomery reduction, a 3.10×
+  kernel speedup. On the fixed unbalanced 224-bit rho input, 200 fresh CLI
+  invocations measured 2.33 s before and 1.33–1.34 s after.
+- The rho iteration budget was intentionally not raised. Interleaved fixed
+  balanced 224-bit runs measured 5.55–5.58 s before and 5.55–5.62 s after,
+  which is a wash; balanced RSA-like inputs do not pay for a deeper rho search.
+
 ### Deliberately not implemented
 
-- ECM is not included. Addendum A explicitly says to abandon ECM when the fake
-  `Montgomery` type is deleted rather than replaced by real CIOS arithmetic;
-  division-based modular multiplication makes ECM harmful at any useful
-  budget. Pollard p−1 was likewise not inserted as unconditional overhead
-  without the required arithmetic and A/B measurements. The bounded
-  Pollard–Brent-to-SIQS ladder remains.
+- ECM is not included. Real Montgomery reduction now exists, but ECM would
+  still be unsuccessful overhead on balanced RSA-like semiprimes unless it is
+  separately budgeted, measured on unbalanced inputs, and disabled by default
+  for the balanced artifact. Pollard p−1 was likewise not inserted as
+  unconditional overhead. The bounded Pollard–Brent-to-SIQS ladder remains.
 - No optional serde dependency was added. The active worker wire is private,
   versioned, fuzzed, and substantially smaller; adding a general serialization
   contract was only a “consider” item and would expand the public format
   surface without serving the current raw-Wasm protocol.
-- No new performance claim is made for 0.3.0. Algorithmic hot paths are
-  unchanged apart from owned tuning access and compact packets; the extensive
-  0.2.1 interleaved measurements and rejected changes remain recorded below.
+- No SIQS speedup is claimed for 0.3.0. The measured Montgomery improvement is
+  confined to native big-integer rho; balanced end-to-end time is unchanged.
+  The extensive 0.2.1 interleaved measurements and rejected changes remain
+  recorded below.
 
 ## 0.2.1 — 2026-07-25
 
