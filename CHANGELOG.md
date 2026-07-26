@@ -83,7 +83,7 @@ documentation work deferred from 0.2.1.
   retuned five SIQS tiers. Verified corpus means fell by 35.9% at 216 bits
   (5.097 s → 3.266 s), 16.8% at 224 bits (6.417 s → 5.340 s), 28.0% at 232 bits
   (11.258 s → 8.107 s), 7.5% at 240 bits (14.733 s → 13.629 s), and 8.0% at 256
-  bits (38.334 s → 35.279 s). The retained `(factor-base bound, half-width,
+  bits (38.334 s → 35.279 s). The initially retained `(factor-base bound, half-width,
   threshold adjustment)` settings are `(135k, 131072, 0)`,
   `(150k, 131072, 0)`, `(200k, 131072, −3)`, `(350k, 131072, −1)`, and
   `(400k, 196608, −5)` respectively.
@@ -94,8 +94,8 @@ documentation work deferred from 0.2.1.
 - Rejected several measured non-wins instead of retaining speculative
   optimization code: a dense prime-only hot stream regressed the 240-bit corpus
   mean by 0.5%; 64-way bit-sliced dependency back-substitution left the 272-bit
-  LA tail unchanged; and 272-bit interval/factor-base sweeps merely shifted
-  time between sieving and LA without a reliable end-to-end gain.
+  LA tail unchanged; and the pre-M4RI 272-bit interval/factor-base sweeps merely
+  shifted time between sieving and LA without a reliable end-to-end gain.
 - Added opt-in LA subphase profiling and removed repeated scans/XORs over
   already-zero high words during echelon construction. On the identical
   9,227×9,619 reduced 256-bit matrix, native echelon time fell from 1.625 s to
@@ -116,6 +116,13 @@ documentation work deferred from 0.2.1.
   0.374 s to 0.317 s at 224 bits (−15.2%) and from 2.803 s to 1.769 s at
   256 bits (−36.9%); total means became 5.176 s and 32.917 s. The fixed
   272-bit anchor's LA/extraction fell from 4.550 s to 2.788 s (−38.7%).
+- Recalibrated browser SIQS tiers after M4RI changed the sieve/LA balance.
+  Five-case Chromium means retained 175k instead of 150k at 224 bits
+  (5.176 s → 5.075 s), `(450k,196608,−4)` instead of
+  `(400k,196608,−5)` at 256 bits (32.917 s → 32.259 s), and
+  `(700k,262144,−4)` instead of `(500k,327680,−4)` at 272 bits
+  (105.110 s → 94.880 s). Re-sweeps at 216, 232, and 240 bits produced
+  no corpus win and were not retained.
 - Added GitHub Actions for musl-native debug and release-profile tests, the
   feature matrix, fmt, clippy with warnings denied, both Wasm build paths, the
   C smoke executable, and scheduled slow 192–256-bit corpus coverage.

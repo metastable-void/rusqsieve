@@ -104,6 +104,11 @@ Per main-brief item:
   and 32.917 s. The fixed 272-bit anchor fell from 4.550 s to 2.788 s for
   LA/extraction. A measured crossover and memory guard preserve scalar
   elimination for smaller or oversized residuals.
+- A post-M4RI Chromium tier re-sweep retained larger factor bases at 224 and
+  256 bits and a larger-base/narrower-interval 272-bit tier. Five-case means
+  changed 5.176 s → 5.075 s, 32.917 s → 32.259 s, and
+  105.110 s → 94.880 s respectively. The 216-, 232-, and 240-bit candidates
+  were measured and rejected.
 - All Phase 2 before/after figures, host details, A/B/A/B method, measured
   rejections, and variance qualifications remain in the 0.2.1 changelog and
   were not re-labeled as new 0.3 measurements.

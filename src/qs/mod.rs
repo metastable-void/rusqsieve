@@ -303,6 +303,21 @@ pub mod parameters {
     /// 256-bit bounds of 300k and 450k all regressed. At 232 bits, −3 and −4 thresholds were equal
     /// over the full corpus (8.107 s versus 8.103 s); −3 is retained as the less permissive setting.
     ///
+    /// The browser tiers were re-swept after eight-pivot M4RI made large residual matrices cheaper.
+    /// Five-case Chromium means retained three changes:
+    ///
+    /// - 224 bits: `(150k, 131072, 0)` → `(175k, 131072, 0)`, 5.176 s → 5.075 s (−2.0%);
+    /// - 256 bits: `(400k, 196608, −5)` → `(450k, 196608, −4)`, 32.917 s → 32.259 s (−2.0%);
+    /// - 272 bits: `(500k, 327680, −4)` → `(700k, 262144, −4)`, 105.110 s → 94.880 s (−9.7%).
+    ///
+    /// The 216-bit 150k boundary regressed. At 232 bits, 250k averaged 7.774 s versus 7.757 s for
+    /// 200k. At 240 bits, 400k and 450k anchor runs regressed. At 256 bits, 500k was a wash and the
+    /// five-case 450k/−3 gain was only 0.4%; −4 won the confirmation corpus. At 272 bits, 600k,
+    /// 700k, and 800k bracketed the bound; 800k exceeded M4RI's working-set guard and fell back to
+    /// scalar elimination. Half-widths 196,608 and 327,680 both lost to 262,144 at 700k. The
+    /// measured 272-bit settings cover the 265–280 tier; unmeasured larger widths retain the prior
+    /// conservative parameters.
+    ///
     /// `thresh_adj` is the measured sieve-threshold offset in bits, added to
     /// `log2|g(x)| − log2(large-prime bound) − small-prime slack`. Deeper thresholds trade more
     /// survivors for fewer polynomials, and the optimum deepens with input size because
@@ -325,10 +340,11 @@ pub mod parameters {
             177..=192 => (100_000, 90_112, 0),
             193..=208 => (120_000, 131_072, -1),
             209..=216 => (135_000, 131_072, 0),
-            217..=224 => (150_000, 131_072, 0),
+            217..=224 => (175_000, 131_072, 0),
             225..=232 => (200_000, 131_072, -3),
             233..=248 => (350_000, 131_072, -1),
-            249..=264 => (400_000, 196_608, -5),
+            249..=264 => (450_000, 196_608, -4),
+            265..=280 => (700_000, 262_144, -4),
             _ => (500_000, 327_680, -4),
         };
         EngineParams {
@@ -336,6 +352,30 @@ pub mod parameters {
             sieve_half_width,
             thresh_adj,
             large_prime_mult: 256,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parameters::engine_params;
+
+    #[test]
+    fn browser_tier_parameters_match_the_confirmed_m4ri_sweep() {
+        let expected = [
+            (216, 135_000, 131_072, 0),
+            (224, 175_000, 131_072, 0),
+            (232, 200_000, 131_072, -3),
+            (240, 350_000, 131_072, -1),
+            (256, 450_000, 196_608, -4),
+            (272, 700_000, 262_144, -4),
+            (281, 500_000, 327_680, -4),
+        ];
+        for (bits, bound, half_width, threshold) in expected {
+            let params = engine_params(bits);
+            assert_eq!(params.factor_base_bound, bound, "{bits}-bit bound");
+            assert_eq!(params.sieve_half_width, half_width, "{bits}-bit width");
+            assert_eq!(params.thresh_adj, threshold, "{bits}-bit threshold");
         }
     }
 }
