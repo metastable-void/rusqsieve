@@ -90,17 +90,47 @@ SIMD:   160,402 bytes
 ```
 
 The primary raw Wasm artifacts are present and passed the build and
-Node/Worker checks. The archive's additional JavaScript glue is incomplete as
-a self-contained demo:
+Node/Worker checks. At the audited revision, the archive's additional
+JavaScript glue was incomplete as a self-contained demo:
 
 ```text
 index.js imports: ./coordinator.js
 archive contains: no web/coordinator.js
 ```
 
-This does not invalidate the raw Wasm modules or custom integrations. It means
-only that the informational frontend cannot be deployed unchanged as a
-self-contained application.
+This did not invalidate the raw Wasm modules or custom integrations.
+
+After remediation, `build-release.sh wasm32-unknown-unknown` produced an
+archive containing:
+
+```text
+abi.js
+coordinator.js
+index.css
+index.html
+index.js
+numtheory.js
+rusqsieve-simd.wasm
+rusqsieve.wasm
+serve.mjs
+worker.js
+```
+
+The extracted package passed a same-directory frontend-reference check.
+
+Post-audit browser-glue verification also passed:
+
+```text
+node tools/browser-arch-check.mjs
+node tools/browser-glue-failure-check.mjs
+node --check web/abi.js web/coordinator.js web/index.js web/worker.js
+```
+
+The focused failure check covers invalid/stale packet handles, bad magic,
+wrong packet kinds, length mismatches, allocator rollback, commands in the
+wrong state, unknown commands, and malformed relation batches. The 192-bit
+eight-worker SIMD benchmark remained factor-correct at 0.937 seconds in the
+post-hardening run.
 
 The GNU release CLI is a dynamically linked x86-64 PIE. The musl release CLI is
 a static PIE. Both factored small smoke inputs correctly from freshly extracted

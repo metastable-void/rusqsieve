@@ -243,7 +243,16 @@ package_wasm() {
     package_dir="$WORK_DIR/rusqsieve-$VERSION-$target"
 
     mkdir -p "$package_dir/web"
-    for web_file in abi.js index.css index.html index.js numtheory.js serve.mjs worker.js; do
+    for web_file in \
+        abi.js \
+        coordinator.js \
+        index.css \
+        index.html \
+        index.js \
+        numtheory.js \
+        serve.mjs \
+        worker.js
+    do
         copy_file 0644 "$SCRIPT_DIR/web/$web_file" "$package_dir/web/$web_file"
     done
     copy_file 0644 "$scalar" "$package_dir/web/rusqsieve.wasm"

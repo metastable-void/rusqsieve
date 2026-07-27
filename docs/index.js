@@ -9,7 +9,14 @@ const SCALAR_WASM_URL = new URL("./rusqsieve.wasm", import.meta.url);
 // Small jobs reduce the tail after the relation target is reached. Two
 // families was consistently best in Node/V8 from 192 through 256 bits.
 const BATCH = 2;
-const MAX_FAMILIES = 2_000_000;
+// Keep the browser scheduler on the engine's bounded family domain. The last
+// issued family is MAX_FAMILIES - 1.
+const MAX_FAMILIES = 100_000;
+const MAX_INPUT_BITS = 512;
+const MAX_DECIMAL_DIGITS = 155;
+const BOOT_TIMEOUT_MS = 30_000;
+const JOB_TIMEOUT_MS = 120_000;
+const RUN_TIMEOUT_MS = 30 * 60_000;
 
 const els = {
   input: document.getElementById("input"),
@@ -30,45 +37,137 @@ let coord = null; // coordinator Worker (owns its own wasm instance)
 let workers = []; // sieve worker pool
 let gen = 0; // generation token so stale worker messages are ignored
 let wasmFlavor = "scalar";
+let runtimeReady = false;
 // Scaling remains positive through 32–48 workers on the 96-thread reference
 // host, while 96 workers regress from startup, memory traffic, and job overshoot.
 const nWorkers = Math.max(1, Math.min(48, navigator.hardwareConcurrency || 4));
 
 async function boot() {
+  runtimeReady = false;
   let module;
   try {
-    module = await loadModule(SIMD_WASM_URL);
+    module = await withTimeout(loadModule(SIMD_WASM_URL), BOOT_TIMEOUT_MS, "SIMD wasm load");
     wasmFlavor = "SIMD";
   } catch {
     // Older engines can still use the portable artifact.
-    module = await loadModule(SCALAR_WASM_URL);
+    module = await withTimeout(
+      loadModule(SCALAR_WASM_URL),
+      BOOT_TIMEOUT_MS,
+      "scalar wasm load",
+    );
+    wasmFlavor = "scalar";
   }
-  coord = new Worker(new URL("./coordinator.js", import.meta.url), { type: "module" });
-  const abi = await new Promise((resolve, reject) => {
-    coord.onmessage = ({ data }) => {
-      if (data.type === "ready") resolve(data.abi);
-      else if (data.type === "error") reject(new Error(data.error));
-    };
-    coord.postMessage({ cmd: "init", module });
-  });
-  workers = await Promise.all(
-    Array.from({ length: nWorkers }, () => {
-      const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
-      return new Promise((resolve) => {
-        w.addEventListener("message", function ready({ data }) {
-          if (data.type === "ready") {
-            w.removeEventListener("message", ready);
-            resolve(w);
-          }
-        });
-        w.postMessage({ cmd: "init", module });
-      });
-    }),
+  const nextCoord = new Worker(new URL("./coordinator.js", import.meta.url), { type: "module" });
+  const nextWorkers = Array.from(
+    { length: nWorkers },
+    () => new Worker(new URL("./worker.js", import.meta.url), { type: "module" }),
   );
-  els.workers.textContent =
-    `${nWorkers} worker${nWorkers === 1 ? "" : "s"} · ${wasmFlavor} · ABI v${abi}`;
+  const bootAbort = new AbortController();
+  try {
+    const [coordinatorReady] = await Promise.all([
+      waitForWorkerReady(nextCoord, module, true, bootAbort.signal),
+      ...nextWorkers.map((worker) =>
+        waitForWorkerReady(worker, module, false, bootAbort.signal),
+      ),
+    ]);
+    coord = nextCoord;
+    workers = nextWorkers;
+    runtimeReady = true;
+    els.workers.textContent =
+      `${nWorkers} worker${nWorkers === 1 ? "" : "s"} · ${wasmFlavor} · ` +
+      `ABI v${coordinatorReady.abi}`;
+  } catch (error) {
+    bootAbort.abort();
+    nextCoord.terminate();
+    for (const worker of nextWorkers) worker.terminate();
+    throw error;
+  }
   els.go.disabled = false;
   els.status.textContent = "Ready.";
+}
+
+function shutdownRuntime() {
+  runtimeReady = false;
+  coord?.terminate();
+  for (const worker of workers) worker.terminate();
+  coord = null;
+  workers = [];
+}
+
+async function restartRuntime() {
+  shutdownRuntime();
+  els.go.disabled = true;
+  await boot();
+}
+
+function waitForWorkerReady(worker, module, requireAbi, signal) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(
+      () => finish(new Error("worker initialization timed out")),
+      BOOT_TIMEOUT_MS,
+    );
+    const cleanup = () => {
+      clearTimeout(timer);
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+      worker.removeEventListener("messageerror", onMessageError);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (error, data) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(data);
+    };
+    const onMessage = ({ data }) => {
+      if (data?.type === "error") {
+        finish(new Error(data.error || "worker initialization failed"));
+      } else if (data?.type === "ready") {
+        if (requireAbi && data.abi !== 2) {
+          finish(new Error(`unsupported rusqsieve wasm ABI ${String(data.abi)}`));
+        } else {
+          finish(null, data);
+        }
+      }
+    };
+    const onError = (event) => {
+      event.preventDefault?.();
+      finish(new Error(event.message || "worker failed during initialization"));
+    };
+    const onMessageError = () => finish(new Error("worker initialization message was invalid"));
+    const onAbort = () => finish(new Error("worker initialization cancelled"));
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    worker.addEventListener("messageerror", onMessageError);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    try {
+      worker.postMessage({ cmd: "init", module });
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+function withTimeout(promise, milliseconds, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), milliseconds);
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 // Parallel quadratic sieve for one hard composite; resolves to a nontrivial factor.
@@ -79,26 +178,131 @@ function siqsParallel(decimal, bits, report) {
     let target = 0;
     let relations = 0;
     let nextFamily = 0;
+    let activeJobs = 0;
+    let pendingSubmissions = 0;
+    let preparedWorkers = 0;
     let finished = false;
+    const workerBusy = new Array(workers.length).fill(false);
+    const workerPrepared = new Array(workers.length).fill(false);
+    const jobTimers = new Map();
+    const runTimer = setTimeout(
+      () => fail(new Error("factorization timed out")),
+      RUN_TIMEOUT_MS,
+    );
 
-    const dispatch = (w) => {
-      if (nextFamily > MAX_FAMILIES) return;
-      const family = nextFamily;
-      nextFamily += BATCH;
-      w.postMessage({ cmd: "sieve", family, count: BATCH, gen: myGen });
+    const cleanup = () => {
+      clearTimeout(runTimer);
+      for (const timer of jobTimers.values()) clearTimeout(timer);
+      jobTimers.clear();
+      coord.onmessage = null;
+      coord.onerror = null;
+      coord.onmessageerror = null;
+      for (const worker of workers) {
+        worker.onmessage = null;
+        worker.onerror = null;
+        worker.onmessageerror = null;
+      }
     };
+    const fail = (error) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const succeed = (factor) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      resolve(factor);
+    };
+    const maybeExhausted = () => {
+      if (
+        !finished &&
+        nextFamily >= MAX_FAMILIES &&
+        activeJobs === 0 &&
+        pendingSubmissions === 0 &&
+        preparedWorkers === workers.length
+      ) {
+        fail(new Error(`relation budget exhausted after ${MAX_FAMILIES} families`));
+      }
+    };
+    const dispatch = (worker, workerIndex) => {
+      if (finished || workerBusy[workerIndex]) return false;
+      if (nextFamily >= MAX_FAMILIES) {
+        maybeExhausted();
+        return false;
+      }
+      const family = nextFamily;
+      const count = Math.min(BATCH, MAX_FAMILIES - nextFamily);
+      nextFamily += count;
+      workerBusy[workerIndex] = true;
+      activeJobs++;
+      const timer = setTimeout(
+        () => fail(new Error(`sieve worker ${workerIndex + 1} timed out`)),
+        JOB_TIMEOUT_MS,
+      );
+      jobTimers.set(workerIndex, timer);
+      try {
+        worker.postMessage({ cmd: "sieve", family, count, gen: myGen });
+      } catch (error) {
+        clearTimeout(timer);
+        jobTimers.delete(workerIndex);
+        workerBusy[workerIndex] = false;
+        activeJobs--;
+        fail(error);
+        return false;
+      }
+      return true;
+    };
+    const finishJob = (workerIndex) => {
+      if (!workerBusy[workerIndex]) {
+        fail(new Error(`unexpected response from idle sieve worker ${workerIndex + 1}`));
+        return false;
+      }
+      clearTimeout(jobTimers.get(workerIndex));
+      jobTimers.delete(workerIndex);
+      workerBusy[workerIndex] = false;
+      activeJobs--;
+      return true;
+    };
+
     coord.onmessage = ({ data }) => {
-      if (data.gen !== myGen && data.type !== "error") return;
+      if (data?.gen !== myGen) return;
       if (data.type === "error") {
-        if (!finished) {
-          finished = true;
-          reject(new Error(data.error));
-        }
+        fail(new Error(data.error || "coordinator failed"));
       } else if (data.type === "session") {
+        if (!Number.isInteger(data.target) || data.target <= 0) {
+          fail(new Error("coordinator returned an invalid relation target"));
+          return;
+        }
         target = data.target;
-        for (const w of workers) w.postMessage({ cmd: "prepare", n: decimal, gen: myGen });
+        try {
+          for (const w of workers) {
+            w.postMessage({ cmd: "prepare", n: decimal, gen: myGen });
+          }
+        } catch (error) {
+          fail(error);
+        }
       } else if (data.type === "submitted") {
+        if (pendingSubmissions <= 0) {
+          fail(new Error("coordinator acknowledged an unknown submission"));
+          return;
+        }
+        pendingSubmissions--;
+        if (
+          !Number.isInteger(data.worker) ||
+          data.worker < 0 ||
+          data.worker >= workers.length ||
+          !Number.isInteger(data.relations) ||
+          data.relations < relations ||
+          !Number.isInteger(data.target) ||
+          data.target <= 0
+        ) {
+          fail(new Error("coordinator returned invalid progress"));
+          return;
+        }
         relations = data.relations;
+        target = data.target;
         const now = performance.now();
         const elapsedSeconds = (now - sieveStarted) / 1000;
         // The accepted relation count accelerates as the partial-relation graph
@@ -117,50 +321,92 @@ function siqsParallel(decimal, bits, report) {
           elapsedSeconds,
           etaSeconds,
         });
-        if (!finished) dispatch(workers[data.worker]);
+        if (!finished) {
+          dispatch(workers[data.worker], data.worker);
+          maybeExhausted();
+        }
       } else if (data.type === "linalg") {
         report({ phase: "linalg" });
       } else if (data.type === "factor") {
-        finished = true;
-        resolve(bytesToBigInt(data.factor));
+        if (!(data.factor instanceof Uint8Array)) {
+          fail(new Error("coordinator returned a malformed factor"));
+          return;
+        }
+        const factor = bytesToBigInt(data.factor);
+        const composite = BigInt(decimal);
+        if (factor <= 1n || factor >= composite || composite % factor !== 0n) {
+          fail(new Error("coordinator returned an invalid factor"));
+          return;
+        }
+        succeed(factor);
+      } else {
+        fail(new Error(`unknown coordinator response: ${String(data.type)}`));
       }
     };
+    coord.onerror = (event) => {
+      event.preventDefault?.();
+      fail(new Error(event.message || "coordinator worker crashed"));
+    };
+    coord.onmessageerror = () => fail(new Error("coordinator returned an invalid message"));
 
     workers.forEach((w, workerIndex) => {
       w.onmessage = ({ data }) => {
-        // Errors are always surfaced; other messages from an obsolete generation
-        // (a worker's in-flight job for a previous composite) are ignored.
+        // Every run response, including errors, is generation-scoped. Old jobs
+        // may finish after a successful factor was already returned.
+        if (data?.gen !== myGen) return;
         if (data.type === "error") {
-          if (!finished) {
-            finished = true;
-            reject(new Error(data.error));
-          }
+          fail(new Error(data.error || `sieve worker ${workerIndex + 1} failed`));
           return;
         }
-        if (finished || data.gen !== myGen) return;
+        if (finished) return;
         if (data.type === "prepared") {
+          if (workerPrepared[workerIndex]) {
+            fail(new Error(`sieve worker ${workerIndex + 1} prepared twice`));
+            return;
+          }
           if (!data.ok) {
-            finished = true;
-            reject(new Error("worker could not build a sieve"));
+            fail(new Error(`sieve worker ${workerIndex + 1} could not build a sieve`));
             return;
           }
-          dispatch(w);
+          workerPrepared[workerIndex] = true;
+          preparedWorkers++;
+          dispatch(w, workerIndex);
         } else if (data.type === "relations") {
+          if (!finishJob(workerIndex)) return;
           if (data.payload) {
-            coord.postMessage(
-              { cmd: "submit", payload: data.payload, worker: workerIndex, gen: myGen },
-              [data.payload.buffer],
-            );
+            if (!(data.payload instanceof Uint8Array)) {
+              fail(new Error(`sieve worker ${workerIndex + 1} returned invalid relations`));
+              return;
+            }
+            pendingSubmissions++;
+            try {
+              coord.postMessage(
+                { cmd: "submit", payload: data.payload, worker: workerIndex, gen: myGen },
+                [data.payload.buffer],
+              );
+            } catch (error) {
+              pendingSubmissions--;
+              fail(error);
+            }
             return;
           }
-          if (nextFamily > MAX_FAMILIES) {
-            finished = true;
-            reject(new Error("relation budget exhausted"));
-          } else dispatch(w);
+          fail(new Error(`sieve worker ${workerIndex + 1} could not serialize relations`));
+        } else {
+          fail(new Error(`unknown sieve-worker response: ${String(data.type)}`));
         }
       };
+      w.onerror = (event) => {
+        event.preventDefault?.();
+        fail(new Error(event.message || `sieve worker ${workerIndex + 1} crashed`));
+      };
+      w.onmessageerror = () =>
+        fail(new Error(`sieve worker ${workerIndex + 1} returned an invalid message`));
     });
-    coord.postMessage({ cmd: "new", n: decimal, gen: myGen });
+    try {
+      coord.postMessage({ cmd: "new", n: decimal, gen: myGen });
+    } catch (error) {
+      fail(error);
+    }
   });
 }
 
@@ -199,6 +445,9 @@ async function factorize(N, report) {
       continue;
     }
     const factor = await siqsParallel(c.toString(), bitLength(c), report);
+    if (factor <= 1n || factor >= c || c % factor !== 0n) {
+      throw new Error("quadratic sieve returned an invalid factor");
+    }
     stack.push(factor, c / factor);
   }
   return groupFactors(primes);
@@ -290,9 +539,16 @@ function render(grouped, original, seconds) {
 // Live "N digits · M bits" readout for whatever is currently in the input box.
 function updateInputInfo() {
   const text = normalizeNumberText(els.input.value);
-  if (/^\d+$/.test(text) && BigInt(text) > 0n) {
+  const significant = text.replace(/^0+/u, "") || "0";
+  if (/^\d+$/.test(text) && significant.length > MAX_DECIMAL_DIGITS) {
+    els.inputInfo.textContent =
+      `${significant.length} significant digits · exceeds the ${MAX_INPUT_BITS}-bit limit`;
+  } else if (/^\d+$/.test(text) && BigInt(text) > 0n) {
     const N = BigInt(text);
-    els.inputInfo.textContent = `${text.length} digit${text.length === 1 ? "" : "s"} · ${bitLength(N)} bits`;
+    const bits = bitLength(N);
+    els.inputInfo.textContent =
+      `${text.length} digit${text.length === 1 ? "" : "s"} · ${bits} bits` +
+      (bits > MAX_INPUT_BITS ? ` · limit ${MAX_INPUT_BITS}` : "");
   } else {
     els.inputInfo.textContent = "";
   }
@@ -324,9 +580,18 @@ async function run() {
     els.status.textContent = "Enter a positive whole number.";
     return;
   }
+  const significant = text.replace(/^0+/u, "") || "0";
+  if (significant.length > MAX_DECIMAL_DIGITS) {
+    els.status.textContent = `Enter a number no wider than ${MAX_INPUT_BITS} bits.`;
+    return;
+  }
   const N = BigInt(text);
   if (N < 1n) {
     els.status.textContent = "Enter a positive whole number.";
+    return;
+  }
+  if (bitLength(N) > MAX_INPUT_BITS) {
+    els.status.textContent = `Enter a number no wider than ${MAX_INPUT_BITS} bits.`;
     return;
   }
   els.go.disabled = true;
@@ -350,11 +615,20 @@ async function run() {
       els.status.textContent = "Done.";
     }
   } catch (error) {
-    els.status.textContent = "Error: " + (error?.message || error);
+    const message = String(error?.message || error);
+    els.status.textContent = `Error: ${message} Resetting workers…`;
+    try {
+      await restartRuntime();
+      els.status.textContent = `Error: ${message} Worker runtime was reset.`;
+    } catch (restartError) {
+      els.status.textContent =
+        `Error: ${message} Worker reset failed: ` +
+        String(restartError?.message || restartError);
+    }
   } finally {
     els.meter.classList.remove("busy");
     setBar(0, false);
-    els.go.disabled = false;
+    els.go.disabled = !runtimeReady;
   }
 }
 
@@ -422,5 +696,6 @@ els.go.disabled = true;
 els.status.textContent = "Loading WebAssembly…";
 resizeNumberInput();
 boot().catch((e) => {
+  shutdownRuntime();
   els.status.textContent = "Failed to load: " + (e?.message || e);
 });

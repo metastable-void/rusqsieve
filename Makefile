@@ -107,9 +107,9 @@ $(DOCS)/.nojekyll:
 serve: docs
 	node $(WEB)/serve.mjs $(DOCS) 8000
 
-# Native + wasm correctness checks. The browser architecture check drives the real
-# coordinator-Worker/sieve-Worker protocol on node worker threads, which is otherwise
-# only ever exercised by hand in a browser.
+# Native + wasm correctness checks. The browser architecture check drives the
+# coordinator-Worker/sieve-Worker protocol on node worker threads; the focused
+# glue check covers malformed packets and invalid command sequences.
 c-api-smoke: native
 	$(CC) -std=c11 -Wall -Wextra -Werror -I. tests/c_api_smoke.c \
 		-Ltarget/release -lrusqsieve -Wl,-rpath,'$$ORIGIN/release' \
@@ -122,6 +122,7 @@ test:
 	$(MAKE) wasm
 	$(MAKE) docs-verify
 	node tools/browser-arch-check.mjs
+	node tools/browser-glue-failure-check.mjs
 
 clean:
 	rm -rf $(DOCS)

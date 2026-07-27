@@ -30,6 +30,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup target add wasm32-unknown-unknown
       - run: make wasm
+      - run: node tools/browser-arch-check.mjs
+      - run: node tools/browser-glue-failure-check.mjs
       - run: ./build-release.sh wasm32-unknown-unknown
 
   slow-factorization:

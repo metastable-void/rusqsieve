@@ -11,6 +11,10 @@ Severity meanings:
 
 ### A030-001 — The additional Wasm demo glue omits the coordinator Worker
 
+**Status: remediated after the audit.** `build-release.sh` now includes
+`coordinator.js`; a rebuilt archive was extracted and checked for all referenced
+frontend files.
+
 **Evidence**
 
 - `web/index.js:46` constructs `./coordinator.js`.
@@ -65,6 +69,9 @@ measurements.
 
 ### A030-003 — Stale worker errors can fail a later factorization
 
+**Status: remediated after the audit.** All run responses, including errors,
+must now match the active generation.
+
 `web/index.js:91` exempts coordinator errors from the generation check.
 `web/index.js:133-138` likewise handles every sieve-worker error before checking
 `data.gen`. A completed run leaves other jobs in flight. If one of those old
@@ -77,6 +84,9 @@ two-run regression test with delayed success/error messages from the first
 generation.
 
 ### A030-004 — Family-budget exhaustion can leave the browser promise pending forever
+
+**Status: remediated after the audit.** The scheduler tracks active jobs and
+pending submissions and rejects once the bounded family domain is drained.
 
 `web/index.js:84-89` silently returns from `dispatch` when the next family
 exceeds `MAX_FAMILIES`. Once all workers take that path, no worker is active and
@@ -92,6 +102,10 @@ Track active jobs and dispatched families centrally. Reject with a typed
 Add a tiny injected budget to make the test fast and deterministic.
 
 ### A030-005 — Scheduler limits and documented error semantics disagree
+
+**Status: partially remediated after the audit.** JavaScript now uses the
+engine's 100,000-family bound. The native exhaustion path still needs to return
+`InsufficientRelations` explicitly.
 
 - Rust defines `MAX_FAMILIES = 100_000` at `src/engine.rs:251`.
 - The browser defines `MAX_FAMILIES = 2_000_000` at `web/index.js:12`.
@@ -113,6 +127,10 @@ linear algebra when the relation target was not reached.
 
 ### A030-006 — Linear algebra is a destructive one-shot operation in the browser
 
+**Status: remediated for the reference browser glue after the audit.** A
+no-factor extraction retains the session and requests at least 64 additional
+relations before retrying.
+
 At the first relation target, `web/coordinator.js:45-53` runs extraction,
 immediately frees the session, and throws if no factor is returned. A relation
 target is a heuristic surplus, not a proof that one of the bounded dependencies
@@ -126,6 +144,10 @@ dependencies, resource limits, and "need more relations" in the Wasm ABI.
 
 ### A030-007 — Worker initialization can hang boot indefinitely
 
+**Status: remediated after the audit.** Boot handles Worker errors,
+message errors, cancellation, and a 30-second timeout; failed runs reset the
+entire Worker runtime.
+
 The worker-ready promise at `web/index.js:55-65` only resolves on `ready`.
 It does not reject on a worker `error` message, a Worker `error` event, or a
 timeout. A failed Wasm instantiation therefore leaves `Promise.all` and the UI
@@ -136,6 +158,9 @@ Worker errors/message errors, termination, and a timeout. Terminate the partly
 created pool if boot fails.
 
 ### A030-008 — The browser accepts inputs outside the documented 512-bit range
+
+**Status: remediated in the reference demo after the audit.** The UI rejects
+inputs wider than 512 significant bits before creating a Wasm session.
 
 Native entry points reject inputs above 512 bits in `src/native.rs:79-82`.
 The Wasm path parses into the default 1024-bit `Natural` and calls
@@ -151,6 +176,10 @@ Return a typed range error rather than handle `0`.
 ## Additional medium findings
 
 ### A030-009 — CI does not test the shipped browser product
+
+**Status: partially remediated after the audit.** CI now runs the Worker
+architecture smoke test and focused glue failure checks. Extracted-archive and
+real-browser CI remain outstanding.
 
 The Wasm job compiles modules and runs `build-release.sh`, but does not inspect
 or execute the resulting archive. It therefore passed while omitting a required
@@ -183,6 +212,10 @@ Remove the directory from version control and ignore `**/target/` or
 crash artifacts.
 
 ### A030-011 — The browser packet reader does not validate its envelope
+
+**Status: remediated after the audit.** The glue validates QSV1 magic, version,
+kind, exact payload length, memory bounds, and relation-batch framing, while
+freeing owned handles on every path.
 
 `web/abi.js:32-46` does not check `QSV1` magic, kind, version, nonzero
 pointer/length consistency, or that `payloadLen <= len - 12`. `Uint8Array.slice`

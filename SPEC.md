@@ -514,6 +514,15 @@ JavaScript performs inexpensive recursive preprocessing with `BigInt`: trial
 division, Miller–Rabin, perfect powers, and bounded Pollard–Brent. Hard
 composites are sent to the Wasm SIQS coordinator.
 
+The reference frontend enforces the same 512-bit input ceiling as the native
+entry points. Per-run messages, including errors, are generation-scoped.
+Worker initialization, individual sieve jobs, and complete runs are bounded by
+timeouts; a failed run terminates and rebuilds the Worker runtime. The browser
+scheduler issues at most the engine's 100,000-family budget and reports
+exhaustion once no jobs or submissions remain. If the first dependency set
+yields no nontrivial factor, the coordinator retains its session, requests a
+relation surplus, and retries instead of discarding collected work.
+
 The production frontend is `web/`. The older `js/` prototype is not part of the
 published crate or release archives.
 
@@ -697,6 +706,7 @@ Tests cover:
 - deterministic portable job output;
 - out-of-order relation submission;
 - native parallel engine factorization;
+- browser Worker architecture and malformed glue-protocol handling;
 - factor ordering and multiplicity;
 - zero/one and invalid input behavior;
 - progress completion and cooperative cancellation;

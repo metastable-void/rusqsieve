@@ -34,9 +34,9 @@ interleaved runs and load controls.
 
 World-class readiness is broader than a fast steady-state kernel:
 
-1. The primary raw Wasm module must build and execute; it does. Any bundled
-   frontend advertised as self-contained must also boot; the additional 0.3.0
-   glue does not without `coordinator.js`.
+1. The primary raw Wasm module must build and execute; it does. The bundled
+   frontend must contain all referenced glue; the omission found during this
+   audit has now been remediated.
 2. Every async path must terminate on success, error, timeout, cancellation, or
    exhaustion.
 3. A heuristic relation target must support recovery, not destructive failure.
@@ -47,10 +47,16 @@ World-class readiness is broader than a fast steady-state kernel:
 
 ## Recommended sequence
 
+Post-audit work completed Gate 0's core items: bounded job accounting,
+generation-safe errors, boot/job/run timeouts, runtime reset, 512-bit input
+enforcement, strict packet framing, and retryable extraction. The focused
+failure test is now part of CI. The lists below remain as regression
+requirements and as guidance for broader browser coverage.
+
 ### Gate 0 — Make the browser product reliable
 
-- State clearly that the JavaScript is informational glue, or complete and
-  test it if it is intended to be a deployable demo.
+- Retain an extracted-archive reference audit so the remediated glue omission
+  cannot recur.
 - Introduce a typed message protocol with generation on every per-run response.
 - Add Worker error/message-error handling and timeouts.
 - Add explicit cancellation and terminate or recycle failed workers.
