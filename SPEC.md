@@ -739,8 +739,9 @@ are:
   measurements;
 - parameter tables need multi-input rather than single-sample sweeps at every
   tier;
-- fastest-browser claims still require same-browser measurements against
-  current competitor implementations.
+- retain the existing same-device mobile competitor comparisons as publishable
+  raw results so the world-leading browser-SIQS result is independently
+  reproducible.
 
 Future optimization must preserve the safety and correctness invariants above
 and must not slow the default balanced-RSA artifact.

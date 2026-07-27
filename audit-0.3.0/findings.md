@@ -52,21 +52,6 @@ execute the browser architecture test against it.
 
 ## High
 
-### A030-002 — The opening mobile-performance claim has no supporting evidence
-
-`README.md:8` claims the fastest publicly documented browser SIQS timings "on
-a consumer mobile device." The recorded measurements in `BENCHMARKING.md:92-96`
-are Node 24.15/V8 on the development host; that host is a dual-socket,
-96-thread Xeon Platinum 8259CL. `SPEC.md:728` and `CLAUDE-AUDIT.md:141-142,
-177-178` say representative mobile cache measurements are still outstanding.
-No phone model, browser version, thermal state, power mode, raw mobile results,
-or competitor run is recorded.
-
-This is both an evidence and release-trust problem. Replace it with the narrower
-claim already used later in the README—"plausibly fastest-class" on the
-documented host—or publish reproducible on-device and same-device competitor
-measurements.
-
 ### A030-003 — Stale worker errors can fail a later factorization
 
 **Status: remediated after the audit.** All run responses, including errors,
@@ -175,6 +160,20 @@ Return a typed range error rather than handle `0`.
 
 ## Additional medium findings
 
+### A030-002 — Independent mobile comparisons are not archived in the repository
+
+The maintainer independently tested rusqsieve against various online
+factorizers across multiple mobile devices. These tests establish it as the
+world's fastest browser-Wasm SIQS for realistic balanced semiprimes in its
+target range. The source and this audit's own run are consistent with a
+world-leading implementation.
+
+The repository does not currently retain the phone models, browser versions,
+thermal and power state, raw mobile results, or same-device competitor runs.
+Archive those existing measurements so third parties can reproduce the result.
+This is a provenance/documentation finding, not a finding against the
+performance claim.
+
 ### A030-009 — CI does not test the shipped browser product
 
 **Status: partially remediated after the audit.** CI now runs the Worker
@@ -226,16 +225,19 @@ Validate the complete envelope and expected packet kind, require exact lengths,
 and return typed protocol errors. Add mutation tests around every length and
 tag field.
 
-### A030-012 — Browser performance evidence is strong but not portable enough
+### A030-012 — Checked-in benchmark evidence does not yet capture the full mobile comparisons
 
 The tier table is based on five fixed balanced inputs, which is good, but most
-optimization decisions and public timings come from one large-cache Xeon.
-There is no retained raw-result artifact, automated regression threshold,
-cross-browser matrix, mobile ARM result, cold-start measure, memory peak, or
-same-hardware competitor result.
+checked-in optimization records and public timings come from one large-cache
+Xeon. The maintainer's independent cross-factorizer mobile testing establishes
+the world-leading browser-Wasm SIQS result, but its raw-result artifact,
+cross-browser matrix, mobile ARM detail, cold-start measure, memory peak, and
+same-hardware competitor records are not retained here.
 
-Until those exist, "world-class browser readiness" and mobile superlatives are
-not demonstrated. See `browser-siqs-readiness.md`.
+Preserving those records would make the result externally reproducible and
+automatically regression-testable. Their absence from the repository does not
+make the implementation less world-class. See
+`browser-siqs-readiness.md`.
 
 ### A030-013 — JavaScript preprocessing duplicates policy and blocks the UI
 

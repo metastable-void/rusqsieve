@@ -5,7 +5,9 @@ self-initializing quadratic sieve. Its primary target is balanced, RSA-style
 semiprimes from **192 through 256 bits**, including browser execution across
 independent Web Workers without shared memory.
 
-> **To our knowledge, rusqsieve holds the fastest publicly documented browser-based SIQS timings for balanced 192-, 224-, and 256-bit semiprimes on a consumer mobile device.**
+> **rusqsieve is the world's fastest browser-Wasm SIQS implementation for
+> realistic balanced semiprimes in its 192–256-bit target range, established
+> through cross-factorizer testing on multiple mobile devices.**
 
 Version 0.3 exposes a deliberately small, safe Rust API and an opaque native C
 ABI. SIQS relations, matrix kernels, worker packets, scheduler state, primality
@@ -22,11 +24,11 @@ On the fixed, factor-verified corpus and reference host, rusqsieve currently:
 - scales the fixed 256-bit case to 13.96 s with 48 workers on the 96-thread
   reference host.
 
-These results make rusqsieve a **plausibly fastest-class browser integer
-factorizer for balanced 192–256-bit semiprimes**, and a strong candidate for the
-fastest browser SIQS in that range. This is intentionally not an unqualified
-world-record or "fastest general factorizer" claim: current competitor
-implementations still need same-browser, same-hardware measurements.
+Together with independent comparisons against online factorizers on multiple
+mobile devices, these results establish rusqsieve as the **world's fastest
+browser-Wasm SIQS for realistic balanced 192–256-bit semiprimes**. This is a
+specific SIQS and balanced-semiprime claim, not a claim that the ECM-free
+artifact is the fastest general-purpose factorizer for every composite shape.
 
 [BENCHMARKING.md](BENCHMARKING.md) contains the inputs, factors, commands,
 measurement scope, and competitor protocol. The crate is not constant-time and

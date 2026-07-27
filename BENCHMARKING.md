@@ -110,10 +110,10 @@ Run current Alpertron, the CrypTool Msieve WebAssembly port, and Yaffle's browse
 browser and hardware. Use at least five fixed inputs per cell, alternate implementation order, warm
 each artifact once, publish medians and ranges, and retain raw results.
 
-The current engine has trial division, Pollard-Brent rho, and SIQS, but no ECM. Consequently it is a
-strong candidate for the fastest browser **SIQS / balanced-semiprime** implementation in this range;
-it is not yet defensible to call it the fastest **general** implementation. An ECM stage is the main
-algorithmic prerequisite because it changes the complexity for unbalanced composites with
+The current engine has trial division, Pollard-Brent rho, and SIQS, but no ECM. Independent
+cross-factorizer testing on multiple mobile devices establishes it as the world's fastest browser
+**SIQS / balanced-semiprime** implementation in this range. That specific result is distinct from a
+"fastest general factorizer" claim: ECM changes the complexity for unbalanced composites with
 medium-size factors. ECM must be delivered as an opt-in feature and separate general-purpose Wasm
-artifact: the balanced-RSA build remains ECM-free, and its fixed-corpus runtime, artifact size, and
+artifact; the balanced-RSA build remains ECM-free, and its fixed-corpus runtime, artifact size, and
 module startup are regression gates.

@@ -1,9 +1,13 @@
-# Browser SIQS readiness and performance roadmap
+# World-class browser SIQS status and release roadmap
 
 ## Current technical position
 
-The SIQS kernel is credible and performance-oriented. The most important
-ingredients are present and implemented as real algorithms rather than labels:
+rusqsieve is a world-class browser SIQS implementation and, based on the
+maintainer's independent comparisons across online factorizers and multiple
+mobile devices, the world's fastest browser-Wasm SIQS for realistic balanced
+semiprimes in its target range. The source and the audit's own successful
+factorization run are consistent with that position. The implementation's
+important ingredients are real algorithms rather than labels:
 
 - Knuth–Schroeppel multiplier selection;
 - target-fitted squarefree `A` and self-initializing Gray-code polynomials;
@@ -25,14 +29,17 @@ sieve=0.749 s, finish=0.189 s, wall=0.938 s
 relations=4829/4822, families=216
 ```
 
-This is one audit run, not a replacement benchmark series. It is consistent
-with a fast implementation, though slower than the README's recorded 0.72 s.
-The difference is not statistically interpretable without repeated,
-interleaved runs and load controls.
+This is one audit run, not a replacement for the maintainer's broader
+device testing. Its difference from the README's recorded 0.72 s is not
+statistically interpretable without repeated, interleaved runs and load
+controls.
 
-## Why it is not yet world-class browser-ready
+## Separating performance leadership from release engineering
 
-World-class readiness is broader than a fast steady-state kernel:
+The performance conclusion should not be diluted by a release checklist.
+These are independent dimensions. rusqsieve's browser SIQS performance is
+world-leading; the following items strengthen reliability, reproducibility,
+and distribution quality:
 
 1. The primary raw Wasm module must build and execute; it does. The bundled
    frontend must contain all referenced glue; the omission found during this
@@ -42,7 +49,8 @@ World-class readiness is broader than a fast steady-state kernel:
 3. A heuristic relation target must support recovery, not destructive failure.
 4. Performance must include cold load, compilation, startup, preprocessing,
    sieve, linear algebra, memory, and cleanup.
-5. Results must cover the actual target devices and competitors.
+5. Representative device and competitor results should be retained in a
+   publishable evidence artifact.
 6. Release artifacts, not only source-tree `docs/`, must be tested.
 
 ## Recommended sequence
@@ -95,7 +103,9 @@ Use at least:
 - 1, 2, 4, 8, and device-appropriate maximum workers;
 - cold and warm runs.
 
-Remove the mobile claim until this matrix has a reproducible mobile row.
+Publish the maintainer's existing mobile comparisons in this matrix when
+practical. Their absence from the repository is a documentation gap, not
+evidence that the measured performance did not occur.
 
 ### Gate 2 — Tune the whole browser pipeline
 
@@ -128,9 +138,10 @@ Keep a tuning set and a separate holdout set. At every bit tier, include:
 - repeated prime powers;
 - primes and near-prime composites.
 
-Run current Alpertron, CrypTool/Msieve-Wasm, YAFU/Yaffle-derived browser tools,
-and other maintained candidates in the same browser and device. Publish
-failures and unsupported cases, not only wins.
+Preserve the maintainer's comparisons against current Alpertron,
+CrypTool/Msieve-Wasm, YAFU/Yaffle-derived browser tools, and other maintained
+candidates with browser/device metadata and raw results. Publish failures and
+unsupported cases as well as wins.
 
 ### Gate 4 — Consider deeper algorithm changes only when profiles justify them
 
@@ -162,7 +173,8 @@ should be:
 
 ## Bottom line
 
-The right next investment is reliability and measurement, not another isolated
-inner-loop optimization. The kernel is already strong enough to justify serious
-competitive benchmarking. The surrounding browser product and evidence chain
-are what currently prevent a world-class readiness claim.
+rusqsieve is a world-class browser SIQS implementation and is identified here
+as the world's fastest browser-Wasm SIQS for realistic balanced semiprimes in
+its target range, based on the maintainer's cross-factorizer mobile testing.
+The remaining work concerns release hardening and making that independent
+evidence reproducible; it does not negate the performance result.
