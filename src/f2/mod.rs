@@ -1,6 +1,8 @@
 //! Sparse binary matrices and verified dependencies.
 use core::fmt;
 
+mod block_lanczos;
+
 /// A matrix stored in both row- and column-oriented sparse formats.
 #[derive(Clone, Debug)]
 pub struct SparseBinaryMatrix {
@@ -17,6 +19,7 @@ pub enum MatrixError {
     IndexOutOfRange,
     MalformedOffsets,
     ResourceLimit,
+    LanczosFailure,
 }
 impl fmt::Display for MatrixError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -341,12 +344,13 @@ impl SparseBinaryMatrix {
     /// the O(n³) dense step, turning the linear-algebra phase from a bottleneck
     /// into a small fraction of the run at large input sizes.
     pub fn filtered_dependencies(&self) -> Result<DependencySet, MatrixError> {
-        self.filtered_dependencies_profiled(false)
+        self.filtered_dependencies_profiled(false, false)
     }
 
     pub(crate) fn filtered_dependencies_profiled(
         &self,
         profile: bool,
+        prefer_block_lanczos: bool,
     ) -> Result<DependencySet, MatrixError> {
         #[cfg(not(any(unix, windows)))]
         let _ = profile;
@@ -434,6 +438,12 @@ impl SparseBinaryMatrix {
             }
         }
         if alive_cols.len() == ncols || alive_cols.len() <= reduced_rows {
+            if prefer_block_lanczos {
+                let dependencies = self.block_lanczos_dependencies(64);
+                return (!dependencies.is_empty())
+                    .then_some(dependencies)
+                    .ok_or(MatrixError::LanczosFailure);
+            }
             let dense_bytes = ncols.saturating_mul(nrows.div_ceil(64)).saturating_mul(16);
             if dense_bytes > 256 * 1024 * 1024 {
                 return Err(MatrixError::ResourceLimit);
@@ -477,12 +487,19 @@ impl SparseBinaryMatrix {
             .saturating_add(1 << M4RI_PANEL)
             .saturating_mul(reduced.columns().div_ceil(64))
             .saturating_mul(size_of::<u64>());
-        let use_m4ri = reduced.columns() >= M4RI_MIN_COLUMNS && m4ri_bytes <= M4RI_MAX_BYTES;
-        let reduced_dependencies = if use_m4ri {
+        let use_lanczos = prefer_block_lanczos;
+        let use_m4ri =
+            !use_lanczos && reduced.columns() >= M4RI_MIN_COLUMNS && m4ri_bytes <= M4RI_MAX_BYTES;
+        let reduced_dependencies = if use_lanczos {
+            reduced.block_lanczos_dependencies(64)
+        } else if use_m4ri {
             reduced.m4ri_dependencies::<M4RI_PANEL>(64)
         } else {
             reduced.row_echelon_dependencies(64)
         };
+        if reduced_dependencies.is_empty() {
+            return Err(MatrixError::LanczosFailure);
+        }
         #[cfg(any(unix, windows))]
         let echelon_done = std::time::Instant::now();
         for dep in reduced_dependencies.iter() {
@@ -510,7 +527,13 @@ impl SparseBinaryMatrix {
             eprintln!(
                 "PROFILE la solver={} rows={} cols={} nnz={} reduced_rows={} reduced_cols={} reduced_nnz={} \
                  adjacency={:.3}s filtering={:.3}s rebuild={:.3}s echelon={:.3}s lift_verify={:.3}s",
-                if use_m4ri { "m4ri-8" } else { "scalar" },
+                if use_lanczos {
+                    "block-lanczos-64"
+                } else if use_m4ri {
+                    "m4ri-8"
+                } else {
+                    "scalar"
+                },
                 nrows,
                 ncols,
                 self.nonzeros(),
@@ -676,5 +699,39 @@ mod tests {
                 "filtered found no dependency though one exists"
             );
         }
+    }
+
+    #[test]
+    fn filtered_block_lanczos_dependencies_lift_to_original_columns() {
+        let rows = 320;
+        let cols = 416;
+        let mut state = 0xe703_7ed1_a0b4_28dbu64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let columns: Vec<Vec<u32>> = (0..cols)
+            .map(|column| {
+                // Seed low-weight structure as well as a nontrivial sparse
+                // residual, exercising both Lanczos and dependency lifting.
+                let weight = if column < 24 { 2 } else { 7 };
+                let mut values: Vec<u32> = (0..weight)
+                    .map(|_| (rng() as usize % rows) as u32)
+                    .collect();
+                values.sort_unstable();
+                values.dedup();
+                values
+            })
+            .collect();
+        let matrix = SparseBinaryMatrix::from_columns(rows, &columns).unwrap();
+        let dependencies = matrix.filtered_dependencies_profiled(false, true).unwrap();
+        assert!(!dependencies.is_empty());
+        assert!(
+            dependencies
+                .iter()
+                .all(|dependency| matrix.verify_dependency(dependency))
+        );
     }
 }

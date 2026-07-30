@@ -207,7 +207,7 @@ fn corpus_entries() -> Vec<(&'static str, Vec<&'static str>)> {
 #[test]
 fn browser_tuning_corpus_has_exact_balanced_products() {
     let corpus = include_str!("data/browser-balanced-corpus.txt");
-    let mut counts = [0usize; 6];
+    let mut counts = [0usize; 7];
     for (line_index, line) in corpus.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -235,10 +235,11 @@ fn browser_tuning_corpus_has_exact_balanced_products() {
             240 => 3,
             256 => 4,
             272 => 5,
+            288 => 6,
             _ => panic!("unexpected browser tier {bits}"),
         }] += 1;
     }
-    assert_eq!(counts, [5, 5, 5, 5, 5, 5]);
+    assert_eq!(counts, [5, 5, 5, 5, 5, 5, 1]);
 }
 
 /// Where the default corpus test stops and the `#[ignore]`d one picks up. Every one of the 117

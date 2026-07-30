@@ -4,6 +4,44 @@ The performance target is hard composite integers from 192 through 272 bits. Res
 comparable when they use the same input, browser build, machine, worker count, warm-up policy, and
 factor verification. Report both wall time and the complete prime factorization.
 
+The established browser policy below 272 bits is a regression boundary.
+Portable block Lanczos begins at 272 bits after a matched fixed-corpus run
+reduced LA/extraction from 5.574 s to 1.721 s and wall time from 83.599 s to
+80.072 s. A matched 256-bit control stayed within noise (27.146 s before,
+26.986 s after).
+
+For high-digit SIQS on native and Wasm, the initial automatic scale is:
+
+| input bits | approximate digits | prime bound | half-width | LP multiplier | DLP |
+|---:|---:|---:|---:|---:|:---:|
+| 281–288 | 85–87 | 1,400,000 | 262,144 | 100 | no |
+| 289–296 | 87–89 | 1,200,000 | 262,144 | 120 | yes |
+| 297–304 | 90–92 | 1,500,000 | 262,144 | 120 | yes |
+| 305–312 | 92–94 | 1,800,000 | 262,144 | 150 | yes |
+| 313–320 | 95–97 | 2,250,000 | 262,144 | 150 | yes |
+| 321–333 | 97–100 | 3,000,000 | 262,144 | 150 | yes |
+
+DLP products are capped at 12× or 16× the factor-base-bound square. The older
+`single_limit^1.8` cutoff admitted millions of survivors whose unique graph
+vertices did not close cycles.
+
+On the 96-thread Xeon 8259CL tuning host, fixed 289- and 304-bit balanced
+semiprimes completed in 41.8 s and 103.5 s. RSA-100 completed in 622.6 s
+(606.2 s collection, 14.9 s filtering/Lanczos/extraction). This does not match
+the reported 140.0531 s YAFU run on the same host; the remaining gap is
+relation-sieve throughput, not block Lanczos.
+
+The 281–288 tier removes the old drop from a 700k prime bound at 280 bits to
+500k at 281. On an exact 288-bit balanced fixture, the old 500k/327,680 policy
+needed 10,352 families and 420.223 s; 1.4M/262,144 with Lanczos needed 4,328
+families and 258.512 s (−38.5%). This is a one-input boundary measurement, so
+retain it as a strong correction to the discontinuity rather than a
+multi-host optimum claim. The exact input and its two 144-bit factors are
+recorded as the 288-bit row in `tests/data/browser-balanced-corpus.txt`. A
+final real-Chromium run of the shipped SIMD artifacts took 23.702 s at 256
+bits, 69.783 s at 272 bits, and 226.901 s at 288 bits; all three results were
+factor-verified with eight Web Workers.
+
 ## Reproducible rusqsieve harness
 
 `tools/wasm-bench.mjs` runs the browser architecture under Node/V8: one coordinator Wasm instance,
@@ -17,6 +55,21 @@ RUSQSIEVE_WASM=target/wasm-simd/wasm32-unknown-unknown/release/rusqsieve.wasm \
 
 The fourth argument is polynomial families per worker job. Two is the measured default. The harness
 rejects a result unless the returned divisor is nontrivial and divides the input.
+
+The CI host's unpacked Playwright installation also needs its `/tmp` font
+root:
+
+```sh
+FONTCONFIG_FILE=/tmp/rusqsieve-font-root/etc/fonts/fonts.conf \
+FONTCONFIG_SYSROOT=/tmp/rusqsieve-font-root \
+LD_LIBRARY_PATH=/tmp/rusqsieve-chromium-libs/root/usr/lib/x86_64-linux-gnu \
+PLAYWRIGHT_MODULE=/tmp/rusqsieve-playwright/node_modules/playwright \
+PLAYWRIGHT_BROWSERS_PATH=/tmp/rusqsieve-playwright-browsers \
+  node tools/playwright-bench.mjs URL N P Q 8
+```
+
+Without the two fontconfig variables, Chromium's Skia font manager exits
+during the first navigation.
 
 For a real browser measurement, serve `docs/` and point the Playwright driver at
 it. Playwright remains an external benchmark dependency rather than a crate or

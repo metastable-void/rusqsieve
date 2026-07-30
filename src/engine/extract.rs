@@ -19,7 +19,7 @@ pub(super) fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural, Engi
     let matrix = SparseBinaryMatrix::from_columns(ctx.base.len() + 1, &matrix_cols)
         .map_err(|_| EngineError::InvalidDependency)?;
     let dependencies = matrix
-        .filtered_dependencies_profiled(ctx.profile)
+        .filtered_dependencies_profiled(ctx.profile, ctx.use_block_lanczos)
         .map_err(|_| EngineError::ResourceLimit)?;
     for dep in dependencies.iter() {
         if !matrix.verify_dependency(dep) {

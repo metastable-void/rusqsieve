@@ -10,7 +10,9 @@ pub(super) fn sieve_family(
         polynomials: 0,
         relations: Vec::new(),
         survivors: 0,
+        timing: [0; 4],
     };
+    let family_started = ctx.profile.then(std::time::Instant::now);
     let Some((a, aidx)) = choose_a(ctx, family) else {
         return empty(family);
     };
@@ -85,6 +87,10 @@ pub(super) fn sieve_family(
     // prime between consecutive polynomials instead of recomputing them.
     let mut relations = Vec::new();
     let mut survivors = 0u64;
+    let mut timing = [0u64; 4];
+    if let Some(started) = family_started {
+        timing[0] = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    }
     for v in 0..variants {
         survivors += sieve_one_poly(
             ctx,
@@ -97,6 +103,7 @@ pub(super) fn sieve_family(
             &mut scratch.scores,
             &mut scratch.candidates,
             &mut relations,
+            &mut timing,
         ) as u64;
         if v + 1 >= variants {
             break;
@@ -112,6 +119,7 @@ pub(super) fn sieve_family(
             false
         };
         let off = j * nfb;
+        let roots_started = ctx.profile.then(std::time::Instant::now);
         if add_bainv {
             for idx in 0..nfb {
                 if scratch.root1[idx] == u32::MAX {
@@ -137,12 +145,16 @@ pub(super) fn sieve_family(
                 scratch.root2[idx] = r1.max(r2);
             }
         }
+        if let Some(started) = roots_started {
+            timing[3] += started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        }
     }
     FamilyResult {
         family,
         polynomials: variants,
         relations,
         survivors,
+        timing,
     }
 }
 

@@ -39,13 +39,13 @@ must not be used where operand-dependent timing reveals a secret.
 Add the Rust library:
 
 ```sh
-cargo add rusqsieve@0.3.0
+cargo add rusqsieve@0.4.0
 ```
 
 Install the native CLI:
 
 ```sh
-cargo install rusqsieve --version 0.3.0
+cargo install rusqsieve --version 0.4.0
 ```
 
 Or build the optimized native library and CLI from source:
@@ -94,7 +94,7 @@ algorithm at that scale. Arithmetic operators on `Natural` wrap at capacity,
 while `checked_*` methods report overflow.
 
 All supported public items are covered by rustdoc, enforced with
-`deny(missing_docs)`. The complete 0.3 contract and implementation architecture
+`deny(missing_docs)`. The complete 0.4 contract and implementation architecture
 are documented in [SPEC.md](SPEC.md); breaking changes from 0.1 are summarized
 in [CHANGELOG.md](CHANGELOG.md).
 
@@ -104,8 +104,8 @@ The native driver validates and converts the public const-generic `Natural`
 into the engine’s fixed working width. The engine performs trial division,
 primality and perfect-power checks, bounded Pollard–Brent, then schedules SIQS
 polynomial families. Completed families flow through deterministic
-single-large-prime relation collection, sparse matrix filtering, verified
-row-echelon dependency recovery, and GCD extraction. The Wasm worker and
+large-prime graph collection, sparse matrix filtering, verified dependency
+recovery, and GCD extraction. The Wasm worker and
 coordinator exports use the same family kernel and collector through
 serialized, ownership-checked packets. `qs` owns factor-base construction and
 tier parameters; `natural`, `smallfactor`, `primality`, and `f2` provide the
@@ -191,7 +191,7 @@ Notable performance work includes:
 - translated, sorted roots and a paired root-difference stride loop;
 - biased byte logarithmic scores with word-at-a-time candidate rejection;
 - multiply-shift-gated survivor division that stops on the recorded score;
-- single-large-prime relation combination with a bounded 256× factor-base limit;
+- tier-bounded single- and double-large-prime graph combination;
 - deterministic low-weight sparse matrix elimination;
 - compact residual row-echelon solving;
 - scoped Wasm SIMD128 XOR acceleration;
@@ -225,7 +225,7 @@ with its cofactor.
 Proof-of-work is resource pricing, not authentication. Retain the normal
 authentication mechanism, and never use a modulus belonging to a real RSA key.
 
-ECM is not part of the 0.3 default path. If added later, it must be opt-in
+ECM is not part of the 0.4 default path. If added later, it must be opt-in
 behind a non-default feature and shipped in a separate general-purpose Wasm
 artifact. The balanced-RSA artifact must contain no ECM code or initialization;
 the fixed 192/224/256-bit corpus remains an A/B gate for runtime, download size,
@@ -238,9 +238,23 @@ perfect-power checks, and SIQS. It is strongest on balanced semiprimes.
 Unbalanced 192–256-bit composites with medium-size factors remain the main
 general-factorization gap because ECM is absent.
 
-The current linear algebra uses structured sparse elimination followed by a
-compact row-echelon solve; it is not a true block-Lanczos recurrence. That
-becomes a future concern for matrices beyond the current practical range.
+Below 272 bits, linear algebra uses structured sparse elimination followed by
+compact scalar/M4RI row-echelon solving. At 272 bits and above, native and Wasm
+use a true 64-way Montgomery block-Lanczos recurrence. The 281–288 tier also
+uses a larger factor base now that its residual matrix no longer incurs dense
+elimination cost; double-large-prime graph collection begins above 288 bits.
+
+On the fixed browser fixtures, Lanczos reduced 272-bit LA/extraction from
+5.574 s to 1.721 s. On an exact 288-bit balanced fixture, the larger base plus
+Lanczos reduced wall time from 420.223 s to 258.512 s. A matched 256-bit run,
+which stays on M4RI, was unchanged within noise (27.146 s versus 26.986 s).
+The final shipped-artifact confirmation in real Chromium completed the
+256-/272-/288-bit fixtures in 23.702/69.783/226.901 s.
+
+On the 96-thread native tuning host, final-default fixed anchors completed in
+41.8 s at 289 bits and 103.5 s at 304 bits. RSA-100 completed in 622.6 s;
+relation collection, not block Lanczos, remains the limiting gap versus
+specialized assembly/bucket-sieve implementations.
 
 ## Release builds
 

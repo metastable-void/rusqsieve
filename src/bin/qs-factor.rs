@@ -77,6 +77,8 @@ fn run() -> Result<(), String> {
             env_parse("RUSQSIEVE_THRESH_ADJ"),
             env_parse("RUSQSIEVE_FB_BOUND"),
             env_parse("RUSQSIEVE_HALFW"),
+            env_parse("RUSQSIEVE_LP_MULT"),
+            env_parse("RUSQSIEVE_DLP_BOUND"),
             std::env::var_os("RUSQSIEVE_PROFILE").is_some(),
         );
     let factors = factor_with_progress(natural.clone(), config, |snapshot| {

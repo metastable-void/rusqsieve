@@ -1,11 +1,11 @@
 # rusqsieve 0.3 implementation specification
 
 This document specifies the supported behavior and current architecture of
-rusqsieve 0.3. It describes the implementation that is shipped, not an
+rusqsieve 0.4. It describes the implementation that is shipped, not an
 aspirational module layout or a compatibility promise for private internals.
 
 Normative requirements use **must**. Descriptions of tuning and implementation
-strategy document the 0.3 release and may change in later compatible releases
+strategy document the 0.4 release and may change in later compatible releases
 when observable behavior is preserved.
 
 ## 1. Purpose and scope
@@ -45,7 +45,7 @@ balanced-RSA path.
 
 ### 2.1 Supported public interfaces
 
-The supported interfaces in 0.3 are:
+The supported interfaces in 0.4 are:
 
 1. the items re-exported from `src/lib.rs`;
 2. the factor/result functions, ABI query, status formatter, and opaque type
@@ -56,7 +56,7 @@ The supported interfaces in 0.3 are:
 Everything else in `src/` is private implementation detail even when an
 internal item uses Rust's `pub` visibility inside its private module.
 
-Minor 0.3 releases may retune parameters, change internal representations, add
+Minor 0.4 releases may retune parameters, change internal representations, add
 non-exhaustive error/progress variants, or replace private algorithms. They
 must not expose invalid relation, matrix, pointer, or scheduler states through
 the safe Rust API.
@@ -302,8 +302,16 @@ order.
 ### 7.1 Parameters and multiplier
 
 Bit-size tiers in `qs::parameters::engine_params` select the factor-base bound,
-sieve half-width, and large-prime allowance. Environment overrides are
-development tuning aids and are not stable public configuration.
+sieve half-width, large-prime allowance, and whether double-large-prime
+collection is active. Environment overrides are development tuning aids and
+are not stable public configuration.
+
+The measured scalar/M4RI browser policy is unchanged below 272 bits. The
+281–288 tier uses a 1.4M factor-base prime bound and a 262,144 half-width.
+Above that boundary, 96-thread native anchors split the scale at
+296/304/312/320 bits, with bounds from 1.2M through 3M. Every high-digit tier
+uses a 262,144 half-width; larger per-worker arrays lost to memory pressure.
+Native and Wasm both use true sparse linear algebra from 272 bits upward.
 
 The engine chooses a deterministic Knuth–Schroeppel multiplier `k` and sieves
 against `kN`. Extraction still computes GCDs against `N`; because `kN` is zero
@@ -345,9 +353,10 @@ The sieve uses bit-length `u8` scores and:
    byte's high bit;
 2. skips selected very small primes and derives their expected threshold slack
    from that set;
-3. adds `ceil(log2 p)` weights at both sorted modular roots, wrapping rather
-   than saturating whenever the engine can prove from the smallest scored prime
-   that no position can carry past 255;
+3. adds `ceil(log2 p)` weights through 288 bits and nearest-integer log weights
+   above 288 bits, reducing high-tier survivor false positives; additions wrap
+   rather than saturate whenever the engine can prove from the smallest scored
+   prime that no position can carry past 255;
 4. uses the paired root-difference stride loop;
 5. extracts candidates eight positions at a time with one masked compare;
 6. trial-divides survivors.
@@ -357,9 +366,10 @@ Candidate division is gated by a precomputed multiply-shift residue test and
 stops as soon as the primes divided out account for the recorded score, which is
 exact when the scores did not saturate.
 
-The sieve threshold is `log2|g(x)| − log2(large-prime bound) − small-prime slack`
-plus a measured per-tier offset. The large-prime term is the acceptance bound
-itself, not an independent constant: a survivor whose cofactor exceeds what
+The sieve threshold is `log2|g(x)| − log2(cofactor bound) − small-prime slack`
+plus a measured per-tier offset. The cofactor term is the single-large-prime
+bound when DLP is off and the bounded DLP product when it is on; it is not an
+independent constant. A survivor whose cofactor exceeds what
 `classify_cofactor` will accept costs a full trial division for no possible
 relation.
 
@@ -373,12 +383,19 @@ t² ≡ (-1)^sign × product(p_i ^ e_i) × large_parts (mod N)
 
 where `t = Ax + B` reduced modulo `N`.
 
-Full relations have no large-prime cofactor. The shipped engine accepts one
-probable-prime large factor up to 256 times the factor-base bound. Double-large-
-prime collection remains disabled because it did not produce a net wall-time win. The
-coordinator treats partials as edges in a large-prime graph. A cycle combines
-relations only when every large-prime exponent cancels to even parity; the
-corresponding square-root factors are retained for extraction.
+Full relations have no large-prime cofactor. Through 280 bits the engine accepts
+one prime large factor up to 256 times the factor-base bound; the 281–288
+larger-base tier uses 100×. DLP remains off in those measured tiers. Above 288
+bits the engine uses a 120× or 150× single-prime bound and admits a product of
+two prime large factors up to 12× or 16× the factor-base-bound square. This
+measured graph-density cutoff is deliberately below both the full
+single-limit square and `single_limit^1.8`: relations containing two sparse
+vertices near `single_limit` rarely close useful cycles.
+
+The coordinator treats single partials as edges to a reserved unit vertex and
+double partials as ordinary graph edges. A cycle combines relations only when
+every large-prime exponent cancels to even parity; the corresponding
+square-root factors are retained for extraction.
 
 The relation collector buffers out-of-order families and merges them in
 ascending family order. Native workers and Web Workers execute the same
@@ -389,19 +406,25 @@ ascending family order. Native workers and Web Workers execute the same
 Matrix columns correspond to combined relations. Rows correspond to the sign
 and factor-base-prime exponent parities.
 
-The 0.3 solver is:
+The 0.4 solver is:
 
 1. sparse structured elimination, including singleton removal and deterministic
    low-weight row elimination through weight six;
 2. compact pivot records used to expand residual dependencies back into the
    original relation-column space;
-3. a compact row-echelon solve on the residual matrix;
+3. a residual solve selected by tier: compact scalar/M4RI row-echelon below
+   272 bits, or 64-way Montgomery block Lanczos from 272 bits upward;
 4. expansion of at most 64 useful dependencies;
 5. verification of every expanded dependency against the original parity
    matrix.
 
-The crate does **not** implement a block-Lanczos recurrence. The current
-residual solver is compact dense Gaussian/row-echelon elimination.
+The block-Lanczos path represents 64 vectors in each `u64`, repeatedly applies
+the sparse symmetric product `Bᵀ(BV)` without materializing it, selects and
+inverts the recurrence's nonsingular 64×64 submatrices, and includes the third
+recurrence term required after a rank-deficient block. Deterministic independent
+starting blocks recover from the algorithm's small breakdown probability.
+Terminal candidates and every lifted dependency are verified against the
+original parity matrix.
 
 For a verified dependency, extraction constructs:
 
@@ -729,12 +752,12 @@ same-browser competitor protocol described there.
 
 ## 17. Current limitations and future work
 
-The 0.3 release is optimized for balanced semiprimes. Its principal known gaps
+The 0.4 release is optimized for balanced semiprimes. Its principal known gaps
 are:
 
 - no ECM for medium factors in unbalanced composites;
-- no true sparse block-Lanczos recurrence for matrices beyond the current
-  practical range;
+- high-digit SIQS tiers still need multi-input wall-time sweeps on representative
+  native hosts;
 - cache-blocked/bucket tuning still needs representative small-L2 mobile
   measurements;
 - parameter tables need multi-input rather than single-sample sweeps at every

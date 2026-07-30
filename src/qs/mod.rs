@@ -314,12 +314,27 @@ pub mod parameters {
     /// 200k. At 240 bits, 400k and 450k anchor runs regressed. At 256 bits, 500k was a wash and the
     /// five-case 450k/−3 gain was only 0.4%; −4 won the confirmation corpus. At 272 bits, 600k,
     /// 700k, and 800k bracketed the bound; 800k exceeded M4RI's working-set guard and fell back to
-    /// scalar elimination. Half-widths 196,608 and 327,680 both lost to 262,144 at 700k. The
-    /// measured 272-bit settings cover the 265–280 tier; unmeasured larger widths retain the prior
-    /// conservative parameters.
+    /// scalar elimination. Half-widths 196,608 and 327,680 both lost to 262,144 at 700k.
+    ///
+    /// True block Lanczos subsequently moved the browser crossover to 272 bits:
+    /// on the first fixed 272-bit case it reduced LA/extraction from 5.574 s to
+    /// 1.721 s. At 288 bits, removing the old 700k-to-500k bound discontinuity
+    /// with `(1.4M, 262144, −4)` reduced a fixed balanced case from 420.223 s to
+    /// 258.512 s. That last tier is a one-input boundary correction, not a
+    /// multi-host optimum claim. A final real-Chromium shipped-artifact run
+    /// completed the 256-, 272-, and 288-bit fixtures in 23.702 s, 69.783 s,
+    /// and 226.901 s.
+    ///
+    /// The 289–333 native tiers were then measured with 96 workers on the same
+    /// Xeon 8259CL host. Splitting the 289–304 range, using 262,144-wide
+    /// half-intervals, nearest-integer log weights, a 500-prime score skip, and
+    /// SQUFOF for DLP cofactors reduced fixed anchors to 41.8 s at 289 bits and
+    /// 103.5 s at 304 bits. RSA-100 completed in 622.6 s; its 14.9-second
+    /// filtering/Lanczos/extraction tail confirms that relation sieving, not
+    /// sparse linear algebra, is the remaining high-end bottleneck.
     ///
     /// `thresh_adj` is the measured sieve-threshold offset in bits, added to
-    /// `log2|g(x)| − log2(large-prime bound) − small-prime slack`. Deeper thresholds trade more
+    /// `log2|g(x)| − log2(cofactor bound) − small-prime slack`. Deeper thresholds trade more
     /// survivors for fewer polynomials, and the optimum deepens with input size because
     /// per-polynomial cost grows faster than per-survivor cost. Measured optima on a 48-core Xeon
     /// 8259CL at 4 threads: 0 at 192-bit, −2 at 224-bit, −4 at 256-bit. The browser-tier values
@@ -330,28 +345,50 @@ pub mod parameters {
         pub sieve_half_width: u32,
         pub thresh_adj: i32,
         pub large_prime_mult: u32,
+        pub double_large_primes: bool,
+        pub double_large_prime_mult: u32,
     }
     pub fn engine_params(bits: usize) -> EngineParams {
-        let (factor_base_bound, sieve_half_width, thresh_adj) = match bits {
-            0..=100 => (3_000, 32_768, 0),
-            101..=128 => (6_000, 32_768, 0),
-            129..=160 => (40_000, 65_536, 0),
-            161..=176 => (60_000, 65_536, 0),
-            177..=192 => (100_000, 90_112, 0),
-            193..=208 => (120_000, 131_072, -1),
-            209..=216 => (135_000, 131_072, 0),
-            217..=224 => (175_000, 131_072, 0),
-            225..=232 => (200_000, 131_072, -3),
-            233..=248 => (350_000, 131_072, -1),
-            249..=264 => (450_000, 196_608, -4),
-            265..=280 => (700_000, 262_144, -4),
-            _ => (500_000, 327_680, -4),
+        let (
+            factor_base_bound,
+            sieve_half_width,
+            thresh_adj,
+            large_prime_mult,
+            double_large_primes,
+            double_large_prime_mult,
+        ) = match bits {
+            0..=100 => (3_000, 32_768, 0, 256, false, 0),
+            101..=128 => (6_000, 32_768, 0, 256, false, 0),
+            129..=160 => (40_000, 65_536, 0, 256, false, 0),
+            161..=176 => (60_000, 65_536, 0, 256, false, 0),
+            177..=192 => (100_000, 90_112, 0, 256, false, 0),
+            193..=208 => (120_000, 131_072, -1, 256, false, 0),
+            209..=216 => (135_000, 131_072, 0, 256, false, 0),
+            217..=224 => (175_000, 131_072, 0, 256, false, 0),
+            225..=232 => (200_000, 131_072, -3, 256, false, 0),
+            233..=248 => (350_000, 131_072, -1, 256, false, 0),
+            249..=264 => (450_000, 196_608, -4, 256, false, 0),
+            265..=280 => (700_000, 262_144, -4, 256, false, 0),
+            // With sparse Lanczos removing the residual-matrix penalty, do not
+            // retain the old discontinuity that dropped the prime bound from
+            // 700k at 280 bits to 500k at 281 bits. This scale gives roughly
+            // 55k accepted primes near 288 bits.
+            281..=288 => (1_400_000, 262_144, -4, 100, false, 0),
+            // Native 96-thread anchors split this range: retaining one tier
+            // made the 304-bit endpoint relation-starved.
+            289..=296 => (1_200_000, 262_144, -3, 120, true, 12),
+            297..=304 => (1_500_000, 262_144, -3, 120, true, 16),
+            305..=312 => (1_800_000, 262_144, -3, 150, true, 16),
+            313..=320 => (2_250_000, 262_144, -3, 150, true, 16),
+            _ => (3_000_000, 262_144, -3, 150, true, 16),
         };
         EngineParams {
             factor_base_bound,
             sieve_half_width,
             thresh_adj,
-            large_prime_mult: 256,
+            large_prime_mult,
+            double_large_primes,
+            double_large_prime_mult,
         }
     }
 }
@@ -369,13 +406,56 @@ mod tests {
             (240, 350_000, 131_072, -1),
             (256, 450_000, 196_608, -4),
             (272, 700_000, 262_144, -4),
-            (281, 500_000, 327_680, -4),
         ];
         for (bits, bound, half_width, threshold) in expected {
             let params = engine_params(bits);
             assert_eq!(params.factor_base_bound, bound, "{bits}-bit bound");
             assert_eq!(params.sieve_half_width, half_width, "{bits}-bit width");
             assert_eq!(params.thresh_adj, threshold, "{bits}-bit threshold");
+            assert!(!params.double_large_primes, "{bits}-bit DLP policy");
+        }
+    }
+
+    #[test]
+    fn lanczos_browser_crossover_removes_the_old_281_bit_base_drop() {
+        for bits in [281, 288] {
+            let params = engine_params(bits);
+            assert_eq!(params.factor_base_bound, 1_400_000);
+            assert_eq!(params.sieve_half_width, 262_144);
+            assert_eq!(params.thresh_adj, -4);
+            assert_eq!(params.large_prime_mult, 100);
+            assert!(!params.double_large_primes);
+        }
+    }
+
+    #[test]
+    fn hundred_digit_tiers_use_large_bases_dlp_and_sparse_la_scale() {
+        let expected = [
+            (289, 1_200_000, 262_144, -3, 120, 12),
+            (296, 1_200_000, 262_144, -3, 120, 12),
+            (297, 1_500_000, 262_144, -3, 120, 16),
+            (304, 1_500_000, 262_144, -3, 120, 16),
+            (305, 1_800_000, 262_144, -3, 150, 16),
+            (312, 1_800_000, 262_144, -3, 150, 16),
+            (313, 2_250_000, 262_144, -3, 150, 16),
+            (320, 2_250_000, 262_144, -3, 150, 16),
+            (321, 3_000_000, 262_144, -3, 150, 16),
+            (333, 3_000_000, 262_144, -3, 150, 16),
+        ];
+        for (bits, bound, half_width, threshold, large_prime_mult, double_mult) in expected {
+            let params = engine_params(bits);
+            assert_eq!(params.factor_base_bound, bound, "{bits}-bit bound");
+            assert_eq!(params.sieve_half_width, half_width, "{bits}-bit width");
+            assert_eq!(params.thresh_adj, threshold, "{bits}-bit threshold");
+            assert_eq!(
+                params.large_prime_mult, large_prime_mult,
+                "{bits}-bit large-prime multiplier"
+            );
+            assert!(params.double_large_primes, "{bits}-bit DLP policy");
+            assert_eq!(
+                params.double_large_prime_mult, double_mult,
+                "{bits}-bit DLP product multiplier"
+            );
         }
     }
 }

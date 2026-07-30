@@ -70,6 +70,7 @@ struct Context {
     pinv: Arc<[u64]>,
     /// Threshold give-back for the tiny primes the score pass skips, derived from that set.
     small_slack: usize,
+    rounded_scores: bool,
     /// `interval mod p` per factor-base prime. Sieve roots are residues of the signed polynomial
     /// coordinate `x`, while score-array positions represent `x + interval`; precomputing this
     /// fixed translation avoids two signed divisions per prime and polynomial in the sieve pass.
@@ -79,9 +80,11 @@ struct Context {
     a_all: Arc<[usize]>,
     a_pool: Arc<[usize]>,
     a_factor_count: usize,
-    /// Sieve-threshold slack for the unfactored cofactor, in bits. This is `log2(single_limit)` and
-    /// nothing else: a survivor whose cofactor exceeds the large-prime bound is discarded by
-    /// `classify_cofactor`, so admitting it costs a full trial division for no possible relation.
+    /// Sieve-threshold slack for the unfactored cofactor, in bits. This is
+    /// `log2(single_limit)` in the browser tiers and `log2(double_limit)` in
+    /// high-digit DLP tiers, and nothing else: a survivor whose cofactor exceeds
+    /// the applicable bound is discarded by `classify_cofactor`, so admitting
+    /// it costs a full trial division for no possible relation.
     /// v0.2.0 used an independent per-tier `lp_allowance` here, which at the 256-bit tier admitted
     /// 34-bit cofactors against a 27-bit acceptance bound — seven bits of pure waste.
     lp_bits: usize,
@@ -89,8 +92,12 @@ struct Context {
     thresh_adj: i32,
     /// Maximum accepted single large prime (and maximum factor of a double).
     single_limit: u64,
-    /// Whether double-large-prime cofactors are captured and combined.
-    double_enabled: bool,
+    /// Maximum accepted product of two large primes, or zero when the
+    /// double-large-prime variant is disabled.
+    double_limit: u64,
+    /// Select the sparse 64-way Montgomery block-Lanczos recurrence after
+    /// filtering. The measured crossover is 272 bits on browser Wasm.
+    use_block_lanczos: bool,
     relation_percent: Option<usize>,
     small_skip: u32,
     threshold_margin: i32,
@@ -140,6 +147,10 @@ struct FamilyResult {
     /// Total sieve survivors examined (read only by the native profiling path).
     #[allow(dead_code)]
     survivors: u64,
+    /// Profile-only nanoseconds: family setup, score/scan, survivor
+    /// factorization, and Gray-code root advancement.
+    #[allow(dead_code)]
+    timing: [u64; 4],
 }
 
 /// Per-worker reusable buffers (SPEC §7.4 — reuse sieve/candidate scratch).
@@ -252,12 +263,16 @@ const MAX_FAMILIES: u64 = 100_000;
 
 /// Prepare an immutable context without creating threads.
 pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, EngineError> {
-    let mut p = crate::qs::parameters::engine_params(n.bit_len());
+    let input_bits = n.bit_len();
+    let mut p = crate::qs::parameters::engine_params(input_bits);
     if let Some(bound) = tuning.factor_base_bound {
         p.factor_base_bound = bound;
     }
     if let Some(half_width) = tuning.sieve_half_width {
         p.sieve_half_width = half_width;
+    }
+    if let Some(large_prime_multiplier) = tuning.large_prime_multiplier {
+        p.large_prime_mult = large_prime_multiplier;
     }
     let k = knuth_schroeppel(&n);
     let sieve_n = n
@@ -273,8 +288,11 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
     // Expected log weight of the tiny primes that are skipped by the score pass: `Σ log(p)/(p−1)`
     // over the skipped set, which is what the threshold must give back. Derived once here rather
     // than carried as a hand-tuned constant, and cheap to keep out of the per-polynomial path.
-    let small_skip = tuning.small_skip.unwrap_or(100);
-    let small_slack = small_slack(&base, small_skip);
+    let small_skip = tuning
+        .small_skip
+        .unwrap_or(if input_bits >= 289 { 500 } else { 100 });
+    let rounded_scores = input_bits >= 289;
+    let small_slack = small_slack(&base, small_skip, rounded_scores);
     let interval_mod_p: Arc<[u32]> = base.iter().map(|e| p.sieve_half_width % e.prime).collect();
     let target_a = sieve_n
         .floor_sqrt()
@@ -282,27 +300,45 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
         .unwrap()
         .0;
     let (a_all, a_pool, a_factor_count) = siqs::build_a_candidates(&base, &target_a);
-    let (single_limit, double_enabled) =
-        large_prime_policy(p.factor_base_bound, p.large_prime_mult);
+    let (single_limit, mut double_limit) = large_prime_policy(
+        p.factor_base_bound,
+        p.large_prime_mult,
+        if p.double_large_primes {
+            p.double_large_prime_mult
+        } else {
+            0
+        },
+    );
+    if let Some(bound) = tuning.double_large_prime_bound {
+        double_limit = bound.min(single_limit.saturating_mul(single_limit));
+    }
     let context = Arc::new(Context {
         n,
         sieve_n,
         base,
         pinv,
         small_slack,
+        rounded_scores,
         interval_mod_p,
         interval: p.sieve_half_width as i32,
         target_a,
         a_all,
         a_pool,
         a_factor_count,
-        // A double needs room for two acceptable large primes, so the threshold has to admit twice
-        // the cofactor width or no double can ever survive it — the second, independent blocker that
-        // made `LargePrime::Two` unreachable in v0.2.0 even with its gate forced open.
-        lp_bits: (64 - single_limit.leading_zeros()) as usize * if double_enabled { 2 } else { 1 },
+        // The double cutoff is deliberately below `single_limit²`: relations
+        // with two primes near the full single-prime cutoff almost never close
+        // useful cycles, but admitting them floods survivor trial division.
+        lp_bits: (64
+            - if double_limit == 0 {
+                single_limit
+            } else {
+                double_limit
+            }
+            .leading_zeros()) as usize,
         thresh_adj: p.thresh_adj + tuning.threshold_adjustment.unwrap_or(0),
         single_limit,
-        double_enabled,
+        double_limit,
+        use_block_lanczos: input_bits >= 272,
         relation_percent: tuning.relation_percent,
         small_skip,
         threshold_margin: tuning.threshold_margin.unwrap_or(0),
@@ -326,31 +362,22 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
     Ok(EngineContext(context))
 }
 
-/// Whether to capture and combine double-large-prime cofactors.
-///
-/// Off, on measurement. `LargePrime::Two`, `classify_cofactor` and cycle combination are all
-/// implemented and reachable — flipping this constant is the whole switch — but at 192-bit, 4
-/// threads, sieve+collect seconds:
-///
-/// | configuration                                    | polys | survivors | cycles | time  |
-/// |--------------------------------------------------|------:|----------:|-------:|------:|
-/// | off (shipped)                                    | 5 632 |    45 194 |  1 945 | 0.605 |
-/// | on, threshold matched to the single-prime bound   | 5 408 |    51 513 |  2 040 | 0.607 |
-/// | on, threshold 4 bits deeper                       | 4 672 |    85 829 |  2 391 | 0.680 |
-/// | on, threshold widened to admit genuine doubles    |     — |         — |      — | >300  |
-///
-/// At a matched threshold it buys 4% fewer polynomials and the extra cofactor splits eat exactly
-/// that, so it is a wash. Widening the threshold to `2 · log2(large-prime bound)` — which a genuine
-/// double *needs*, and which was the second, independent reason `LargePrime::Two` was unreachable in
-/// v0.2.0 — floods the survivor path and did not finish in 300 s against 0.605 s.
-const DOUBLE_LARGE_PRIMES: bool = false;
-
 /// Large-prime acceptance is independent from the sieve threshold slack.
-fn large_prime_policy(bound: u32, large_prime_mult: u32) -> (u64, bool) {
-    (
-        (bound as u64).saturating_mul(large_prime_mult as u64),
-        DOUBLE_LARGE_PRIMES,
-    )
+///
+/// Cap DLP products at a small multiple of the factor-base square. This keeps
+/// both factors in the dense part of the large-prime graph; the conventional
+/// `single_limit^1.8` window flooded this engine with unique vertices.
+fn large_prime_policy(
+    bound: u32,
+    large_prime_mult: u32,
+    double_large_prime_mult: u32,
+) -> (u64, u64) {
+    let single_limit = (bound as u64).saturating_mul(large_prime_mult as u64);
+    let double_limit = (bound as u64)
+        .saturating_mul(bound as u64)
+        .saturating_mul(double_large_prime_mult as u64)
+        .min(single_limit.saturating_mul(single_limit));
+    (single_limit, double_limit)
 }
 
 /// Execute a job using only the caller's thread and owned scratch memory.
@@ -467,8 +494,8 @@ impl EngineSession {
 
 fn relation_target(base_len: usize, percent: Option<usize>) -> usize {
     if let Some(percent) = percent {
-        // Fewer than one relation per factor-base row cannot produce the
-        // dependencies SIQS needs, so reject misleading under-target tuning.
+        // Fewer than one relation per factor-base row cannot reliably produce
+        // the dependencies SIQS needs, so reject misleading under-target tuning.
         return (base_len * percent.clamp(100, 110) / 100).max(base_len + 1);
     }
     base_len + 64
@@ -689,6 +716,8 @@ fn find_factor(
     let mut collector = RelationCollector::new();
     let mut polynomials = 0u64;
     let mut total_survivors = 0u64;
+    let mut relation_kinds = [0u64; 3];
+    let mut timing = [0u64; 4];
     let mut seen_a = HashSet::new();
     let mut cancelled = false;
     while collector.columns.len() < target && next_merge < MAX_FAMILIES && !cancelled {
@@ -707,7 +736,15 @@ fn find_factor(
             }
             polynomials += r.polynomials;
             total_survivors += r.survivors;
+            for (total, value) in timing.iter_mut().zip(r.timing) {
+                *total += value;
+            }
             for rel in r.relations {
+                relation_kinds[match rel.large {
+                    LargePrime::None => 0,
+                    LargePrime::One(_) => 1,
+                    LargePrime::Two(_, _) => 2,
+                }] += 1;
                 collector.ingest(rel, &n);
                 if collector.columns.len() >= target {
                     break;
@@ -762,14 +799,24 @@ fn find_factor(
     }
     if prof {
         eprintln!(
-            "PROFILE sieve+collect={:.3}s polys={} families={} survivors={} partials={} cycles={} relations={}",
+            "PROFILE sieve+collect={:.3}s polys={} families={} survivors={} accepted={}/{}/{} partials={} cycles={} relations={}",
             t_sieve.elapsed().as_secs_f64(),
             polynomials,
             next_merge,
             total_survivors,
+            relation_kinds[0],
+            relation_kinds[1],
+            relation_kinds[2],
             collector.forest.relations.len(),
             collector.cycles,
             collector.columns.len()
+        );
+        eprintln!(
+            "PROFILE worker_cpu setup={:.3}s score={:.3}s factor={:.3}s roots={:.3}s",
+            timing[0] as f64 * 1e-9,
+            timing[1] as f64 * 1e-9,
+            timing[2] as f64 * 1e-9,
+            timing[3] as f64 * 1e-9,
         );
     }
     if !progress(EngineProgress {
@@ -803,11 +850,12 @@ fn find_factor(
 }
 
 /// Expected log weight lost by skipping tiny primes.
-fn small_slack(base: &[FactorBaseEntry], skip: u32) -> usize {
+fn small_slack(base: &[FactorBaseEntry], skip: u32, rounded: bool) -> usize {
     base.iter()
         .filter(|entry| entry.prime < skip)
         .map(|entry| {
-            score_weight(entry.prime) as f64 / (entry.prime.saturating_sub(1).max(1)) as f64
+            score_weight(entry.prime, rounded) as f64
+                / (entry.prime.saturating_sub(1).max(1)) as f64
         })
         .sum::<f64>()
         .round() as usize
@@ -817,8 +865,37 @@ fn small_slack(base: &[FactorBaseEntry], skip: u32) -> usize {
 /// prime rather than read from a parallel array, so the score pass streams one fewer array over the
 /// whole factor base for every polynomial — which matters on the small-L2 targets this crate aims at.
 #[inline(always)]
-fn score_weight(prime: u32) -> u8 {
-    (32 - prime.leading_zeros()) as u8
+fn score_weight(prime: u32, rounded: bool) -> u8 {
+    let floor = 31 - prime.leading_zeros();
+    if !rounded {
+        return (floor + 1) as u8;
+    }
+    // Round log2(p) to nearest instead of always rounding upward. The latter
+    // accumulates roughly half a bit of false score per factor and becomes a
+    // major survivor false-positive source in 90–100 digit tiers.
+    let rounds_up = (prime as u64) * (prime as u64) >= (2u64 << (2 * floor));
+    (floor + u32::from(rounds_up)) as u8
+}
+
+fn score_plan(ctx: &Context, a: &Natural) -> (u8, u8, bool) {
+    let g_bits = ctx.sieve_n.bit_len().saturating_sub(a.bit_len());
+    let threshold = (g_bits as i32 - ctx.lp_bits as i32 - ctx.small_slack as i32
+        + ctx.threshold_margin
+        + ctx.thresh_adj)
+        .clamp(1, u8::MAX as i32) as u8;
+    let bias = 128u8.saturating_sub(threshold);
+    let small_end = ctx
+        .base
+        .partition_point(|entry| entry.prime < ctx.small_skip);
+    let smallest_scored = ctx
+        .base
+        .get(small_end)
+        .map_or(u32::MAX, |entry| entry.prime)
+        .max(3);
+    let scored_bits = (32 - smallest_scored.leading_zeros() - 1).max(1);
+    let score_bound = g_bits as u32 + g_bits as u32 / scored_bits + 1;
+    let exact = bias as u32 + score_bound <= u8::MAX as u32;
+    (bias, threshold.saturating_add(bias), exact)
 }
 /// Add the two root strides for one factor-base prime. Interleaving the roots and unrolling two
 /// hits at a time mirrors FLINT's flat sieve kernel and cuts loop-control overhead in the dominant
@@ -868,6 +945,15 @@ fn sieve_root_pair<const SATURATING: bool>(
     }
 }
 
+#[inline(always)]
+fn add_score<const SATURATING: bool>(slot: &mut u8, weight: u8) {
+    *slot = if SATURATING {
+        slot.saturating_add(weight)
+    } else {
+        slot.wrapping_add(weight)
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn score_polynomial<const SATURATING: bool>(
     ctx: &Context,
@@ -886,15 +972,24 @@ fn score_polynomial<const SATURATING: bool>(
             continue;
         }
         let pu = p as usize;
-        let weight = score_weight(p);
+        let weight = score_weight(p, ctx.rounded_scores);
         if root1[idx] != u32::MAX {
-            sieve_root_pair::<SATURATING>(
-                scores,
-                root1[idx] as usize,
-                root2[idx] as usize,
-                pu,
-                weight,
-            );
+            let r1 = root1[idx] as usize;
+            let r2 = root2[idx] as usize;
+            // Most primes in the high-digit factor bases exceed the whole
+            // sieve array and therefore hit each root at most once. Avoid
+            // entering the stride kernel (and its overflow-safe loop tests)
+            // for this dominant sparse tail.
+            if pu >= scores.len() {
+                if r1 < scores.len() {
+                    add_score::<SATURATING>(&mut scores[r1], weight);
+                }
+                if r2 != r1 && r2 < scores.len() {
+                    add_score::<SATURATING>(&mut scores[r2], weight);
+                }
+            } else {
+                sieve_root_pair::<SATURATING>(scores, r1, r2, pu, weight);
+            }
         } else {
             // p | a: the polynomial is linear (2bx + c) mod p — one root, per poly.
             let mut bp = b.mod_u64(p as u64) as u32;
@@ -910,11 +1005,7 @@ fn score_polynomial<const SATURATING: bool>(
             let xroot = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
             let mut pos = add_mod_u32(xroot, ctx.interval_mod_p[idx], p) as usize;
             while pos < scores.len() {
-                scores[pos] = if SATURATING {
-                    scores[pos].saturating_add(weight)
-                } else {
-                    scores[pos].wrapping_add(weight)
-                };
+                add_score::<SATURATING>(&mut scores[pos], weight);
                 pos += pu;
             }
         }
@@ -994,6 +1085,7 @@ fn sieve_one_poly(
     scores: &mut Vec<u8>,
     candidates: &mut Vec<u32>,
     out: &mut Vec<Relation>,
+    timing: &mut [u64; 4],
 ) -> usize {
     let base = &ctx.base;
     let len = (ctx.interval as usize) * 2;
@@ -1004,52 +1096,33 @@ fn sieve_one_poly(
     } else {
         (ctx.sieve_n.wrapping_sub(&bb).div_rem(a).unwrap().0, true)
     };
-    let g_bits = ctx.sieve_n.bit_len().saturating_sub(a.bit_len());
-    // Score threshold: a survivor's scored-prime log weight must come within `lp_bits` of g(x), the
-    // point past which the unfactored cofactor could no longer be an acceptable large prime.
-    // `small_slack` gives back the tiny primes that are not scored, and `thresh_adj` is the measured
-    // per-tier offset trading survivors against polynomials (see `qs::parameters`).
-    let threshold = (g_bits as i32 - ctx.lp_bits as i32 - ctx.small_slack as i32
-        + ctx.threshold_margin
-        + ctx.thresh_adj)
-        .clamp(1, u8::MAX as i32) as u8;
+    let (bias, scan_threshold, exact_scores) = score_plan(ctx, a);
     // Factor-base entries with `prime < small_skip` occupy the low indices (the base is sorted
     // ascending). Those tiny primes are not sieved — gating them would waste a `fastmod` where a
     // direct divide is cheaper (they divide most survivors) — so they are divided out directly.
     let small_end = base.partition_point(|e| e.prime < small_skip);
-    // Bias every score so that reaching `threshold` sets the byte's high bit; the candidate scan is
-    // then one masked compare per eight positions (see `collect_candidates`).
-    let bias = 128u8.saturating_sub(threshold);
-    let scan_threshold = threshold.saturating_add(bias);
-    // Wrapping score writes are one instruction cheaper than saturating ones, but they are only
-    // sound when no position can carry past 255. Every scored prime is at least
-    // `base[small_end].prime`, so at most `g_bits / floor(log2 p_min)` distinct scored primes can
-    // divide one `g(x)`, and each adds at most `log2(p) + 1` — hence the bound below. When it does
-    // not fit, fall back to saturating writes, which lose the exact-score trial-division shortcut
-    // but cannot produce a false negative. This is the invariant that `RUSQSIEVE_SMALL_SKIP` could
-    // previously break silently into wrapping overflow and false negatives.
-    let smallest_scored = base.get(small_end).map_or(u32::MAX, |e| e.prime).max(3);
-    let scored_bits = (32 - smallest_scored.leading_zeros() - 1).max(1);
-    let score_bound = g_bits as u32 + g_bits as u32 / scored_bits + 1;
-    let exact_scores = bias as u32 + score_bound <= u8::MAX as u32;
     scores.clear();
     scores.resize(len, bias);
     // Flat logarithmic sieve. The formerly gated cache-blocked kernel was
     // unreachable for every shipped interval and was slower when forced on.
+    let score_started = ctx.profile.then(std::time::Instant::now);
     if exact_scores {
         score_polynomial::<false>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
     } else {
         score_polynomial::<true>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
     }
     collect_candidates(scores, scan_threshold, candidates);
+    if let Some(started) = score_started {
+        timing[1] += started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    }
     if candidates.is_empty() {
         return 0;
     }
     let survivors = candidates.len();
+    let factor_started = ctx.profile.then(std::time::Instant::now);
 
     let two_idx = base.iter().position(|e| e.prime == 2).map(|i| i as u32);
     let mut powers_scratch = Vec::new();
-
     for &posu in candidates.iter() {
         let pos = posu as usize;
         // The score is the sum of one log weight per sieve hit. Once the primes divided out account
@@ -1082,14 +1155,13 @@ fn sieve_one_poly(
             continue;
         }
         powers_scratch.clear();
-        powers_scratch.extend(aidx.iter().copied().map(|i| (i, 1)));
-        // Merge a divided-out exponent for factor-base index `i` into `powers`.
+        powers_scratch.extend(aidx.iter().copied().map(|index| (index, 1)));
         let record = |i: u32, count: u16, powers: &mut Vec<(u32, u16)>| {
             if count == 0 {
                 return;
             }
-            if let Some(v) = powers.iter_mut().find(|v| v.0 == i) {
-                v.1 += count;
+            if let Some(value) = powers.iter_mut().find(|value| value.0 == i) {
+                value.1 += count;
             } else {
                 powers.push((i, count));
             }
@@ -1125,38 +1197,34 @@ fn sieve_one_poly(
             let p = base[ai as usize].prime as u64;
             let count = divide_out(&mut q, p);
             if count != 0 && p >= small_skip as u64 {
-                confirmed_score += u16::from(score_weight(p as u32));
+                confirmed_score += u16::from(score_weight(p as u32, ctx.rounded_scores));
             }
             record(ai, count, &mut powers_scratch);
         }
-        // Scored factor base: gate each prime with the precomputed multiply-shift residue test and
-        // divide only on a hit (FLINT `qsieve_evaluate_candidate`), stopping as soon as the recorded
-        // score is accounted for or nothing is left to divide.
-        //
-        // msieve-style resieving was implemented here — replaying the root progressions of the
-        // sparse tail over a candidate bitmap so those primes cost O(number of factors) instead of a
-        // gated scan — and measured a net LOSS at every size and every cutoff tried (224-bit: gate
-        // scan 2.40 -> 1.49 cpu-s but the resieve pass cost 1.59; 256-bit: 26.5 -> 12.0 against a
-        // 17.1 cpu-s pass). The reason is structural: the gate below is only ~9 cycles per prime, so
-        // resieving competes against an already-cheap test, and its cost falls per *polynomial*
-        // while the saving accrues per *survivor* — and this engine sees only ~5 survivors per
-        // polynomial. See CHANGELOG 0.2.1.
         for idx in small_end..base.len() {
             if q.is_one() || confirmed_score >= score_target {
                 break;
             }
             let r1 = root1[idx];
             if r1 == u32::MAX {
-                continue; // prime divides `a`; handled above
+                continue;
             }
             let p = base[idx].prime;
-            let position_mod_p = fastmod(posu, p, ctx.pinv[idx]);
+            // For the sparse factor-base tail `p` exceeds the score-array
+            // position, so the residue is the position itself. This removes
+            // two wide multiplies from most survivor/prime gates at 90–100
+            // decimal digits.
+            let position_mod_p = if posu < p {
+                posu
+            } else {
+                fastmod(posu, p, ctx.pinv[idx])
+            };
             if position_mod_p != r1 && position_mod_p != root2[idx] {
                 continue;
             }
             let count = divide_out(&mut q, p as u64);
             if count != 0 {
-                confirmed_score += u16::from(score_weight(p));
+                confirmed_score += u16::from(score_weight(p, ctx.rounded_scores));
             }
             record(idx as u32, count, &mut powers_scratch);
         }
@@ -1165,7 +1233,7 @@ fn sieve_one_poly(
         } else if q.bit_len() > 64 {
             continue;
         } else {
-            match classify_cofactor(q.as_parts()[0], ctx.single_limit, ctx.double_enabled) {
+            match classify_cofactor(q.as_parts()[0], ctx.single_limit, ctx.double_limit) {
                 Some(lp) => lp,
                 None => continue,
             }
@@ -1180,6 +1248,9 @@ fn sieve_one_poly(
             powers: core::mem::take(&mut powers_scratch),
             large,
         });
+    }
+    if let Some(started) = factor_started {
+        timing[2] += started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     }
     survivors
 }
@@ -1228,14 +1299,24 @@ fn combine_cycle<'a>(rels: impl IntoIterator<Item = &'a Relation>, n: &Natural) 
 
 /// Classify a factored-out cofactor (>1, fits in `u64`) as a single or double
 /// large prime, or reject it. Portable (no threads / native-only deps).
-fn classify_cofactor(q: u64, single_limit: u64, double_enabled: bool) -> Option<LargePrime> {
-    if crate::u64math::is_prime(q) {
-        return (q <= single_limit).then_some(LargePrime::One(q));
+fn classify_cofactor(q: u64, single_limit: u64, double_limit: u64) -> Option<LargePrime> {
+    // An exact residual may be used as a graph vertex without proving it
+    // prime: when the same value closes a cycle, the entire residual is
+    // squared out. In normal SIQS use it is prime anyway, because all possible
+    // factor-base divisors have just been removed.
+    if q <= single_limit {
+        return Some(LargePrime::One(q));
     }
-    if !double_enabled {
+    if double_limit == 0 || q > double_limit {
         return None;
     }
-    let d = pollard_u64(q)?;
+    // Almost every residual in this range is prime. One base-2 Fermat test is
+    // sufficient as a cheap rejection filter; base-2 pseudoprimes continue to
+    // exact splitting and factor primality checks below.
+    if crate::u64math::pow_mod(2, q - 1, q) == 1 {
+        return None;
+    }
+    let d = crate::u64math::squfof(q).or_else(|| pollard_u64(q))?;
     let e = q / d;
     if d > 1
         && e > 1
@@ -1992,6 +2073,57 @@ mod tests {
             let factor = pollard_u64(n).expect("Brent failed to split cofactor");
             assert!(factor == left || factor == right, "{n} -> {factor}");
         }
+    }
+
+    #[test]
+    fn double_large_prime_classification_is_bounded_and_exact() {
+        let left = 1_000_003u64;
+        let right = 1_000_033u64;
+        let product = left * right;
+        assert!(matches!(
+            classify_cofactor(left, 2_000_000, product),
+            Some(LargePrime::One(value)) if value == left
+        ));
+        assert!(classify_cofactor(product, 2_000_000, 0).is_none());
+        assert!(classify_cofactor(product, 2_000_000, product - 1).is_none());
+        assert!(matches!(
+            classify_cofactor(product, 2_000_000, product),
+            Some(LargePrime::Two(a, b)) if a == left && b == right
+        ));
+        assert!(
+            classify_cofactor(product, left, product).is_none(),
+            "a factor above the single-prime bound was accepted"
+        );
+    }
+
+    #[test]
+    fn dlp_policy_is_integer_bounded() {
+        let (single, double) = large_prime_policy(3_000_000, 150, 16);
+        assert_eq!(single, 450_000_000);
+        assert_eq!(double, 144_000_000_000_000);
+        assert!(double < single.saturating_mul(single));
+        assert_eq!(large_prime_policy(3_000_000, 150, 0), (single, 0));
+    }
+
+    #[test]
+    fn double_large_prime_triangle_closes_and_retains_square_roots() {
+        let n = Natural::from_u64(1_000_000_007);
+        let relation = |a, b| Relation {
+            root: Natural::ONE,
+            sign: false,
+            powers: Vec::new(),
+            large: LargePrime::Two(a, b),
+        };
+        let mut collector = RelationCollector::new();
+        collector.ingest(relation(101, 103), &n);
+        collector.ingest(relation(103, 107), &n);
+        assert!(collector.columns.is_empty());
+        collector.ingest(relation(101, 107), &n);
+        assert_eq!(collector.columns.len(), 1);
+        assert_eq!(collector.cycles, 1);
+        let mut square_roots = collector.columns[0].extra_sqrt.clone();
+        square_roots.sort_unstable();
+        assert_eq!(square_roots, [101, 103, 107]);
     }
 
     #[test]

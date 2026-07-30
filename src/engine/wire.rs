@@ -118,5 +118,6 @@ pub(super) fn deserialize_family(b: &[u8]) -> Option<FamilyResult> {
         polynomials,
         relations,
         survivors: 0,
+        timing: [0; 4],
     })
 }

@@ -3,9 +3,14 @@
 // Playwright stays an external development tool so the zero-dependency crate
 // and browser artifact do not acquire a Node package manifest:
 //
+//   FONTCONFIG_FILE=/tmp/rusqsieve-font-root/etc/fonts/fonts.conf \
+//   FONTCONFIG_SYSROOT=/tmp/rusqsieve-font-root \
 //   PLAYWRIGHT_MODULE=/tmp/rusqsieve-playwright/node_modules/playwright \
 //   PLAYWRIGHT_BROWSERS_PATH=/tmp/rusqsieve-playwright-browsers \
 //     node tools/playwright-bench.mjs URL N P Q [WORKERS]
+//
+// Set PLAYWRIGHT_CHROMIUM_EXECUTABLE only when the default Playwright browser
+// must be overridden and that executable's dynamic-library set is complete.
 
 import { createRequire } from "node:module";
 
@@ -21,7 +26,11 @@ if (!Number.isInteger(workers) || workers < 1 || workers > 48) {
 const require = createRequire(import.meta.url);
 const playwrightModule = process.env.PLAYWRIGHT_MODULE || "playwright";
 const { chromium } = require(playwrightModule);
-const browser = await chromium.launch({ headless: true });
+const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE;
+const browser = await chromium.launch({
+  headless: true,
+  ...(executablePath ? { executablePath } : {}),
+});
 const context = await browser.newContext();
 await context.addInitScript((count) => {
   Object.defineProperty(Navigator.prototype, "hardwareConcurrency", {

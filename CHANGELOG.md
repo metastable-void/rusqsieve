@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0 — 2026-07-30
+
+- Added a true portable 64-way Montgomery block-Lanczos recurrence over `GF(2)`
+  for native and Wasm residual matrices from 272 input bits upward. It applies
+  sparse `BᵀB`, handles rank-deficient blocks with the complete three-term
+  recurrence, retries deterministic starting blocks, lifts through structured
+  filtering, and verifies every dependency against the original matrix.
+- Added split 87–100-decimal-digit SIQS tiers, combined partial relations, and
+  bounded double-large-prime collection. High-tier DLP uses a production
+  SQUFOF splitter with a bounded Pollard fallback and caps products at 12× or
+  16× the factor-base-bound square; `single_limit^1.8` flooded this relation
+  graph with unique vertices.
+- Added nearest-integer high-tier log weights and a measured 500-prime score
+  skip. On the 96-thread tuning host, fixed 289- and 304-bit anchors completed
+  in 41.8 s and 103.5 s. RSA-100 completed in 622.6 s, of which 14.9 s was
+  filtering, block Lanczos, and extraction.
+- A matched fixed 272-bit browser run reduced LA/extraction from 5.574 s to
+  1.721 s and wall time from 83.599 s to 80.072 s. The 281–288 tier removes the
+  old 700k-to-500k factor-base discontinuity: on an exact 288-bit fixture,
+  1.4M/262,144 plus Lanczos reduced wall time from 420.223 s to 258.512 s.
+  A matched 256-bit M4RI control remained within noise. A final real-Chromium
+  confirmation of the shipped artifacts completed the 256-, 272-, and 288-bit
+  fixtures in 23.702 s, 69.783 s, and 226.901 s.
+
 ## 0.3.0 — 2026-07-26
 
 Breaking minor release for the API, environment, dead-code, safety, CI, and

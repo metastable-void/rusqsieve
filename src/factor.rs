@@ -37,6 +37,8 @@ pub(crate) struct FactorTuning {
     pub(crate) threshold_adjustment: Option<i32>,
     pub(crate) factor_base_bound: Option<u32>,
     pub(crate) sieve_half_width: Option<u32>,
+    pub(crate) large_prime_multiplier: Option<u32>,
+    pub(crate) double_large_prime_bound: Option<u64>,
     pub(crate) profile: bool,
 }
 
@@ -109,6 +111,8 @@ impl FactorConfig {
         threshold_adjustment: Option<i32>,
         factor_base_bound: Option<u32>,
         sieve_half_width: Option<u32>,
+        large_prime_multiplier: Option<u32>,
+        double_large_prime_bound: Option<u64>,
         profile: bool,
     ) -> Self {
         self.tuning = FactorTuning {
@@ -118,6 +122,8 @@ impl FactorConfig {
             threshold_adjustment,
             factor_base_bound,
             sieve_half_width,
+            large_prime_multiplier,
+            double_large_prime_bound,
             profile,
         };
         self
