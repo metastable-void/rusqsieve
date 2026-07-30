@@ -63,14 +63,18 @@ struct Context {
     /// `Q(x) = (a·x+b)² − k·n` are all built against this; because `k·n ≡ 0 (mod n)`, the
     /// congruence `x² ≡ y² (mod k·n)` still yields a factor of `n` via `gcd(x−y, n)`.
     sieve_n: Natural,
+    /// Use `(2Ax+B)²-kN = 4A·g(x)` when `kN ≡ 1 (mod 8)`.
+    /// The fixed factor four is a square and gives smaller sieve values.
+    use_q2: bool,
     base: Arc<[FactorBaseEntry]>,
+    /// Rounded binary-log score per factor-base entry.
+    score_weights: Arc<[u8]>,
     /// Lemire fast-mod constant `⌊2^64 / p⌋ + 1` per factor-base prime, precomputed once. Used to
     /// test `x mod p == root` (a ~3-instruction multiply-shift) in trial division without a
     /// hardware divide, so the whole factor base can be gated per survivor cheaply.
     pinv: Arc<[u64]>,
     /// Threshold give-back for the tiny primes the score pass skips, derived from that set.
     small_slack: usize,
-    rounded_scores: bool,
     /// `interval mod p` per factor-base prime. Sieve roots are residues of the signed polynomial
     /// coordinate `x`, while score-array positions represent `x + interval`; precomputing this
     /// fixed translation avoids two signed divisions per prime and polynomial in the sieve pass.
@@ -169,6 +173,18 @@ struct EngineScratch {
     bainv: Vec<u32>,
     /// Positions surviving the score threshold, reused across polynomials.
     candidates: Vec<u32>,
+    /// Fixed-stride scored-factor indices for each report. Flat storage avoids
+    /// one allocator object per report in the DLP path.
+    candidate_factor_counts: Vec<u8>,
+    candidate_factors: Vec<u32>,
+    /// One-bit report-position filter used by prime-major resieving. At 1 bit
+    /// per sieve byte it stays in L2; the old u32 position map was 4 MiB at
+    /// RSA-100 and incurred a cache miss on almost every root visit.
+    candidate_bits: Vec<u64>,
+    /// Reused while trial-dividing reports. Accepted relations clone their
+    /// final compact powers; rejected reports and later polynomials allocate
+    /// nothing here.
+    powers_scratch: Vec<(u32, u16)>,
 }
 
 /// Immutable portable SIQS worker context.
@@ -274,7 +290,12 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
     if let Some(large_prime_multiplier) = tuning.large_prime_multiplier {
         p.large_prime_mult = large_prime_multiplier;
     }
-    let k = knuth_schroeppel(&n);
+    let high_digit_tier = input_bits >= 289;
+    let k = if high_digit_tier {
+        knuth_schroeppel(&n)
+    } else {
+        knuth_schroeppel_legacy(&n)
+    };
     let sieve_n = n
         .checked_mul(&Natural::from_u64(k))
         .unwrap_or_else(|| n.clone());
@@ -293,12 +314,27 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
         .unwrap_or(if input_bits >= 289 { 500 } else { 100 });
     let rounded_scores = input_bits >= 289;
     let small_slack = small_slack(&base, small_skip, rounded_scores);
+    let score_weights: Arc<[u8]> = base
+        .iter()
+        .map(|entry| score_weight(entry.prime, rounded_scores))
+        .collect();
     let interval_mod_p: Arc<[u32]> = base.iter().map(|e| p.sieve_half_width % e.prime).collect();
-    let target_a = sieve_n
+    let use_q2 = high_digit_tier && sieve_n.mod_u64(8) == 1;
+    let target_source = if use_q2 {
+        sieve_n
+            .checked_mul(&Natural::from_u64(2))
+            .unwrap_or_else(|| sieve_n.clone())
+    } else {
+        sieve_n.clone()
+    };
+    let mut target_a = target_source
         .floor_sqrt()
         .div_rem_u64(p.sieve_half_width as u64)
         .unwrap()
         .0;
+    if use_q2 {
+        target_a >>= 1;
+    }
     let (a_all, a_pool, a_factor_count) = siqs::build_a_candidates(&base, &target_a);
     let (single_limit, mut double_limit) = large_prime_policy(
         p.factor_base_bound,
@@ -315,10 +351,11 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
     let context = Arc::new(Context {
         n,
         sieve_n,
+        use_q2,
         base,
+        score_weights,
         pinv,
         small_slack,
-        rounded_scores,
         interval_mod_p,
         interval: p.sieve_half_width as i32,
         target_a,
@@ -495,7 +532,7 @@ impl EngineSession {
 fn relation_target(base_len: usize, percent: Option<usize>) -> usize {
     if let Some(percent) = percent {
         // Fewer than one relation per factor-base row cannot reliably produce
-        // the dependencies SIQS needs, so reject misleading under-target tuning.
+        // dependencies after singleton filtering.
         return (base_len * percent.clamp(100, 110) / 100).max(base_len + 1);
     }
     base_len + 64
@@ -661,11 +698,26 @@ fn find_factor(
     let ctx = prepare(n.clone(), tuning)?.0;
     let target = relation_target(ctx.base.len(), ctx.relation_percent);
     if prof {
+        let (score_cutoff, score_bias, exact_scores) = siqs::choose_a(&ctx, 0)
+            .map(|(a, _)| {
+                let (bias, scan, exact) = score_plan(&ctx, &a);
+                (scan.saturating_sub(bias), bias, exact)
+            })
+            .unwrap_or((0, 0, false));
         eprintln!(
-            "PROFILE fb_build={:.3}s nfb={} interval={} target={}",
+            "PROFILE fb_build={:.3}s bits={} k={} q2={} nfb={} interval={} target_a_bits={} a_factors={} variants={} score_cutoff={} bias={} exact={} target={}",
             t_fb.elapsed().as_secs_f64(),
+            ctx.n.bit_len(),
+            ctx.sieve_n.div_rem(&ctx.n).unwrap().0.to_u64().unwrap_or(0),
+            ctx.use_q2,
             ctx.base.len(),
             ctx.interval,
+            ctx.target_a.bit_len(),
+            ctx.a_factor_count,
+            1usize << (ctx.a_factor_count - 1).min(11),
+            score_cutoff,
+            score_bias,
+            exact_scores,
             target,
         );
     }
@@ -749,6 +801,25 @@ fn find_factor(
                 if collector.columns.len() >= target {
                     break;
                 }
+            }
+            if prof && next_merge.is_multiple_of(50) {
+                eprintln!(
+                    "PROFILE checkpoint elapsed={:.3}s polys={} families={} survivors={} accepted={}/{}/{} partials={} cycles={} relations={} cpu={:.1}/{:.1}/{:.1}/{:.1}",
+                    t_sieve.elapsed().as_secs_f64(),
+                    polynomials,
+                    next_merge,
+                    total_survivors,
+                    relation_kinds[0],
+                    relation_kinds[1],
+                    relation_kinds[2],
+                    collector.forest.relations.len(),
+                    collector.cycles,
+                    collector.columns.len(),
+                    timing[0] as f64 * 1e-9,
+                    timing[1] as f64 * 1e-9,
+                    timing[2] as f64 * 1e-9,
+                    timing[3] as f64 * 1e-9,
+                );
             }
             if !progress(EngineProgress {
                 phase: EnginePhase::Sieving,
@@ -861,9 +932,8 @@ fn small_slack(base: &[FactorBaseEntry], skip: u32, rounded: bool) -> usize {
         .round() as usize
 }
 
-/// Sieve log weight of one factor-base prime: its bit length, i.e. `ceil(log2 p)`. Computed from the
-/// prime rather than read from a parallel array, so the score pass streams one fewer array over the
-/// whole factor base for every polynomial — which matters on the small-L2 targets this crate aims at.
+/// Sieve log weight of one factor-base prime, computed once while preparing
+/// the immutable context.
 #[inline(always)]
 fn score_weight(prime: u32, rounded: bool) -> u8 {
     let floor = 31 - prime.leading_zeros();
@@ -878,7 +948,11 @@ fn score_weight(prime: u32, rounded: bool) -> u8 {
 }
 
 fn score_plan(ctx: &Context, a: &Natural) -> (u8, u8, bool) {
-    let g_bits = ctx.sieve_n.bit_len().saturating_sub(a.bit_len());
+    let g_bits = ctx
+        .sieve_n
+        .bit_len()
+        .saturating_sub(a.bit_len())
+        .saturating_sub(usize::from(ctx.use_q2) * 2);
     let threshold = (g_bits as i32 - ctx.lp_bits as i32 - ctx.small_slack as i32
         + ctx.threshold_margin
         + ctx.thresh_adj)
@@ -966,20 +1040,16 @@ fn score_polynomial<const SATURATING: bool>(
     scores: &mut [u8],
     small_skip: u32,
 ) {
-    for (idx, e) in ctx.base.iter().enumerate() {
-        let p = e.prime;
+    for (idx, entry) in ctx.base.iter().enumerate() {
+        let p = entry.prime;
         if p == 2 || p < small_skip {
             continue;
         }
         let pu = p as usize;
-        let weight = score_weight(p, ctx.rounded_scores);
+        let weight = ctx.score_weights[idx];
         if root1[idx] != u32::MAX {
             let r1 = root1[idx] as usize;
             let r2 = root2[idx] as usize;
-            // Most primes in the high-digit factor bases exceed the whole
-            // sieve array and therefore hit each root at most once. Avoid
-            // entering the stride kernel (and its overflow-safe loop tests)
-            // for this dominant sparse tail.
             if pu >= scores.len() {
                 if r1 < scores.len() {
                     add_score::<SATURATING>(&mut scores[r1], weight);
@@ -991,12 +1061,15 @@ fn score_polynomial<const SATURATING: bool>(
                 sieve_root_pair::<SATURATING>(scores, r1, r2, pu, weight);
             }
         } else {
-            // p | a: the polynomial is linear (2bx + c) mod p — one root, per poly.
             let mut bp = b.mod_u64(p as u64) as u32;
             if bneg && bp != 0 {
                 bp = p - bp;
             }
-            let denom = (2 * bp as u64 % p as u64) as u32;
+            let denom = if ctx.use_q2 {
+                bp
+            } else {
+                (2 * bp as u64 % p as u64) as u32
+            };
             let Some(inv) = inv_u32(denom, p) else {
                 continue;
             };
@@ -1026,6 +1099,20 @@ fn divide_out(q: &mut Natural, p: u64) -> u16 {
         count += 1;
     }
     count
+}
+
+/// Divide by a prime already proved to hit this polynomial position.
+///
+/// The ordinary helper first computes a remainder because most calls miss.
+/// Resieving has established the first division here, so doing that remainder
+/// pass again wastes a full limb traversal for the overwhelmingly common
+/// exponent-one case.
+#[inline]
+fn divide_out_known(q: &mut Natural, p: u64) -> u16 {
+    let (quotient, remainder) = q.div_rem_u64(p).unwrap();
+    debug_assert_eq!(remainder, 0);
+    *q = quotient;
+    1 + divide_out(q, p)
 }
 
 /// Collect high-scoring positions, ascending.
@@ -1073,6 +1160,109 @@ fn collect_candidates(scores: &[u8], threshold: u8, candidates: &mut Vec<u32>) {
     }
 }
 
+/// Recover the scored factor-base hits for a batch of sieve reports.
+///
+/// Candidate-major trial division is excellent when a polynomial has one or
+/// two reports. Once the threshold is deep enough for DLP, however, repeating
+/// the full factor-base scan for every report dominates. Below the interval
+/// length we scan the smaller prefix candidate-major. Above it, every root has
+/// at most one hit, so one prime-major pass recovers all report factors.
+#[allow(clippy::too_many_arguments)]
+fn resieve_candidate_factors(
+    ctx: &Context,
+    root1: &[u32],
+    root2: &[u32],
+    scores: &[u8],
+    _threshold: u8,
+    candidates: &[u32],
+    small_end: usize,
+    counts: &mut Vec<u8>,
+    factors: &mut Vec<u32>,
+    candidate_bits: &mut Vec<u64>,
+) -> bool {
+    const FACTOR_STRIDE: usize = 48;
+    #[inline]
+    fn push_factor(
+        counts: &mut [u8],
+        factors: &mut [u32],
+        candidate_index: usize,
+        factor: u32,
+    ) -> bool {
+        let count = counts[candidate_index] as usize;
+        if count == FACTOR_STRIDE {
+            return false;
+        }
+        factors[candidate_index * FACTOR_STRIDE + count] = factor;
+        counts[candidate_index] += 1;
+        true
+    }
+    counts.clear();
+    counts.resize(candidates.len(), 0);
+    factors.resize(candidates.len() * FACTOR_STRIDE, 0);
+    let bit_words = scores.len().div_ceil(64);
+    if candidate_bits.len() < bit_words {
+        candidate_bits.resize(bit_words, 0);
+    }
+    for &position in candidates {
+        candidate_bits[position as usize >> 6] |= 1u64 << (position & 63);
+    }
+    let mut overflow = false;
+    // Candidate-major costs one fast remainder per report and prime.
+    // Prime-major costs roughly two interval/prime root visits with a direct
+    // slot lookup. Move the crossover with the actual report density.
+    let crossover_prime = ((2 * scores.len()) / candidates.len().max(1))
+        .max(ctx.small_skip as usize)
+        .min(u32::MAX as usize) as u32;
+    let sparse_start = ctx
+        .base
+        .partition_point(|entry| entry.prime < crossover_prime);
+
+    for (candidate_index, &position) in candidates.iter().enumerate() {
+        for idx in small_end..sparse_start {
+            let first = root1[idx];
+            if first == u32::MAX {
+                continue;
+            }
+            let prime = ctx.base[idx].prime;
+            let residue = fastmod(position, prime, ctx.pinv[idx]);
+            if residue == first || residue == root2[idx] {
+                overflow |= !push_factor(counts, factors, candidate_index, idx as u32);
+            }
+        }
+    }
+
+    for idx in sparse_start..ctx.base.len() {
+        let first = root1[idx];
+        if first == u32::MAX {
+            continue;
+        }
+        let prime = ctx.base[idx].prime as usize;
+        for (root_number, root) in [first, root2[idx]].into_iter().enumerate() {
+            if root_number == 1 && root == first {
+                continue;
+            }
+            let mut position = root as usize;
+            while position < scores.len() {
+                if candidate_bits[position >> 6] & (1u64 << (position & 63)) != 0 {
+                    let candidate_index = candidates
+                        .binary_search(&(position as u32))
+                        .expect("candidate bit filter must be exact");
+                    let count = counts[candidate_index] as usize;
+                    let offset = candidate_index * FACTOR_STRIDE;
+                    if count == 0 || factors[offset + count - 1] != idx as u32 {
+                        overflow |= !push_factor(counts, factors, candidate_index, idx as u32);
+                    }
+                }
+                position += prime;
+            }
+        }
+    }
+    for &position in candidates {
+        candidate_bits[position as usize >> 6] &= !(1u64 << (position & 63));
+    }
+    !overflow
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sieve_one_poly(
     ctx: &Context,
@@ -1084,6 +1274,10 @@ fn sieve_one_poly(
     root2: &[u32],
     scores: &mut Vec<u8>,
     candidates: &mut Vec<u32>,
+    candidate_factor_counts: &mut Vec<u8>,
+    candidate_factors: &mut Vec<u32>,
+    candidate_bits: &mut Vec<u64>,
+    powers_scratch: &mut Vec<(u32, u16)>,
     out: &mut Vec<Relation>,
     timing: &mut [u64; 4],
 ) -> usize {
@@ -1091,11 +1285,19 @@ fn sieve_one_poly(
     let len = (ctx.interval as usize) * 2;
     let small_skip = ctx.small_skip;
     let bb = b.checked_mul(b).unwrap();
-    let (c, csign) = if bb >= ctx.sieve_n {
-        (bb.wrapping_sub(&ctx.sieve_n).div_rem(a).unwrap().0, false)
+    let (mut c, csign) = if bb >= ctx.sieve_n {
+        let (quotient, remainder) = bb.wrapping_sub(&ctx.sieve_n).div_rem(a).unwrap();
+        debug_assert!(remainder.is_zero());
+        (quotient, false)
     } else {
-        (ctx.sieve_n.wrapping_sub(&bb).div_rem(a).unwrap().0, true)
+        let (quotient, remainder) = ctx.sieve_n.wrapping_sub(&bb).div_rem(a).unwrap();
+        debug_assert!(remainder.is_zero());
+        (quotient, true)
     };
+    if ctx.use_q2 {
+        debug_assert!(c.trailing_zeros() >= 2);
+        c >>= 2;
+    }
     let (bias, scan_threshold, exact_scores) = score_plan(ctx, a);
     // Factor-base entries with `prime < small_skip` occupy the low indices (the base is sorted
     // ascending). Those tiny primes are not sieved — gating them would waste a `fastmod` where a
@@ -1118,12 +1320,25 @@ fn sieve_one_poly(
     if candidates.is_empty() {
         return 0;
     }
+    let use_resieve = ctx.n.bit_len() >= 289
+        && candidates.len() >= 4
+        && resieve_candidate_factors(
+            ctx,
+            root1,
+            root2,
+            scores,
+            scan_threshold,
+            candidates,
+            small_end,
+            candidate_factor_counts,
+            candidate_factors,
+            candidate_bits,
+        );
     let survivors = candidates.len();
     let factor_started = ctx.profile.then(std::time::Instant::now);
 
     let two_idx = base.iter().position(|e| e.prime == 2).map(|i| i as u32);
-    let mut powers_scratch = Vec::new();
-    for &posu in candidates.iter() {
+    for (candidate_index, &posu) in candidates.iter().enumerate() {
         let pos = posu as usize;
         // The score is the sum of one log weight per sieve hit. Once the primes divided out account
         // for that whole weight, no further scored factor-base prime can divide this candidate.
@@ -1136,20 +1351,29 @@ fn sieve_one_poly(
             u16::MAX
         };
         let mut confirmed_score = 0u16;
+        let mut small_score = 0usize;
         let x = pos as i64 - ctx.interval as i64;
         let xabs = x.unsigned_abs();
         let ax = a.checked_mul(&Natural::from_u64(xabs)).unwrap();
-        // t = a·x + b, needed for the relation's square root.
-        let (t, tneg) = siqs::signed_add(&ax, x < 0, b, bneg);
-        // Value to factor: g(x) = Q(x)/a = a·x² + 2b·x + c, computed directly with
-        // signs (c_math = ∓c per csign). This avoids the wide t² squaring and the
-        // division by a — a is guaranteed to divide Q since b² ≡ n (mod a).
+        // Ordinary SIQS uses t=Ax+B. Q2 uses t=2Ax+B and
+        // t²-kN=4A·g; the fixed square factor is recorded below.
+        let tax = if ctx.use_q2 {
+            ax.wrapping_add(&ax)
+        } else {
+            ax.clone()
+        };
+        let (t, tneg) = siqs::signed_add(&tax, x < 0, b, bneg);
+        // Compute g directly with signs, avoiding the wide t² and division.
         let ax2 = ax.checked_mul(&Natural::from_u64(xabs)).unwrap();
-        let two_bx = b
-            .wrapping_add(b)
+        let bx_coefficient = if ctx.use_q2 {
+            b.clone()
+        } else {
+            b.wrapping_add(b)
+        };
+        let bx = bx_coefficient
             .checked_mul(&Natural::from_u64(xabs))
             .unwrap();
-        let (gx, gxneg) = siqs::signed_add(&ax2, false, &two_bx, bneg ^ (x < 0));
+        let (gx, gxneg) = siqs::signed_add(&ax2, false, &bx, bneg ^ (x < 0));
         let (mut q, sign) = siqs::signed_add(&gx, gxneg, &c, csign);
         if q.is_zero() {
             continue;
@@ -1166,12 +1390,18 @@ fn sieve_one_poly(
                 powers.push((i, count));
             }
         };
+        if ctx.use_q2
+            && let Some(ti) = two_idx
+        {
+            record(ti, 2, powers_scratch);
+        }
         // Prime 2 (not sieved): strip via trailing zeros.
         if let Some(ti) = two_idx {
             let c2 = q.trailing_zeros();
             if c2 != 0 {
                 q >>= c2;
-                record(ti, c2 as u16, &mut powers_scratch);
+                small_score += c2;
+                record(ti, c2 as u16, powers_scratch);
             }
         }
         // Small primes are not score-sieved, but still use the same cheap position-root gate as the
@@ -1189,44 +1419,70 @@ fn sieve_one_poly(
                     continue;
                 }
             }
-            let count = divide_out(&mut q, p);
-            record(i as u32, count, &mut powers_scratch);
+            let count = if r1 == u32::MAX {
+                divide_out(&mut q, p)
+            } else {
+                divide_out_known(&mut q, p)
+            };
+            small_score += usize::from(count) * usize::from(ctx.score_weights[i]);
+            record(i as u32, count, powers_scratch);
+        }
+        // The score threshold gives back the *average* contribution of the
+        // unsieved tiny primes. Replace that estimate with the contribution
+        // actually observed before paying for the large-factor divisions.
+        // Extra scored bits compensate a below-average tiny part.
+        let scored = usize::from(scores[pos].wrapping_sub(bias));
+        let required_scored = usize::from(scan_threshold.wrapping_sub(bias));
+        let surplus = scored.saturating_sub(required_scored);
+        if ctx.n.bit_len() >= 289 && small_score + surplus < ctx.small_slack {
+            continue;
         }
         // Primes dividing `a` (seeded at exponent 1, root1 == MAX so not gated) — divide directly.
         for &ai in aidx {
             let p = base[ai as usize].prime as u64;
             let count = divide_out(&mut q, p);
             if count != 0 && p >= small_skip as u64 {
-                confirmed_score += u16::from(score_weight(p as u32, ctx.rounded_scores));
+                confirmed_score += u16::from(ctx.score_weights[ai as usize]);
             }
-            record(ai, count, &mut powers_scratch);
+            record(ai, count, powers_scratch);
         }
-        for idx in small_end..base.len() {
-            if q.is_one() || confirmed_score >= score_target {
-                break;
+        if use_resieve {
+            const FACTOR_STRIDE: usize = 48;
+            let offset = candidate_index * FACTOR_STRIDE;
+            let count = candidate_factor_counts[candidate_index] as usize;
+            for &index in &candidate_factors[offset..offset + count] {
+                let p = base[index as usize].prime;
+                let count = divide_out_known(&mut q, p as u64);
+                record(index, count, powers_scratch);
             }
-            let r1 = root1[idx];
-            if r1 == u32::MAX {
-                continue;
+        } else {
+            for idx in small_end..base.len() {
+                if q.is_one() || confirmed_score >= score_target {
+                    break;
+                }
+                let r1 = root1[idx];
+                if r1 == u32::MAX {
+                    continue;
+                }
+                let p = base[idx].prime;
+                // For the sparse factor-base tail `p` exceeds the score-array
+                // position, so the residue is the position itself. This removes
+                // two wide multiplies from most survivor/prime gates at 90–100
+                // decimal digits.
+                let position_mod_p = if posu < p {
+                    posu
+                } else {
+                    fastmod(posu, p, ctx.pinv[idx])
+                };
+                if position_mod_p != r1 && position_mod_p != root2[idx] {
+                    continue;
+                }
+                let count = divide_out_known(&mut q, p as u64);
+                if count != 0 {
+                    confirmed_score += u16::from(ctx.score_weights[idx]);
+                }
+                record(idx as u32, count, powers_scratch);
             }
-            let p = base[idx].prime;
-            // For the sparse factor-base tail `p` exceeds the score-array
-            // position, so the residue is the position itself. This removes
-            // two wide multiplies from most survivor/prime gates at 90–100
-            // decimal digits.
-            let position_mod_p = if posu < p {
-                posu
-            } else {
-                fastmod(posu, p, ctx.pinv[idx])
-            };
-            if position_mod_p != r1 && position_mod_p != root2[idx] {
-                continue;
-            }
-            let count = divide_out(&mut q, p as u64);
-            if count != 0 {
-                confirmed_score += u16::from(score_weight(p, ctx.rounded_scores));
-            }
-            record(idx as u32, count, &mut powers_scratch);
         }
         let large = if q.is_one() {
             LargePrime::None
@@ -1245,7 +1501,7 @@ fn sieve_one_poly(
         out.push(Relation {
             root,
             sign,
-            powers: core::mem::take(&mut powers_scratch),
+            powers: powers_scratch.clone(),
             large,
         });
     }
@@ -1708,58 +1964,106 @@ fn fastmod(a: u32, p: u32, c: u64) -> u32 {
     let lowbits = c.wrapping_mul(a as u64);
     ((lowbits as u128 * p as u128) >> 64) as u32
 }
-/// Knuth-Schroeppel multiplier selection. Chooses a small `k` such that `k·n` is a quadratic
-/// residue modulo many small primes, raising the density of smooth `Q(x)` values (a standard
-/// 2–3× QS speed-up). Ported from FLINT's `qsieve_knuth_schroeppel`. Returns `k` (>= 1).
-fn knuth_schroeppel(n: &Natural) -> u64 {
+/// The established browser-tier multiplier policy, retained as a performance
+/// compatibility boundary through 288 bits.
+fn knuth_schroeppel_legacy(n: &Natural) -> u64 {
     const MULTIPLIERS: [u64; 29] = [
         1, 2, 3, 5, 6, 7, 10, 11, 13, 14, 15, 17, 19, 21, 22, 23, 26, 29, 30, 31, 33, 34, 35, 37,
         38, 41, 42, 43, 47,
     ];
-    const KS_PRIMES: usize = 500;
     let nmod8 = n.mod_u64(8);
     let mut weights = [0.0f64; MULTIPLIERS.len()];
-    for (w, &k) in weights.iter_mut().zip(&MULTIPLIERS) {
-        let mod8 = (nmod8 * k) % 8;
-        let mut v = 0.346_573_59_f64; // ln2 / 2
+    for (weight, &k) in weights.iter_mut().zip(&MULTIPLIERS) {
+        let mod8 = nmod8 * k % 8;
+        let mut value = 0.346_573_59_f64;
         if mod8 == 1 {
-            v *= 4.0;
+            value *= 4.0;
         } else if mod8 == 5 {
-            v *= 2.0;
+            value *= 2.0;
         }
-        *w = v - (k as f64).ln() / 2.0;
+        *weight = value - (k as f64).ln() / 2.0;
     }
-    // Weight each multiplier by the small primes for which `k·n` is a quadratic residue.
     let mut p = 3u64;
     let mut seen = 0usize;
-    while seen < KS_PRIMES {
+    while seen < 500 {
         if crate::u64math::is_prime(p) {
             seen += 1;
             let nmod = n.mod_u64(p);
             if nmod != 0 {
-                let logpdivp = (p as f64).ln() / p as f64;
-                let kron = jacobi_u64(nmod, p) as i32; // (n / p), handles even nmod
-                for (w, &k) in weights.iter_mut().zip(&MULTIPLIERS) {
+                let contribution = (p as f64).ln() / p as f64;
+                let symbol = jacobi_u64(nmod, p) as i32;
+                for (weight, &k) in weights.iter_mut().zip(&MULTIPLIERS) {
                     let km = k % p;
                     if km == 0 {
-                        *w += logpdivp; // p | k → k·n ≡ 0 (mod p)
-                    } else if kron * jacobi_u64(km, p) as i32 == 1 {
-                        *w += 2.0 * logpdivp; // k·n is a QR mod p
+                        *weight += contribution;
+                    } else if symbol * jacobi_u64(km, p) as i32 == 1 {
+                        *weight += 2.0 * contribution;
                     }
                 }
             }
         }
         p += 2;
     }
-    let mut best = f64::NEG_INFINITY;
-    let mut k = 1u64;
-    for (&w, &m) in weights.iter().zip(&MULTIPLIERS) {
-        if w > best {
-            best = w;
-            k = m;
-        }
+    weights
+        .iter()
+        .zip(MULTIPLIERS)
+        .max_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map_or(1, |(_, multiplier)| multiplier)
+}
+
+/// Modified Knuth-Schroeppel multiplier selection.
+///
+/// The complete odd-heavy table matters: RSA-100 selects 139, which the old
+/// abbreviated table (ending at 47) could not even consider. Scores are the
+/// expected logarithmic size left after sieving; lower is better.
+fn knuth_schroeppel(n: &Natural) -> u64 {
+    const MULTIPLIERS: [u64; 114] = [
+        1, 2, 3, 5, 7, 9, 10, 11, 13, 14, 15, 17, 19, 21, 23, 25, 29, 31, 33, 35, 37, 39, 41, 43,
+        45, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65, 67, 69, 71, 73, 75, 77, 79, 83, 85, 87, 89, 91,
+        93, 95, 97, 101, 103, 105, 107, 109, 111, 113, 115, 119, 121, 123, 127, 129, 131, 133, 137,
+        139, 141, 143, 145, 147, 149, 151, 155, 157, 159, 161, 163, 165, 167, 173, 177, 179, 181,
+        183, 185, 187, 191, 193, 195, 197, 199, 201, 203, 205, 209, 211, 213, 215, 217, 219, 223,
+        227, 229, 231, 233, 235, 237, 239, 241, 249, 251, 253, 255,
+    ];
+    const KS_PRIMES: usize = 300;
+    let nmod8 = n.mod_u64(8);
+    let mut scores = [0.0f64; MULTIPLIERS.len()];
+    for (score, &k) in scores.iter_mut().zip(&MULTIPLIERS) {
+        let mod8 = (nmod8 * k) % 8;
+        *score = (k as f64).ln() / 2.0;
+        *score -= match mod8 {
+            // kN == 1 (mod 8) permits the Q/2 polynomial.
+            1 => 2.625 * core::f64::consts::LN_2,
+            5 => core::f64::consts::LN_2,
+            3 | 7 => 0.5 * core::f64::consts::LN_2,
+            _ => 0.0,
+        };
     }
-    k
+    // Weight small primes for which kN is a quadratic residue. A regular
+    // factor-base prime has two roots; a prime dividing kN has one.
+    let mut p = 3u64;
+    let mut seen = 0usize;
+    while seen < KS_PRIMES {
+        if crate::u64math::is_prime(p) {
+            seen += 1;
+            let nmod = n.mod_u64(p);
+            let contribution = (p as f64).ln() / (p - 1) as f64;
+            for (score, &k) in scores.iter_mut().zip(&MULTIPLIERS) {
+                let knmod = nmod * (k % p) % p;
+                if knmod == 0 {
+                    *score -= contribution;
+                } else if jacobi_u64(knmod, p) == 1 {
+                    *score -= 2.0 * contribution;
+                }
+            }
+        }
+        p += 2;
+    }
+    scores
+        .iter()
+        .zip(MULTIPLIERS)
+        .min_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map_or(1, |(_, multiplier)| multiplier)
 }
 #[cfg(test)]
 mod tests {

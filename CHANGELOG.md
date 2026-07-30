@@ -14,15 +14,25 @@
   graph with unique vertices.
 - Added nearest-integer high-tier log weights and a measured 500-prime score
   skip. On the 96-thread tuning host, fixed 289- and 304-bit anchors completed
-  in 41.8 s and 103.5 s. RSA-100 completed in 622.6 s, of which 14.9 s was
-  filtering, block Lanczos, and extraction.
+  in 41.8 s and 103.5 s.
+- Extended Knuth–Schroeppel multiplier selection above 288 bits, added complete
+  Q/2 SIQS polynomials for `kN ≡ 1 (mod 8)`, and increased high-tier
+  self-initializing families to 13 A factors / 2,048 Gray-code polynomials.
+  Report resieving now uses flat fixed-stride worker scratch, an L2-sized
+  position bitset, known-factor division, and a tiny-prime prefilter; sieve
+  weights are precomputed once. A verified 96-thread RSA-100 run fell from
+  622.6 s to 424.9 s (406.7 s collection and 17.3 s filtering/Lanczos/
+  extraction). The portable YAFU reference remains substantially faster at
+  185.94 s, so no parity claim is made.
 - A matched fixed 272-bit browser run reduced LA/extraction from 5.574 s to
   1.721 s and wall time from 83.599 s to 80.072 s. The 281–288 tier removes the
   old 700k-to-500k factor-base discontinuity: on an exact 288-bit fixture,
   1.4M/262,144 plus Lanczos reduced wall time from 420.223 s to 258.512 s.
   A matched 256-bit M4RI control remained within noise. A final real-Chromium
   confirmation of the shipped artifacts completed the 256-, 272-, and 288-bit
-  fixtures in 23.702 s, 69.783 s, and 226.901 s.
+  fixtures in 23.702 s, 69.783 s, and 226.901 s. After the high-tier work,
+  repeated endpoint checks completed in 67.433 s at 272 bits and 222.006 s at
+  288 bits; multiplier/Q/2 changes are deliberately gated above 288 bits.
 
 ## 0.3.0 — 2026-07-26
 

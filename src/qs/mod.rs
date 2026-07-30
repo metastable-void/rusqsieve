@@ -329,9 +329,10 @@ pub mod parameters {
     /// Xeon 8259CL host. Splitting the 289–304 range, using 262,144-wide
     /// half-intervals, nearest-integer log weights, a 500-prime score skip, and
     /// SQUFOF for DLP cofactors reduced fixed anchors to 41.8 s at 289 bits and
-    /// 103.5 s at 304 bits. RSA-100 completed in 622.6 s; its 14.9-second
-    /// filtering/Lanczos/extraction tail confirms that relation sieving, not
-    /// sparse linear algebra, is the remaining high-end bottleneck.
+    /// 103.5 s at 304 bits. Subsequent multiplier/Q2, family, resieve, and
+    /// score-weight work reduced a verified RSA-100 run from 622.6 s to
+    /// 424.9 s (406.7 s collection, 17.3 s filtering/Lanczos/extraction).
+    /// The matched portable YAFU reference remains faster at 185.94 s.
     ///
     /// `thresh_adj` is the measured sieve-threshold offset in bits, added to
     /// `log2|g(x)| − log2(cofactor bound) − small-prime slack`. Deeper thresholds trade more

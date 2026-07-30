@@ -26,10 +26,14 @@ DLP products are capped at 12× or 16× the factor-base-bound square. The older
 vertices did not close cycles.
 
 On the 96-thread Xeon 8259CL tuning host, fixed 289- and 304-bit balanced
-semiprimes completed in 41.8 s and 103.5 s. RSA-100 completed in 622.6 s
-(606.2 s collection, 14.9 s filtering/Lanczos/extraction). This does not match
-the reported 140.0531 s YAFU run on the same host; the remaining gap is
-relation-sieve throughput, not block Lanczos.
+semiprimes completed in 41.8 s and 103.5 s. The original RSA-100 result was
+622.6 s (606.2 s collection, 14.9 s filtering/Lanczos/extraction). Complete
+multiplier selection, Q/2 polynomials, 13-factor/2,048-variant A families,
+flat report scratch, L2-sized resieve membership, and precomputed weights
+reduced the verified final-default run to 424.9 s (406.7 s collection, 17.3 s
+filtering/Lanczos/extraction). This does not match the clean portable YAFU
+reference at 185.94 s; the remaining gap is relation-sieve/resieve throughput,
+not block Lanczos.
 
 The 281–288 tier removes the old drop from a 700k prime bound at 280 bits to
 500k at 281. On an exact 288-bit balanced fixture, the old 500k/327,680 policy
@@ -40,7 +44,8 @@ multi-host optimum claim. The exact input and its two 144-bit factors are
 recorded as the 288-bit row in `tests/data/browser-balanced-corpus.txt`. A
 final real-Chromium run of the shipped SIMD artifacts took 23.702 s at 256
 bits, 69.783 s at 272 bits, and 226.901 s at 288 bits; all three results were
-factor-verified with eight Web Workers.
+factor-verified with eight Web Workers. Post-tuning checks of the same endpoint
+fixtures took 67.433 s at 272 bits and 222.006 s at 288 bits.
 
 ## Reproducible rusqsieve harness
 

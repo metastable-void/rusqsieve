@@ -19,7 +19,12 @@ pub(super) fn sieve_family(
     let base = &ctx.base;
     let nfb = base.len();
     let s = aidx.len();
-    let nvar = (s - 1).min(9); // number of sign bits varied per family
+    // A 13-prime coefficient has 4,096 sign patterns up to global negation,
+    // but 2,048-polynomial jobs give substantially better 96-way load
+    // balance in the report-heavy DLP tiers and match production SIQS family
+    // sizing. Root setup is still amortized four times better than the old
+    // 512-polynomial cap.
+    let nvar = (s - 1).min(11);
     let variants = 1u64 << nvar;
 
     // SIQS B-values: b = Σ ±Bⱼ, with Bⱼ ≡ ±sqrt(n) (mod qⱼ), 0 (mod other q).
@@ -42,6 +47,11 @@ pub(super) fn sieve_family(
     let mut b = Natural::ZERO;
     for bj in &bvals {
         b = b.checked_add(bj).unwrap();
+    }
+    // Q2 requires odd B. Adding odd A preserves B (mod A), hence all CRT
+    // square-root congruences, while fixing parity for the whole Gray family.
+    if ctx.use_q2 && b.trailing_zeros() != 0 {
+        b = b.checked_add(&a).unwrap();
     }
     let mut bneg = false;
     let two_full: Vec<Natural> = bvals[..nvar].iter().map(|bj| bj.wrapping_add(bj)).collect();
@@ -70,16 +80,25 @@ pub(super) fn sieve_family(
         if bneg && bp != 0 {
             bp = p - bp;
         }
-        let xroot1 = mulmod_u32((e.sqrt_n + p - bp) % p, ainvp, p);
-        let xroot2 = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, ainvp, p);
+        let root_inverse = if ctx.use_q2 {
+            mulmod_u32(ainvp, p.div_ceil(2), p)
+        } else {
+            ainvp
+        };
+        let xroot1 = mulmod_u32((e.sqrt_n + p - bp) % p, root_inverse, p);
+        let xroot2 = mulmod_u32(((p - e.sqrt_n) % p + p - bp) % p, root_inverse, p);
         let r1 = add_mod_u32(xroot1, ctx.interval_mod_p[idx], p);
         let r2 = add_mod_u32(xroot2, ctx.interval_mod_p[idx], p);
         scratch.root1[idx] = r1.min(r2);
         scratch.root2[idx] = r1.max(r2);
         for (j, bj) in bvals.iter().take(nvar).enumerate() {
             let bjp = bj.mod_u64(p as u64) as u32;
-            let two_bjp = (2 * bjp as u64 % p as u64) as u32;
-            scratch.bainv[j * nfb + idx] = mulmod_u32(two_bjp, ainvp, p);
+            let delta = if ctx.use_q2 {
+                bjp
+            } else {
+                (2 * bjp as u64 % p as u64) as u32
+            };
+            scratch.bainv[j * nfb + idx] = mulmod_u32(delta, ainvp, p);
         }
     }
 
@@ -102,6 +121,10 @@ pub(super) fn sieve_family(
             &scratch.root2,
             &mut scratch.scores,
             &mut scratch.candidates,
+            &mut scratch.candidate_factor_counts,
+            &mut scratch.candidate_factors,
+            &mut scratch.candidate_bits,
+            &mut scratch.powers_scratch,
             &mut relations,
             &mut timing,
         ) as u64;
@@ -186,7 +209,16 @@ pub(super) fn build_a_candidates(
     target_a: &Natural,
 ) -> (Arc<[usize]>, Arc<[usize]>, usize) {
     let target_bits = target_a.bit_len();
-    let factor_count = target_bits.div_ceil(14).clamp(3, 10);
+    // Keep each A prime close to the 12-bit range at the high tiers. Besides
+    // producing conventional SIQS A values, this amortizes the O(factor-base)
+    // root and Bainv setup over up to 2,048 Gray-code polynomials. The former
+    // 14-bit / ten-factor cap stopped at 512 polynomials and repeated that
+    // setup four times as often on RSA-100.
+    let factor_count = if target_bits >= 140 {
+        target_bits.div_ceil(12).clamp(3, 13)
+    } else {
+        target_bits.div_ceil(14).clamp(3, 10)
+    };
     let ideal_bits = target_bits.div_ceil(factor_count);
     let minimum_bits = ideal_bits.saturating_sub(1).max(2);
     let all: Vec<usize> = base
