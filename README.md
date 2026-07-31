@@ -260,8 +260,9 @@ which stays on M4RI, was unchanged within noise (27.146 s versus 26.986 s).
 The final shipped-artifact confirmation in real Chromium completed the
 256-/272-/288-bit fixtures in 23.702/69.783/226.901 s. Post-tuning endpoint
 checks completed the 272-/288-bit fixtures in 67.433/222.006 s. Wasm SIMD root
-advancement subsequently reduced the verified 272-bit endpoint to 65.829 s;
-the multiplier and Q/2 policy remains gated above 288 bits.
+advancement and the portable score-stream changes subsequently reduced the
+verified endpoints to 62.237/185.830 s; the multiplier and Q/2 policy remains
+gated above 288 bits.
 
 On the 96-thread native tuning host, final-default fixed anchors completed in
 41.8 s at 289 bits and 103.5 s at 304 bits. Full multiplier selection, Q/2

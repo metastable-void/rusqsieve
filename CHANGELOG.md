@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 — Unreleased
+
+- Bumped the crate patch version after the 0.4.0 release.
+- Recorded fresh real-Chromium checks of the shipped SIMD artifacts: verified
+  factors returned in 62.237 s at 272 bits and 185.830 s at 288 bits,
+  improving the previous 67.433/222.006 s controls.
+
 ## 0.4.0 — 2026-07-31
 
 - Added a true portable 64-way Montgomery block-Lanczos recurrence over `GF(2)`

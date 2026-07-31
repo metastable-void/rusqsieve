@@ -54,7 +54,9 @@ recorded as the 288-bit row in `tests/data/browser-balanced-corpus.txt`. A
 final real-Chromium run of the shipped SIMD artifacts took 23.702 s at 256
 bits, 69.783 s at 272 bits, and 226.901 s at 288 bits; all three results were
 factor-verified with eight Web Workers. Post-tuning checks of the same endpoint
-fixtures took 67.433 s at 272 bits and 222.006 s at 288 bits.
+fixtures took 67.433 s at 272 bits and 222.006 s at 288 bits. Wasm SIMD root
+advancement plus the portable scorer subsequently reduced those verified
+endpoints to 62.237 s and 185.830 s.
 
 ## 0.4 release-gate measurements
 
