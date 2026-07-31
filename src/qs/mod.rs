@@ -330,8 +330,11 @@ pub mod parameters {
     /// half-intervals, nearest-integer log weights, a 500-prime score skip, and
     /// SQUFOF for DLP cofactors reduced fixed anchors to 41.8 s at 289 bits and
     /// 103.5 s at 304 bits. Subsequent multiplier/Q2, family, resieve, and
-    /// score-weight work reduced a verified RSA-100 run from 622.6 s to
-    /// 424.9 s (406.7 s collection, 17.3 s filtering/Lanczos/extraction).
+    /// score-weight work first reduced a verified RSA-100 run from 622.6 s to
+    /// 424.9 s. Portable dense-prefix blocking, a 102-bit DLP collection
+    /// policy, allocation-free graph updates, and optional SSE2 root
+    /// advancement reduced it again to 355.4 s (317.2 s collection, 36.9 s
+    /// filtering/Lanczos/extraction).
     /// The matched portable YAFU reference remains faster at 185.94 s.
     ///
     /// `thresh_adj` is the measured sieve-threshold offset in bits, added to
@@ -381,7 +384,12 @@ pub mod parameters {
             297..=304 => (1_500_000, 262_144, -3, 120, true, 16),
             305..=312 => (1_800_000, 262_144, -3, 150, true, 16),
             313..=320 => (2_250_000, 262_144, -3, 150, true, 16),
-            _ => (3_000_000, 262_144, -3, 150, true, 16),
+            // RSA-100: a 102-bit report cutoff and YAFU-scale DLP window
+            // reduce the verified collection from 9.31M to 4.71M
+            // polynomials.  `1214 * B²` is 1.0926e16 at the 3M bound,
+            // matching the useful two-large-prime product range while the
+            // per-prime cap remains 145B.
+            _ => (3_000_000, 262_144, -23, 145, true, 1_214),
         };
         EngineParams {
             factor_base_bound,
@@ -440,8 +448,8 @@ mod tests {
             (312, 1_800_000, 262_144, -3, 150, 16),
             (313, 2_250_000, 262_144, -3, 150, 16),
             (320, 2_250_000, 262_144, -3, 150, 16),
-            (321, 3_000_000, 262_144, -3, 150, 16),
-            (333, 3_000_000, 262_144, -3, 150, 16),
+            (321, 3_000_000, 262_144, -23, 145, 1_214),
+            (333, 3_000_000, 262_144, -23, 145, 1_214),
         ];
         for (bits, bound, half_width, threshold, large_prime_mult, double_mult) in expected {
             let params = engine_params(bits);

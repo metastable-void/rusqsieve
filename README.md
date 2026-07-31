@@ -256,10 +256,13 @@ native multiplier and Q/2 policy is gated above 288 bits.
 On the 96-thread native tuning host, final-default fixed anchors completed in
 41.8 s at 289 bits and 103.5 s at 304 bits. Full multiplier selection, Q/2
 polynomials, larger self-initializing families, allocation-free report
-resieving, and precomputed score weights reduced a verified RSA-100 run from
-622.6 s to 424.9 s. This remains behind the matched portable YAFU run at
-185.94 s; relation scoring/resieving, not block Lanczos, is still the limiting
-gap.
+resieving, precomputed score weights, portable dense-prefix blocking, a
+102-bit/DLP collection policy, and allocation-free partial-graph updates
+reduced a verified RSA-100 run from 622.6 s to 355.4 s. x86-64 builds also
+dispatch root advancement through an SSE2 baseline kernel; all scoring and
+non-x86 builds retain the portable Rust path. This remains behind the matched
+portable YAFU run at 185.94 s; relation scoring, not block Lanczos, is still
+the limiting gap.
 
 ## Release builds
 

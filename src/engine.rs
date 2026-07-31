@@ -1,5 +1,11 @@
 //! Portable SIQS engine and scheduler-facing work kernels.
 mod extract;
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod root_simd;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-simd128"))]
+#[allow(unsafe_code)]
+mod root_wasm;
 mod siqs;
 mod wire;
 
@@ -13,6 +19,7 @@ use crate::{Natural, PARTS, jacobi_u64};
 use crate::{PrimalityConfig, WitnessPolicy, is_probable_prime};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -67,6 +74,10 @@ struct Context {
     /// The fixed factor four is a square and gives smaller sieve values.
     use_q2: bool,
     base: Arc<[FactorBaseEntry]>,
+    /// Contiguous factor-base primes. Keeping this separate from the 12-byte
+    /// setup records removes eight unused bytes from the dominant portable
+    /// score stream and also permits four logical lanes per SIMD root load.
+    primes: Arc<[u32]>,
     /// Rounded binary-log score per factor-base entry.
     score_weights: Arc<[u8]>,
     /// Lemire fast-mod constant `⌊2^64 / p⌋ + 1` per factor-base prime, precomputed once. Used to
@@ -115,6 +126,35 @@ enum LargePrime {
     One(u64),
     Two(u64, u64),
 }
+
+/// Fast deterministic hashing for the large-prime graph's machine-word keys.
+///
+/// `HashMap`'s default SipHash is appropriate for attacker-controlled strings,
+/// but relation cofactors are already validated integers and millions of
+/// graph insertions make its rounds coordinator-visible. SplitMix64 retains
+/// good bucket dispersion without process-random state.
+#[derive(Default)]
+struct PrimeHasher(u64);
+impl Hasher for PrimeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut value = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in bytes {
+            value ^= u64::from(byte);
+            value = value.wrapping_mul(0x1000_0000_01b3);
+        }
+        self.0 = value;
+    }
+    fn write_u64(&mut self, value: u64) {
+        let mut mixed = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.0 = mixed ^ (mixed >> 31);
+    }
+}
+type PrimeMap = HashMap<u64, u32, BuildHasherDefault<PrimeHasher>>;
 impl LargePrime {
     #[inline]
     fn primes(self) -> ([u64; 2], usize) {
@@ -167,6 +207,9 @@ struct EngineScratch {
     /// prime dividing `a`, handled by the per-polynomial linear fallback).
     root1: Vec<u32>,
     root2: Vec<u32>,
+    /// Carried roots for the portable cache-blocked dense score prefix.
+    dense_root1: Vec<u32>,
+    dense_root2: Vec<u32>,
     /// `2·Bⱼ·a⁻¹ mod p` for each varying B-value `j` and factor-base prime `p`
     /// (row-major `[j*nfb + i]`). Adding/subtracting this advances the roots to
     /// the next self-initializing polynomial in O(1) per prime (SPEC §7.3).
@@ -305,6 +348,7 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
     };
     let prepared = prepare_factor_base(&n, &qcfg).map_err(|e| EngineError::Setup(e.to_string()))?;
     let base: Arc<[FactorBaseEntry]> = prepared.factor_base().entries().to_vec().into();
+    let primes: Arc<[u32]> = base.iter().map(|entry| entry.prime).collect();
     let pinv: Arc<[u64]> = base.iter().map(|e| lemire_c(e.prime)).collect();
     // Expected log weight of the tiny primes that are skipped by the score pass: `Σ log(p)/(p−1)`
     // over the skipped set, which is what the threshold must give back. Derived once here rather
@@ -353,6 +397,7 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
         sieve_n,
         use_q2,
         base,
+        primes,
         score_weights,
         pinv,
         small_slack,
@@ -743,7 +788,15 @@ fn find_factor(
                         if cancellation.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        if tx.send(siqs::sieve_family(&c, f, &mut scratch)).is_err() {
+                        if tx
+                            .send(siqs::sieve_family_cancellable(
+                                &c,
+                                f,
+                                &mut scratch,
+                                &cancellation,
+                            ))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -754,7 +807,7 @@ fn find_factor(
     }
     drop(res_tx);
     let mut next_send = 0u64;
-    let mut next_merge = 0u64;
+    let mut completed = 0u64;
     let mut outstanding = 0usize;
     for _ in 0..threads * 2 {
         job_tx
@@ -764,7 +817,6 @@ fn find_factor(
         outstanding += 1
     }
     let t_sieve = std::time::Instant::now();
-    let mut buffered = BTreeMap::new();
     let mut collector = RelationCollector::new();
     let mut polynomials = 0u64;
     let mut total_survivors = 0u64;
@@ -772,20 +824,20 @@ fn find_factor(
     let mut timing = [0u64; 4];
     let mut seen_a = HashSet::new();
     let mut cancelled = false;
-    while collector.columns.len() < target && next_merge < MAX_FAMILIES && !cancelled {
-        let result = res_rx
+    while collector.columns.len() < target && completed < MAX_FAMILIES && !cancelled {
+        let r = res_rx
             .recv()
             .map_err(|_| EngineError::Worker("worker result channel disconnected".into()))?;
         outstanding -= 1;
-        buffered.insert(result.family, result);
-        while let Some(r) = buffered.remove(&next_merge) {
-            next_merge += 1;
-            let unique_a = siqs::choose_a(&ctx, r.family)
-                .map(|(a, _)| seen_a.insert(a))
-                .unwrap_or(false);
-            if !unique_a {
-                continue;
-            }
+        completed += 1;
+        // The native scheduler consumes completed families immediately.  The
+        // portable EngineSession keeps deterministic family-order merging for
+        // browser/distributed callers, but imposing that order here creates a
+        // many-second head-of-line stall behind one slow 2,048-polynomial job.
+        let unique_a = siqs::choose_a(&ctx, r.family)
+            .map(|(a, _)| seen_a.insert(a))
+            .unwrap_or(false);
+        if unique_a {
             polynomials += r.polynomials;
             total_survivors += r.survivors;
             for (total, value) in timing.iter_mut().zip(r.timing) {
@@ -802,36 +854,41 @@ fn find_factor(
                     break;
                 }
             }
-            if prof && next_merge.is_multiple_of(50) {
-                eprintln!(
-                    "PROFILE checkpoint elapsed={:.3}s polys={} families={} survivors={} accepted={}/{}/{} partials={} cycles={} relations={} cpu={:.1}/{:.1}/{:.1}/{:.1}",
-                    t_sieve.elapsed().as_secs_f64(),
-                    polynomials,
-                    next_merge,
-                    total_survivors,
-                    relation_kinds[0],
-                    relation_kinds[1],
-                    relation_kinds[2],
-                    collector.forest.relations.len(),
-                    collector.cycles,
-                    collector.columns.len(),
-                    timing[0] as f64 * 1e-9,
-                    timing[1] as f64 * 1e-9,
-                    timing[2] as f64 * 1e-9,
-                    timing[3] as f64 * 1e-9,
-                );
-            }
-            if !progress(EngineProgress {
-                phase: EnginePhase::Sieving,
+        }
+        if prof && completed.is_multiple_of(50) {
+            eprintln!(
+                "PROFILE checkpoint elapsed={:.3}s polys={} families={} survivors={} accepted={}/{}/{} partials={} cycles={} relations={} cpu={:.1}/{:.1}/{:.1}/{:.1}",
+                t_sieve.elapsed().as_secs_f64(),
                 polynomials,
-                relations: collector.columns.len(),
-                target,
-                workers: threads,
-            }) {
-                cancelled = true;
-                cancellation.store(true, AtomicOrdering::Relaxed);
-                break;
-            }
+                completed,
+                total_survivors,
+                relation_kinds[0],
+                relation_kinds[1],
+                relation_kinds[2],
+                collector.forest.relations.len(),
+                collector.cycles,
+                collector.columns.len(),
+                timing[0] as f64 * 1e-9,
+                timing[1] as f64 * 1e-9,
+                timing[2] as f64 * 1e-9,
+                timing[3] as f64 * 1e-9,
+            );
+        }
+        if !progress(EngineProgress {
+            phase: EnginePhase::Sieving,
+            polynomials,
+            relations: collector.columns.len(),
+            target,
+            workers: threads,
+        }) {
+            cancelled = true;
+            cancellation.store(true, AtomicOrdering::Relaxed);
+        }
+        if collector.columns.len() >= target {
+            // Other workers may be partway through a 2,048-polynomial family.
+            // Stop them between polynomials instead of paying an otherwise
+            // useless full-family tail before linear algebra can start.
+            cancellation.store(true, AtomicOrdering::Relaxed);
         }
         while outstanding < threads * 2
             && next_send < MAX_FAMILIES
@@ -873,7 +930,7 @@ fn find_factor(
             "PROFILE sieve+collect={:.3}s polys={} families={} survivors={} accepted={}/{}/{} partials={} cycles={} relations={}",
             t_sieve.elapsed().as_secs_f64(),
             polynomials,
-            next_merge,
+            completed,
             total_survivors,
             relation_kinds[0],
             relation_kinds[1],
@@ -1029,6 +1086,42 @@ fn add_score<const SATURATING: bool>(slot: &mut u8, weight: u8) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn sieve_linear_root<const SATURATING: bool>(
+    ctx: &Context,
+    b: &Natural,
+    bneg: bool,
+    c: &Natural,
+    csign: bool,
+    idx: usize,
+    scores: &mut [u8],
+) {
+    let p = ctx.primes[idx];
+    let mut bp = b.mod_u64(p as u64) as u32;
+    if bneg && bp != 0 {
+        bp = p - bp;
+    }
+    let denom = if ctx.use_q2 {
+        bp
+    } else {
+        (2 * bp as u64 % p as u64) as u32
+    };
+    let Some(inv) = inv_u32(denom, p) else {
+        return;
+    };
+    let cm = c.mod_u64(p as u64) as u32;
+    let signed_c = if csign && cm != 0 { p - cm } else { cm };
+    let xroot = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
+    let mut pos = add_mod_u32(xroot, ctx.interval_mod_p[idx], p) as usize;
+    while pos < scores.len() {
+        add_score::<SATURATING>(&mut scores[pos], ctx.score_weights[idx]);
+        pos += p as usize;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)]
+#[allow(unsafe_code)]
 fn score_polynomial<const SATURATING: bool>(
     ctx: &Context,
     b: &Natural,
@@ -1039,47 +1132,142 @@ fn score_polynomial<const SATURATING: bool>(
     root2: &[u32],
     scores: &mut [u8],
     small_skip: u32,
+    score_start: usize,
 ) {
-    for (idx, entry) in ctx.base.iter().enumerate() {
-        let p = entry.prime;
-        if p == 2 || p < small_skip {
+    let score_len = (ctx.interval as usize) * 2;
+    debug_assert!(scores.len() >= score_len + SCORE_SENTINELS);
+    let score_begin = ctx.primes.partition_point(|&prime| prime < small_skip);
+    let repeated_end = ctx
+        .primes
+        .partition_point(|&prime| (prime as usize) < score_len);
+
+    {
+        let active_scores = &mut scores[..score_len];
+        // Dense blocking handled the ordinary roots in this prefix. The
+        // handful of primes dividing A still have a polynomial-dependent
+        // linear root.
+        for idx in score_begin..score_start {
+            if root1[idx] == u32::MAX {
+                sieve_linear_root::<SATURATING>(ctx, b, bneg, c, csign, idx, active_scores);
+            }
+        }
+
+        // Score the primes that hit repeatedly without a per-prime interval
+        // size branch.
+        let ordinary_start = score_start.max(score_begin);
+        for idx in ordinary_start..repeated_end {
+            let p = ctx.primes[idx];
+            let weight = ctx.score_weights[idx];
+            if root1[idx] != u32::MAX {
+                sieve_root_pair::<SATURATING>(
+                    active_scores,
+                    root1[idx] as usize,
+                    root2[idx] as usize,
+                    p as usize,
+                    weight,
+                );
+            } else {
+                sieve_linear_root::<SATURATING>(ctx, b, bneg, c, csign, idx, active_scores);
+            }
+        }
+    }
+
+    // Sparse roots hit unpredictably. Redirect misses to a striped sentinel
+    // tail with arithmetic masks, avoiding two data-dependent bounds branches
+    // per prime. The reusable tail is never scanned for reports.
+    let sparse_start = repeated_end.max(score_start).max(score_begin);
+    let pointer = scores.as_mut_ptr();
+    for idx in sparse_start..ctx.primes.len() {
+        if root1[idx] == u32::MAX {
+            sieve_linear_root::<SATURATING>(ctx, b, bneg, c, csign, idx, &mut scores[..score_len]);
             continue;
         }
-        let pu = p as usize;
+        let r1 = root1[idx] as usize;
+        let r2 = root2[idx] as usize;
         let weight = ctx.score_weights[idx];
-        if root1[idx] != u32::MAX {
-            let r1 = root1[idx] as usize;
-            let r2 = root2[idx] as usize;
-            if pu >= scores.len() {
-                if r1 < scores.len() {
-                    add_score::<SATURATING>(&mut scores[r1], weight);
-                }
-                if r2 != r1 && r2 < scores.len() {
-                    add_score::<SATURATING>(&mut scores[r2], weight);
-                }
-            } else {
-                sieve_root_pair::<SATURATING>(scores, r1, r2, pu, weight);
+        let sentinel = score_len + (idx & (SCORE_SENTINELS - 1));
+        let mask1 = 0usize.wrapping_sub(usize::from(r1 < score_len));
+        let target1 = (r1 & mask1) | (sentinel & !mask1);
+        let mask2 = 0usize.wrapping_sub(usize::from(r2 < score_len));
+        let target2 = (r2 & mask2) | (sentinel & !mask2);
+        // SAFETY: an in-range root is below score_len; every redirected root
+        // is within the SCORE_SENTINELS-element tail.
+        unsafe {
+            add_score::<SATURATING>(&mut *pointer.add(target1), weight);
+        }
+        if r2 != r1 {
+            unsafe {
+                add_score::<SATURATING>(&mut *pointer.add(target2), weight);
             }
-        } else {
-            let mut bp = b.mod_u64(p as u64) as u32;
-            if bneg && bp != 0 {
-                bp = p - bp;
-            }
-            let denom = if ctx.use_q2 {
-                bp
-            } else {
-                (2 * bp as u64 % p as u64) as u32
-            };
-            let Some(inv) = inv_u32(denom, p) else {
+        }
+    }
+}
+
+const DENSE_BLOCK_LEN: usize = 32 * 1024;
+const DENSE_PRIME_CUTOFF: u32 = 8 * 1024;
+const SCORE_SENTINELS: usize = 1024;
+
+#[inline(always)]
+#[allow(unsafe_code)]
+fn sieve_dense_root<const SATURATING: bool>(
+    scores: &mut [u8],
+    mut position: usize,
+    step: usize,
+    weight: u8,
+) -> u32 {
+    let pointer = scores.as_mut_ptr();
+    while position + step < scores.len() {
+        // SAFETY: the loop condition proves both positions are in the slice.
+        unsafe {
+            add_score::<SATURATING>(&mut *pointer.add(position), weight);
+        }
+        position += step;
+        unsafe {
+            add_score::<SATURATING>(&mut *pointer.add(position), weight);
+        }
+        position += step;
+    }
+    while position < scores.len() {
+        unsafe {
+            add_score::<SATURATING>(&mut *pointer.add(position), weight);
+        }
+        position += step;
+    }
+    (position - scores.len()) as u32
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+fn score_dense_prefix<const SATURATING: bool>(
+    ctx: &Context,
+    root1: &[u32],
+    root2: &[u32],
+    scores: &mut [u8],
+    small_skip: u32,
+    dense_end: usize,
+    dense_root1: &mut Vec<u32>,
+    dense_root2: &mut Vec<u32>,
+) {
+    dense_root1.clear();
+    dense_root1.extend_from_slice(&root1[..dense_end]);
+    dense_root2.clear();
+    dense_root2.extend_from_slice(&root2[..dense_end]);
+    let dense_start = ctx.base.partition_point(|entry| entry.prime < small_skip);
+    for block in scores.chunks_mut(DENSE_BLOCK_LEN) {
+        for idx in dense_start..dense_end {
+            // SAFETY: all slices cover the shared factor-base prefix.
+            let first = unsafe { *dense_root1.get_unchecked(idx) };
+            if first == u32::MAX {
                 continue;
-            };
-            let cm = c.mod_u64(p as u64) as u32;
-            let signed_c = if csign && cm != 0 { p - cm } else { cm };
-            let xroot = mulmod_u32(if signed_c == 0 { 0 } else { p - signed_c }, inv, p);
-            let mut pos = add_mod_u32(xroot, ctx.interval_mod_p[idx], p) as usize;
-            while pos < scores.len() {
-                add_score::<SATURATING>(&mut scores[pos], weight);
-                pos += pu;
+            }
+            let prime = unsafe { ctx.base.get_unchecked(idx).prime as usize };
+            let weight = unsafe { *ctx.score_weights.get_unchecked(idx) };
+            let second = unsafe { *dense_root2.get_unchecked(idx) };
+            let next1 = sieve_dense_root::<SATURATING>(block, first as usize, prime, weight);
+            let next2 = sieve_dense_root::<SATURATING>(block, second as usize, prime, weight);
+            unsafe {
+                *dense_root1.get_unchecked_mut(idx) = next1;
+                *dense_root2.get_unchecked_mut(idx) = next2;
             }
         }
     }
@@ -1277,6 +1465,8 @@ fn sieve_one_poly(
     candidate_factor_counts: &mut Vec<u8>,
     candidate_factors: &mut Vec<u32>,
     candidate_bits: &mut Vec<u64>,
+    dense_root1: &mut Vec<u32>,
+    dense_root2: &mut Vec<u32>,
     powers_scratch: &mut Vec<(u32, u16)>,
     out: &mut Vec<Relation>,
     timing: &mut [u64; 4],
@@ -1304,16 +1494,47 @@ fn sieve_one_poly(
     // direct divide is cheaper (they divide most survivors) — so they are divided out directly.
     let small_end = base.partition_point(|e| e.prime < small_skip);
     scores.clear();
-    scores.resize(len, bias);
-    // Flat logarithmic sieve. The formerly gated cache-blocked kernel was
-    // unreachable for every shipped interval and was slower when forced on.
+    scores.resize(len + SCORE_SENTINELS, bias);
     let score_started = ctx.profile.then(std::time::Instant::now);
-    if exact_scores {
-        score_polynomial::<false>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
+    let dense_end = if ctx.n.bit_len() >= 289 {
+        base.partition_point(|entry| entry.prime < DENSE_PRIME_CUTOFF)
     } else {
-        score_polynomial::<true>(ctx, b, bneg, &c, csign, root1, root2, scores, small_skip);
+        0
+    };
+    if exact_scores {
+        if dense_end != 0 {
+            score_dense_prefix::<false>(
+                ctx,
+                root1,
+                root2,
+                &mut scores[..len],
+                small_skip,
+                dense_end,
+                dense_root1,
+                dense_root2,
+            );
+        }
+        score_polynomial::<false>(
+            ctx, b, bneg, &c, csign, root1, root2, scores, small_skip, dense_end,
+        );
+    } else {
+        if dense_end != 0 {
+            score_dense_prefix::<true>(
+                ctx,
+                root1,
+                root2,
+                &mut scores[..len],
+                small_skip,
+                dense_end,
+                dense_root1,
+                dense_root2,
+            );
+        }
+        score_polynomial::<true>(
+            ctx, b, bneg, &c, csign, root1, root2, scores, small_skip, dense_end,
+        );
     }
-    collect_candidates(scores, scan_threshold, candidates);
+    collect_candidates(&scores[..len], scan_threshold, candidates);
     if let Some(started) = score_started {
         timing[1] += started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     }
@@ -1795,10 +2016,13 @@ fn pollard_u64(n: u64) -> Option<u64> {
 /// a full-relation column, since all large primes on a cycle cancel.
 #[derive(Default)]
 struct Forest {
-    id_of: HashMap<u64, u32>,
+    id_of: PrimeMap,
     parent: Vec<u32>,
     edge: Vec<Option<u32>>,
+    size: Vec<u32>,
     relations: Vec<Relation>,
+    reroot_vertices: Vec<u32>,
+    reroot_edges: Vec<u32>,
 }
 impl Forest {
     fn vertex(&mut self, prime: u64) -> u32 {
@@ -1809,6 +2033,7 @@ impl Forest {
         self.id_of.insert(prime, id);
         self.parent.push(id);
         self.edge.push(None);
+        self.size.push(1);
         id
     }
     fn root(&self, mut v: u32) -> u32 {
@@ -1825,27 +2050,42 @@ impl Forest {
     }
     /// Re-root the tree containing `v` so that `v` becomes its root.
     fn reroot(&mut self, v: u32) {
-        let mut chain = vec![v];
-        let mut edges: Vec<u32> = Vec::new();
+        self.reroot_vertices.clear();
+        self.reroot_edges.clear();
+        self.reroot_vertices.push(v);
         let mut c = v;
         while self.parent[c as usize] != c {
-            edges.push(self.edge[c as usize].unwrap());
+            self.reroot_edges.push(self.edge[c as usize].unwrap());
             c = self.parent[c as usize];
-            chain.push(c);
+            self.reroot_vertices.push(c);
         }
         self.parent[v as usize] = v;
         self.edge[v as usize] = None;
-        for (i, e) in edges.into_iter().enumerate() {
-            self.parent[chain[i + 1] as usize] = chain[i];
-            self.edge[chain[i + 1] as usize] = Some(e);
+        for i in 0..self.reroot_edges.len() {
+            self.parent[self.reroot_vertices[i + 1] as usize] = self.reroot_vertices[i];
+            self.edge[self.reroot_vertices[i + 1] as usize] = Some(self.reroot_edges[i]);
         }
     }
     fn link(&mut self, a: u32, b: u32, rel: Relation) {
-        self.reroot(b);
         let relation_index = self.relations.len() as u32;
         self.relations.push(rel);
-        self.parent[b as usize] = a;
-        self.edge[b as usize] = Some(relation_index);
+        let root_a = self.root(a);
+        let root_b = self.root(b);
+        let size_a = self.size[root_a as usize];
+        let size_b = self.size[root_b as usize];
+        if size_a >= size_b {
+            self.reroot(b);
+            self.parent[b as usize] = a;
+            self.edge[b as usize] = Some(relation_index);
+            self.size[root_a as usize] = size_a.saturating_add(size_b);
+            self.size[b as usize] = 0;
+        } else {
+            self.reroot(a);
+            self.parent[a as usize] = b;
+            self.edge[a as usize] = Some(relation_index);
+            self.size[root_b as usize] = size_a.saturating_add(size_b);
+            self.size[a as usize] = 0;
+        }
     }
 }
 
@@ -1857,6 +2097,7 @@ struct RelationCollector {
     /// Partials combined into full relations by closing a large-prime cycle. Reported by the
     /// profiling path so the retained-partial count and the cycle yield can be compared directly.
     cycles: usize,
+    cycle_path: Vec<u32>,
 }
 impl RelationCollector {
     fn new() -> Self {
@@ -1864,6 +2105,7 @@ impl RelationCollector {
             forest: Forest::default(),
             columns: Vec::new(),
             cycles: 0,
+            cycle_path: Vec::new(),
         }
     }
     fn ingest(&mut self, rel: Relation, n: &Natural) {
@@ -1881,13 +2123,14 @@ impl RelationCollector {
         let va = self.forest.vertex(pa);
         let vb = self.forest.vertex(pb);
         if self.forest.root(va) == self.forest.root(vb) {
-            let mut path = Vec::new();
-            self.forest.path(va, &mut path);
-            self.forest.path(vb, &mut path);
+            self.cycle_path.clear();
+            self.forest.path(va, &mut self.cycle_path);
+            self.forest.path(vb, &mut self.cycle_path);
             self.cycles += 1;
             self.columns.push(combine_cycle(
                 core::iter::once(&rel).chain(
-                    path.iter()
+                    self.cycle_path
+                        .iter()
                         .map(|&index| &self.forest.relations[index as usize]),
                 ),
                 n,
@@ -1939,12 +2182,9 @@ fn mulmod_u32(a: u32, b: u32, p: u32) -> u32 {
 }
 #[inline]
 fn add_mod_u32(a: u32, b: u32, p: u32) -> u32 {
-    let sum = a as u64 + b as u64;
-    if sum >= p as u64 {
-        (sum - p as u64) as u32
-    } else {
-        sum as u32
-    }
+    debug_assert!(a < p && b < p && p <= u32::MAX / 2);
+    let sum = a + b;
+    if sum >= p { sum - p } else { sum }
 }
 #[inline]
 fn sub_mod_u32(a: u32, b: u32, p: u32) -> u32 {

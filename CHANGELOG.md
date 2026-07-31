@@ -20,10 +20,13 @@
   self-initializing families to 13 A factors / 2,048 Gray-code polynomials.
   Report resieving now uses flat fixed-stride worker scratch, an L2-sized
   position bitset, known-factor division, and a tiny-prime prefilter; sieve
-  weights are precomputed once. A verified 96-thread RSA-100 run fell from
-  622.6 s to 424.9 s (406.7 s collection and 17.3 s filtering/Lanczos/
-  extraction). The portable YAFU reference remains substantially faster at
-  185.94 s, so no parity claim is made.
+  weights are precomputed once. A portable 32 KiB dense-prefix kernel, a
+  YAFU-density 102-bit/DLP collection policy, allocation-free graph rerooting,
+  union-by-size partial combining, and optional x86-64-baseline SIMD root
+  advancement subsequently reduced the verified 96-thread RSA-100 run from
+  622.6 s to 355.4 s (317.2 s collection and 36.9 s filtering/Lanczos/
+  extraction; 4.71M polynomials). The portable YAFU reference remains faster
+  at 185.94 s, so no parity claim is made.
 - A matched fixed 272-bit browser run reduced LA/extraction from 5.574 s to
   1.721 s and wall time from 83.599 s to 80.072 s. The 281–288 tier removes the
   old 700k-to-500k factor-base discontinuity: on an exact 288-bit fixture,

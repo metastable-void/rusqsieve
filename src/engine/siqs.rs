@@ -5,6 +5,27 @@ pub(super) fn sieve_family(
     family: u64,
     scratch: &mut EngineScratch,
 ) -> FamilyResult {
+    sieve_family_inner(ctx, family, scratch, || false)
+}
+
+#[cfg(any(unix, windows))]
+pub(super) fn sieve_family_cancellable(
+    ctx: &Context,
+    family: u64,
+    scratch: &mut EngineScratch,
+    cancellation: &std::sync::atomic::AtomicBool,
+) -> FamilyResult {
+    sieve_family_inner(ctx, family, scratch, || {
+        cancellation.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+fn sieve_family_inner(
+    ctx: &Context,
+    family: u64,
+    scratch: &mut EngineScratch,
+    cancelled: impl Fn() -> bool,
+) -> FamilyResult {
     let empty = |family| FamilyResult {
         family,
         polynomials: 0,
@@ -101,16 +122,25 @@ pub(super) fn sieve_family(
             scratch.bainv[j * nfb + idx] = mulmod_u32(delta, ainvp, p);
         }
     }
-
     // Sieve every polynomial in Gray-code order, advancing the roots in O(1) per
     // prime between consecutive polynomials instead of recomputing them.
-    let mut relations = Vec::new();
+    // DLP tiers commonly retain close to one relation per polynomial.  Size
+    // the family packet once so `push` never grows it in the polynomial loop.
+    let mut relations = if ctx.n.bit_len() >= 289 {
+        Vec::with_capacity(variants as usize)
+    } else {
+        Vec::new()
+    };
     let mut survivors = 0u64;
+    let mut polynomials = 0u64;
     let mut timing = [0u64; 4];
     if let Some(started) = family_started {
         timing[0] = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     }
     for v in 0..variants {
+        if cancelled() {
+            break;
+        }
         survivors += sieve_one_poly(
             ctx,
             &a,
@@ -124,10 +154,13 @@ pub(super) fn sieve_family(
             &mut scratch.candidate_factor_counts,
             &mut scratch.candidate_factors,
             &mut scratch.candidate_bits,
+            &mut scratch.dense_root1,
+            &mut scratch.dense_root2,
             &mut scratch.powers_scratch,
             &mut relations,
             &mut timing,
         ) as u64;
+        polynomials += 1;
         if v + 1 >= variants {
             break;
         }
@@ -144,6 +177,24 @@ pub(super) fn sieve_family(
         let off = j * nfb;
         let roots_started = ctx.profile.then(std::time::Instant::now);
         if add_bainv {
+            #[cfg(target_arch = "x86_64")]
+            root_simd::advance_add(
+                &mut scratch.root1,
+                &mut scratch.root2,
+                &scratch.bainv[off..off + nfb],
+                &ctx.primes,
+            );
+            #[cfg(all(target_arch = "wasm32", feature = "wasm-simd128"))]
+            root_wasm::advance_add(
+                &mut scratch.root1,
+                &mut scratch.root2,
+                &scratch.bainv[off..off + nfb],
+                &ctx.primes,
+            );
+            #[cfg(not(any(
+                target_arch = "x86_64",
+                all(target_arch = "wasm32", feature = "wasm-simd128")
+            )))]
             for idx in 0..nfb {
                 if scratch.root1[idx] == u32::MAX {
                     continue;
@@ -156,6 +207,24 @@ pub(super) fn sieve_family(
                 scratch.root2[idx] = r1.max(r2);
             }
         } else {
+            #[cfg(target_arch = "x86_64")]
+            root_simd::advance_sub(
+                &mut scratch.root1,
+                &mut scratch.root2,
+                &scratch.bainv[off..off + nfb],
+                &ctx.primes,
+            );
+            #[cfg(all(target_arch = "wasm32", feature = "wasm-simd128"))]
+            root_wasm::advance_sub(
+                &mut scratch.root1,
+                &mut scratch.root2,
+                &scratch.bainv[off..off + nfb],
+                &ctx.primes,
+            );
+            #[cfg(not(any(
+                target_arch = "x86_64",
+                all(target_arch = "wasm32", feature = "wasm-simd128")
+            )))]
             for idx in 0..nfb {
                 if scratch.root1[idx] == u32::MAX {
                     continue;
@@ -174,7 +243,7 @@ pub(super) fn sieve_family(
     }
     FamilyResult {
         family,
-        polynomials: variants,
+        polynomials,
         relations,
         survivors,
         timing,

@@ -19,21 +19,24 @@ For high-digit SIQS on native and Wasm, the initial automatic scale is:
 | 297–304 | 90–92 | 1,500,000 | 262,144 | 120 | yes |
 | 305–312 | 92–94 | 1,800,000 | 262,144 | 150 | yes |
 | 313–320 | 95–97 | 2,250,000 | 262,144 | 150 | yes |
-| 321–333 | 97–100 | 3,000,000 | 262,144 | 150 | yes |
+| 321–333 | 97–100 | 3,000,000 | 262,144 | 145 | yes |
 
-DLP products are capped at 12× or 16× the factor-base-bound square. The older
-`single_limit^1.8` cutoff admitted millions of survivors whose unique graph
-vertices did not close cycles.
+DLP products through 320 bits are capped at 12× or 16× the
+factor-base-bound square. The 321–333 tier uses a measured 1,214× cap and a
+102-bit report cutoff; its 1.0926e16 product window matches the RSA-100
+reference workload while retaining a 145B per-prime cap.
 
 On the 96-thread Xeon 8259CL tuning host, fixed 289- and 304-bit balanced
 semiprimes completed in 41.8 s and 103.5 s. The original RSA-100 result was
 622.6 s (606.2 s collection, 14.9 s filtering/Lanczos/extraction). Complete
 multiplier selection, Q/2 polynomials, 13-factor/2,048-variant A families,
 flat report scratch, L2-sized resieve membership, and precomputed weights
-reduced the verified final-default run to 424.9 s (406.7 s collection, 17.3 s
-filtering/Lanczos/extraction). This does not match the clean portable YAFU
-reference at 185.94 s; the remaining gap is relation-sieve/resieve throughput,
-not block Lanczos.
+first reduced the verified run to 424.9 s. Portable dense-prefix blocking,
+the deeper DLP policy, allocation-free union-by-size partial combining, and
+optional x86-64 SSE2 root advancement reduced the final-default run again to
+355.4 s (317.2 s collection, 36.9 s filtering/Lanczos/extraction; 4.71M
+polynomials). This does not match the clean portable YAFU reference at
+185.94 s; the remaining gap is relation-sieve throughput, not block Lanczos.
 
 The 281–288 tier removes the old drop from a 700k prime bound at 280 bits to
 500k at 281. On an exact 288-bit balanced fixture, the old 500k/327,680 policy
