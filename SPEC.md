@@ -1,8 +1,9 @@
-# rusqsieve 0.3 implementation specification
+# rusqsieve 0.4 implementation specification
 
 This document specifies the supported behavior and current architecture of
-rusqsieve 0.4. It describes the implementation that is shipped, not an
-aspirational module layout or a compatibility promise for private internals.
+rusqsieve 0.4, release-verified on 2026-07-31. It describes the implementation
+that is shipped, not an aspirational module layout or a compatibility promise
+for private internals.
 
 Normative requirements use **must**. Descriptions of tuning and implementation
 strategy document the 0.4 release and may change in later compatible releases
@@ -25,7 +26,7 @@ The factorization pipeline combines trial division, probable-prime testing,
 perfect-power detection, Pollard–Brent rho, and a self-initializing quadratic
 sieve (SIQS).
 
-The following are explicitly outside the 0.3 scope:
+The following are explicitly outside the 0.4 scope:
 
 - ECM and the General Number Field Sieve;
 - constant-time or side-channel-resistant arithmetic;
@@ -51,15 +52,16 @@ The supported interfaces in 0.4 are:
 2. the factor/result functions, ABI query, status formatter, and opaque type
    declared in `rusqsieve.h`;
 3. the `qs-factor` command-line behavior documented below;
-4. the Wasm exports used by `web/abi.js`, `web/index.js`, and `web/worker.js`.
+4. the Wasm exports used by `web/abi.js`, `web/index.js`,
+   `web/coordinator.js`, and `web/worker.js`.
 
 Everything else in `src/` is private implementation detail even when an
 internal item uses Rust's `pub` visibility inside its private module.
 
-Minor 0.4 releases may retune parameters, change internal representations, add
-non-exhaustive error/progress variants, or replace private algorithms. They
-must not expose invalid relation, matrix, pointer, or scheduler states through
-the safe Rust API.
+Patch releases in the 0.4 series may retune parameters, change internal
+representations, add non-exhaustive error/progress variants, or replace private
+algorithms. They must not expose invalid relation, matrix, pointer, or scheduler
+states through the safe Rust API.
 
 ### 2.2 Targets
 
@@ -98,10 +100,18 @@ src/
 ├── native.rs           safe blocking native driver
 ├── capi.rs             native C ownership/pointer boundary
 ├── engine.rs           optimized SIQS engine and portable jobs
+├── engine/
+│   ├── siqs.rs         polynomial construction and sieve-family kernel
+│   ├── extract.rs      verified dependency extraction
+│   ├── wire.rs         private worker-family serialization
+│   ├── root_simd.rs    x86-64 SSE2 root advancement
+│   └── root_wasm.rs    Wasm SIMD128 root advancement
 ├── qs/mod.rs           factor-base construction and SIQS tier parameters
 ├── f2/mod.rs           sparse filtering and dependency solving
+├── f2/block_lanczos.rs portable 64-way Montgomery block Lanczos
 ├── natural/mod.rs      fixed-capacity unsigned arithmetic
 ├── smallfactor.rs      cached small primes and u64 Pollard–Brent
+├── u64math.rs          shared machine-word primality/factoring kernels
 ├── primality.rs        probable-prime testing
 ├── factor.rs           public configuration and error vocabulary
 ├── factors.rs          owned factor result
@@ -117,8 +127,9 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 ```
 
 The default Cargo feature enables the CLI. The `wasm-simd128` feature enables
-the SIMD128 linear-algebra kernel. Cargo features are additive: none changes the
-identity or default const-generic width of a public type.
+the explicit SIMD128 matrix-XOR and root-advancement kernels. Cargo features are
+additive: none changes the identity or default const-generic width of a public
+type.
 
 ## 4. Public Rust API
 
@@ -186,7 +197,7 @@ calls.
 
 ### 4.3 Configuration
 
-`FactorConfig` is an owned, encapsulated configuration. In 0.3 its supported
+`FactorConfig` is an owned, encapsulated configuration. In 0.4 its supported
 controls are:
 
 - `parallelism()` / `with_parallelism(...)`;
@@ -287,15 +298,17 @@ The optimized blocking engine performs:
 7. recursively factor divisor and cofactor;
 8. sort the complete factor list.
 
-For input capacities at or below the compiled engine width, the high-level API
-converts into the optimized engine without changing the value. Wider
-user-selected capacities retain a private reference fallback. This distinction
-is not a separate public API.
+The high-level API accepts any `Natural<P>` whose value is at most 512
+significant bits and converts it into the fixed optimized engine width without
+changing the value. Larger values return `FactorError::InputTooLarge`; there is
+no private slow fallback.
 
-The implementation is deterministic for a fixed version, input, configuration,
-and relevant tuning environment. Parallel workers do not choose random
-polynomials. Relation results are merged by family number rather than arrival
-order.
+Polynomial-family selection is deterministic for a fixed version, input, and
+configuration. Portable/browser sessions merge results by family number.
+Native collection deliberately ingests completed unique families in arrival
+order to avoid head-of-line stalls behind unusually expensive families.
+Correctness does not depend on that order, and the public factor list is always
+sorted.
 
 ## 7. SIQS engine
 
@@ -397,9 +410,10 @@ double partials as ordinary graph edges. A cycle combines relations only when
 every large-prime exponent cancels to even parity; the corresponding
 square-root factors are retained for extraction.
 
-The relation collector buffers out-of-order families and merges them in
-ascending family order. Native workers and Web Workers execute the same
-`sieve_family` kernel through different schedulers.
+The portable relation collector buffers out-of-order families and merges them
+in ascending family order. Native collection ingests completed unique families
+immediately. Native workers and Web Workers execute the same `sieve_family`
+kernel through these different schedulers.
 
 ## 8. Linear algebra and extraction
 
@@ -449,7 +463,7 @@ The coordinator:
 
 - owns relation and matrix state;
 - keeps at most a bounded multiple of the worker count in flight;
-- merges families deterministically;
+- ingests completed unique families immediately to avoid head-of-line stalls;
 - stops dispatching once the relation target is met;
 - joins every worker before returning;
 - never calls user progress code from worker threads.
@@ -573,9 +587,11 @@ qs_coord_extract
 qs_coord_free
 ```
 
-Handles contain a slot and generation, so stale handles do not alias newly
-allocated objects. Incoming pointers and lengths are checked with checked
-arithmetic against current Wasm memory and a 16 MiB packet limit.
+Handles contain a 16-bit slot and 16-bit generation. Generation checks reject
+ordinary stale-handle reuse; a slot can alias an ancient handle after 65,535
+reuse cycles, so the raw ABI does not promise unbounded temporal uniqueness.
+Incoming pointers and lengths are checked with checked arithmetic against
+current Wasm memory and a 16 MiB packet limit.
 
 Owned result packets use a `QSV1` envelope:
 
@@ -601,10 +617,11 @@ Release packaging builds:
 - a scalar module with no default features;
 - a module with `-C target-feature=+simd128` and `wasm-simd128`.
 
-The frontend attempts to compile the SIMD module first and falls back to scalar.
-SIMD is intentionally scoped to the XOR-heavy row-reduction kernel. Applying
-whole-program Wasm SIMD or Binaryen post-optimization has measured regressions
-and is not part of the release pipeline.
+The frontend attempts to compile the SIMD module first and falls back to
+scalar. Explicit SIMD kernels accelerate the XOR-heavy row-reduction path and
+SIQS root advancement; all other code retains scalar Rust fallbacks. Applying
+additional whole-program Wasm transforms or Binaryen post-optimization has
+measured regressions and is not part of the release pipeline.
 
 ## 12. CLI
 
@@ -701,7 +718,8 @@ The following invariants are mandatory:
 5. every returned nontrivial divisor divides the composite being split;
 6. every final factor passes probable-prime testing;
 7. multiplying factors with multiplicity reconstructs the input;
-8. stale Wasm handles and obsolete worker generations are rejected or ignored;
+8. stale Wasm handles within the documented generation window and obsolete
+   worker generations are rejected or ignored;
 9. malformed C/Wasm inputs produce errors rather than unwinding across an ABI.
 
 The crate is not constant-time and must not be used where operand-dependent
@@ -714,12 +732,23 @@ Required release checks:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-features
+cargo test --locked --all-features --all-targets
+cargo test --locked --no-default-features
+cargo test --locked --profile release-test --test factorization \
+  supplied_factorization_corpus_above_128_bits -- --ignored
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo check --locked --all-targets --all-features
-cargo package --list --allow-dirty
-cargo package --allow-dirty
+cargo package --list
+cargo package --locked
+make test
+SDKROOT=/path/to/MacOSX.sdk ./build-release.sh
 ```
+
+The final command builds the eight supported archives. Release verification
+must integrity-check each archive, execute host-compatible CLIs, link the C
+smoke program against packaged libraries, and exercise the shipped `docs/`
+frontend in a real browser when the required cross toolchains and browser
+harness are available.
 
 Tests cover:
 

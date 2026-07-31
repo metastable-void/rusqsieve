@@ -11,3 +11,4 @@
 /lpnew.*
 /lprels.*
 /*.tar.gz
+/fuzz/target/

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 — 2026-07-30
+## 0.4.0 — 2026-07-31
 
 - Added a true portable 64-way Montgomery block-Lanczos recurrence over `GF(2)`
   for native and Wasm residual matrices from 272 input bits upward. It applies
@@ -25,8 +25,10 @@
   union-by-size partial combining, and optional x86-64-baseline SIMD root
   advancement subsequently reduced the verified 96-thread RSA-100 run from
   622.6 s to 355.4 s (317.2 s collection and 36.9 s filtering/Lanczos/
-  extraction; 4.71M polynomials). The portable YAFU reference remains faster
-  at 185.94 s, so no parity claim is made.
+  extraction; 4.71M polynomials), then to a 339.2 s profiled run. The final
+  release gate returned the exact factors in 320.1 s with 1.48 GiB peak
+  resident memory. The portable YAFU reference remains faster at 185.94 s, so
+  no parity claim is made.
 - A matched fixed 272-bit browser run reduced LA/extraction from 5.574 s to
   1.721 s and wall time from 83.599 s to 80.072 s. The 281–288 tier removes the
   old 700k-to-500k factor-base discontinuity: on an exact 288-bit fixture,
@@ -36,6 +38,13 @@
   fixtures in 23.702 s, 69.783 s, and 226.901 s. After the high-tier work,
   repeated endpoint checks completed in 67.433 s at 272 bits and 222.006 s at
   288 bits; multiplier/Q/2 changes are deliberately gated above 288 bits.
+- Completed the 0.4 release gate on Rust 1.97.1 and Node 24.15: formatting,
+  warnings-denied Clippy and rustdoc, default/all-feature/no-default tests, the
+  complete 309-entry factorization corpus, C ABI smoke tests, scalar/SIMD
+  Worker protocol tests, Cargo package/install verification, and a real
+  Chromium run all pass. All eight supported release archives build and pass
+  integrity checks; packaged GNU/musl CLIs and native C static/shared libraries
+  were executed on the reference host.
 
 ## 0.3.0 — 2026-07-26
 

@@ -1,8 +1,10 @@
-# Browser factorization benchmarks
+# Factorization benchmarks
 
-The performance target is hard composite integers from 192 through 272 bits. Results are only
-comparable when they use the same input, browser build, machine, worker count, warm-up policy, and
-factor verification. Report both wall time and the complete prime factorization.
+The primary browser performance target is hard composite integers from 192
+through 272 bits; native high-digit validation extends through the 333-bit
+RSA-100 workload. Results are only comparable when they use the same input,
+runtime/build, machine, worker count, warm-up policy, and factor verification.
+Report both wall time and the complete prime factorization.
 
 The established browser policy below 272 bits is a regression boundary.
 Portable block Lanczos begins at 272 bits after a matched fixed-corpus run
@@ -35,8 +37,12 @@ first reduced the verified run to 424.9 s. Portable dense-prefix blocking,
 the deeper DLP policy, allocation-free union-by-size partial combining, and
 optional x86-64 SSE2 root advancement reduced the final-default run again to
 355.4 s (317.2 s collection, 36.9 s filtering/Lanczos/extraction; 4.71M
-polynomials). This does not match the clean portable YAFU reference at
-185.94 s; the remaining gap is relation-sieve throughput, not block Lanczos.
+polynomials). A later profiled run completed in 339.2 s (295.7 s collection
+and 43.5 s filtering/Lanczos/extraction). The final 2026-07-31 release gate,
+run without profiling, returned the exact RSA-100 factors in 320.1 s with a
+1.48 GiB peak resident set. This does not match the clean portable YAFU
+reference at 185.94 s; the remaining gap is relation-sieve throughput, not
+block Lanczos.
 
 The 281–288 tier removes the old drop from a 700k prime bound at 280 bits to
 500k at 281. On an exact 288-bit balanced fixture, the old 500k/327,680 policy
@@ -49,6 +55,25 @@ final real-Chromium run of the shipped SIMD artifacts took 23.702 s at 256
 bits, 69.783 s at 272 bits, and 226.901 s at 288 bits; all three results were
 factor-verified with eight Web Workers. Post-tuning checks of the same endpoint
 fixtures took 67.433 s at 272 bits and 222.006 s at 288 bits.
+
+## 0.4 release-gate measurements
+
+The final 0.4 source and artifacts were rechecked on 2026-07-31. These are
+single-run release gates, not replacements for the multi-input tuning means:
+
+| path | input | workers | wall | peak RSS |
+|---|---:|---:|---:|---:|
+| Node 24.15/V8 SIMD Wasm | 192 bits | 8 | 0.773 s | — |
+| Node 24.15/V8 SIMD Wasm | 224 bits | 8 | 3.973 s | — |
+| Node 24.15/V8 SIMD Wasm | 256 bits | 8 | 27.293 s | — |
+| native release | 288 bits | 48 | 37.81 s | 297 MiB |
+| native release | RSA-100 (330 bits) | 96 | 320.10 s | 1.48 GiB |
+
+The shipped `docs/` frontend also completed the first 216-bit browser-corpus
+case in headless Chromium with eight Web Workers and SIMD: 2.225 s total,
+including 1.979 s through sieving and 0.246 s for linear algebra/extraction.
+Every row returned factor-verified output. At this revision the scalar and
+SIMD Wasm modules are 196,216 and 202,334 bytes.
 
 ## Reproducible rusqsieve harness
 

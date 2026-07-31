@@ -334,7 +334,9 @@ pub mod parameters {
     /// 424.9 s. Portable dense-prefix blocking, a 102-bit DLP collection
     /// policy, allocation-free graph updates, and optional SSE2 root
     /// advancement reduced it again to 355.4 s (317.2 s collection, 36.9 s
-    /// filtering/Lanczos/extraction).
+    /// filtering/Lanczos/extraction), followed by a 339.2 s profiled run. The
+    /// final 0.4 release gate returned the exact RSA-100 factors in 320.1 s
+    /// without profiling, with 1.48 GiB peak resident memory.
     /// The matched portable YAFU reference remains faster at 185.94 s.
     ///
     /// `thresh_adj` is the measured sieve-threshold offset in bits, added to
