@@ -9,7 +9,7 @@ independent Web Workers without shared memory.
 > realistic balanced semiprimes in its 192–256-bit target range, established
 > through cross-factorizer testing on multiple mobile devices.**
 
-Version 0.3 exposes a deliberately small, safe Rust API and an opaque native C
+Version 0.4 exposes a deliberately small, safe Rust API and an opaque native C
 ABI. SIQS relations, matrix kernels, worker packets, scheduler state, primality
 policy, and mutable limbs remain private implementation details.
 
@@ -22,7 +22,9 @@ On the fixed, factor-verified corpus and reference host, rusqsieve currently:
 - factors the 192-, 224-, and 256-bit browser-shaped cases in 0.72 s, 5.04 s,
   and 37.86 s under Node 24.15/V8 with eight workers;
 - scales the fixed 256-bit case to 13.96 s with 48 workers on the 96-thread
-  reference host.
+  reference host;
+- factors the reference RSA-100 semiprime in 339.2 s with 96 worker threads,
+  including 295.7 s of collection and 43.5 s of linear algebra and extraction.
 
 Together with independent comparisons against online factorizers on multiple
 mobile devices, these results establish rusqsieve as the **world's fastest
@@ -250,19 +252,24 @@ Lanczos reduced wall time from 420.223 s to 258.512 s. A matched 256-bit run,
 which stays on M4RI, was unchanged within noise (27.146 s versus 26.986 s).
 The final shipped-artifact confirmation in real Chromium completed the
 256-/272-/288-bit fixtures in 23.702/69.783/226.901 s. Post-tuning endpoint
-checks completed the same 272-/288-bit fixtures in 67.433/222.006 s; the new
-native multiplier and Q/2 policy is gated above 288 bits.
+checks completed the 272-/288-bit fixtures in 67.433/222.006 s. Wasm SIMD root
+advancement subsequently reduced the verified 272-bit endpoint to 65.829 s;
+the multiplier and Q/2 policy remains gated above 288 bits.
 
 On the 96-thread native tuning host, final-default fixed anchors completed in
 41.8 s at 289 bits and 103.5 s at 304 bits. Full multiplier selection, Q/2
 polynomials, larger self-initializing families, allocation-free report
 resieving, precomputed score weights, portable dense-prefix blocking, a
-102-bit/DLP collection policy, and allocation-free partial-graph updates
-reduced a verified RSA-100 run from 622.6 s to 355.4 s. x86-64 builds also
-dispatch root advancement through an SSE2 baseline kernel; all scoring and
-non-x86 builds retain the portable Rust path. This remains behind the matched
-portable YAFU run at 185.94 s; relation scoring, not block Lanczos, is still
-the limiting gap.
+102-bit/DLP collection policy, allocation-free partial-graph updates, and a
+portable structure-of-arrays score stream reduced the latest fully verified
+RSA-100 run from 622.6 s to 339.2 s. The score kernel reads contiguous primes,
+separates repeated-hit and sparse ranges, and uses reusable padded sentinels
+instead of unpredictable sparse-root bounds branches; none of those changes
+depend on x86-64. x86-64 builds additionally dispatch root advancement through
+an SSE2 baseline kernel, while Wasm SIMD128 has an equivalent optional path
+and every target retains scalar Rust fallbacks. This remains behind the
+matched portable YAFU run at 185.94 s; relation scoring, not block Lanczos, is
+still the limiting gap.
 
 ## Release builds
 
