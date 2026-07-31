@@ -2,6 +2,12 @@
 mod extract;
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
+mod report_simd;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-simd128"))]
+#[allow(unsafe_code)]
+mod report_wasm;
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
 mod root_simd;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-simd128"))]
 #[allow(unsafe_code)]
@@ -117,6 +123,8 @@ struct Context {
     small_skip: u32,
     threshold_margin: i32,
     profile: bool,
+    /// Bounded native worker count for sparse block-Lanczos matvecs.
+    la_threads: usize,
 }
 
 /// Large-prime cofactor content of a relation.
@@ -322,6 +330,14 @@ const MAX_FAMILIES: u64 = 100_000;
 
 /// Prepare an immutable context without creating threads.
 pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, EngineError> {
+    prepare_with_la_threads(n, tuning, 1)
+}
+
+fn prepare_with_la_threads(
+    n: Natural,
+    tuning: &FactorTuning,
+    la_threads: usize,
+) -> Result<EngineContext, EngineError> {
     let input_bits = n.bit_len();
     let mut p = crate::qs::parameters::engine_params(input_bits);
     if let Some(bound) = tuning.factor_base_bound {
@@ -425,6 +441,9 @@ pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, Engin
         small_skip,
         threshold_margin: tuning.threshold_margin.unwrap_or(0),
         profile: tuning.profile,
+        // Sparse matvec bandwidth flattened at eight workers on the retained
+        // 96k-column RSA-110 matrix; 16 lost to spawn and cache contention.
+        la_threads: la_threads.clamp(1, 8),
     });
     // A famine here is a parameter-selection failure, not a search failure: if no `A` can be built
     // for family 0 then none can be built for any family, and every scheduler would otherwise burn
@@ -740,7 +759,7 @@ fn find_factor(
     stage_counts::bump(&stage_counts::SIQS);
     let prof = tuning.profile;
     let t_fb = std::time::Instant::now();
-    let ctx = prepare(n.clone(), tuning)?.0;
+    let ctx = prepare_with_la_threads(n.clone(), tuning, threads)?.0;
     let target = relation_target(ctx.base.len(), ctx.relation_percent);
     if prof {
         let (score_cutoff, score_bias, exact_scores) = siqs::choose_a(&ctx, 0)
@@ -759,7 +778,12 @@ fn find_factor(
             ctx.interval,
             ctx.target_a.bit_len(),
             ctx.a_factor_count,
-            1usize << (ctx.a_factor_count - 1).min(11),
+            1usize
+                << match ctx.n.bit_len() {
+                    ..=320 => (ctx.a_factor_count - 1).min(10),
+                    321..=333 => (ctx.a_factor_count - 1).min(11),
+                    _ => (ctx.a_factor_count - 1).min(12),
+                },
             score_cutoff,
             score_bias,
             exact_scores,
@@ -1206,7 +1230,6 @@ fn score_polynomial<const SATURATING: bool>(
 const DENSE_BLOCK_LEN: usize = 32 * 1024;
 const DENSE_PRIME_CUTOFF: u32 = 8 * 1024;
 const SCORE_SENTINELS: usize = 1024;
-
 #[inline(always)]
 #[allow(unsafe_code)]
 fn sieve_dense_root<const SATURATING: bool>(
@@ -1310,7 +1333,29 @@ fn divide_out_known(q: &mut Natural, p: u64) -> u16 {
 /// "reached the threshold" becomes "high bit set". One `and` then rejects eight positions at a time.
 /// The bias is applied by the caller rather than folded in here because a runtime bias would cost an
 /// `add` and an `or` per word, which measured 2.7× slower than the masked test on the 224-bit case.
+#[cfg(target_arch = "x86_64")]
 fn collect_candidates(scores: &[u8], threshold: u8, candidates: &mut Vec<u32>) {
+    report_simd::collect_candidates(scores, threshold, candidates);
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-simd128"))]
+fn collect_candidates(scores: &[u8], threshold: u8, candidates: &mut Vec<u32>) {
+    report_wasm::collect_candidates(scores, threshold, candidates);
+}
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "wasm32", feature = "wasm-simd128")
+)))]
+fn collect_candidates(scores: &[u8], threshold: u8, candidates: &mut Vec<u32>) {
+    collect_candidates_scalar(scores, threshold, candidates);
+}
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "wasm32", feature = "wasm-simd128")
+)))]
+fn collect_candidates_scalar(scores: &[u8], threshold: u8, candidates: &mut Vec<u32>) {
     const HIGH: u64 = 0x8080_8080_8080_8080;
     debug_assert!(
         threshold >= 128,

@@ -3,6 +3,25 @@
 ## 0.4.1 — Unreleased
 
 - Bumped the crate patch version after the 0.4.0 release.
+- Performance-qualified the native SIQS path through the 364-bit RSA-110
+  workload. Runtime-dispatched AVX2 advances eight Gray-code root lanes while
+  preserving the x86-64 SSE2 baseline, and RSA-110 families now use all 4,096
+  nonredundant variants. A factor-verified 192-worker run improved from
+  392.50 s to 366.12 s (−6.7%) with peak RSS essentially unchanged near 2 GiB.
+- Added AVX2/SSE2 and Wasm SIMD128 report scans that enumerate high-bit lanes
+  without a branch per score byte. Block Lanczos now traverses `B·x` row-major
+  and parallelizes disjoint forward/transpose output ranges with a measured
+  eight-worker cap. RSA-110 completed in 366.12 s and 2.06 GiB versus the
+  supplied portable YAFU binary at 405.06 s and 9.41 GiB on the same host.
+- Retuned the exact 320-bit crossover to a 2.75M factor-base bound, 491,520
+  half-width, 100-bit report cutoff, YAFU-scale DLP window, and 1,024-pattern
+  families. A factor-verified 192-worker profile took 33.11 s versus YAFU's
+  33.60 s; using all 384 logical workers took 30.50 s.
+- Split the RSA-100 midpoint into a 3.25M/524,288 tier with a YAFU-scale DLP
+  window and 2,048-pattern families. Its factor-verified 192-worker run took
+  54.01 s, down from the 320.1 s release gate and within 6.5% of portable
+  YAFU's 50.70 s; exact 3.22M geometry, smaller families, and deeper reporting
+  were measured and rejected.
 - Recorded fresh real-Chromium checks of the shipped SIMD artifacts: verified
   factors returned in 62.237 s at 272 bits and 185.830 s at 288 bits,
   improving the previous 67.433/222.006 s controls.

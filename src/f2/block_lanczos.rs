@@ -17,7 +17,7 @@ impl SparseBinaryMatrix {
     /// Find up to `limit` dependencies with the 64-way Montgomery block-Lanczos
     /// recurrence. A few deterministic starting blocks are tried because the
     /// algorithm has a small, input-dependent probability of breakdown.
-    pub(super) fn block_lanczos_dependencies(&self, limit: usize) -> DependencySet {
+    pub(super) fn block_lanczos_dependencies(&self, limit: usize, threads: usize) -> DependencySet {
         if limit == 0 || self.columns() == 0 {
             return DependencySet::default();
         }
@@ -25,6 +25,7 @@ impl SparseBinaryMatrix {
             if let Some(mut dependencies) = Lanczos::new(
                 self,
                 0xd6e8_feb8_6659_fd93 ^ attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                threads,
             )
             .solve()
             {
@@ -45,27 +46,60 @@ impl SparseBinaryMatrix {
 
     /// `out = B * input`, where `input` and every output coordinate carry 64
     /// independent vectors in their bits.
-    fn mul_b(&self, input: &[u64], out: &mut [u64]) {
+    fn mul_b(&self, input: &[u64], out: &mut [u64], threads: usize) {
         debug_assert_eq!(input.len(), self.columns());
         debug_assert_eq!(out.len(), self.rows());
-        out.fill(0);
-        for (column, &word) in input.iter().enumerate() {
-            if word == 0 {
-                continue;
-            }
-            let start = self.csc_offsets[column] as usize;
-            let end = self.csc_offsets[column + 1] as usize;
-            for &row in &self.csc_rows[start..end] {
-                out[row as usize] ^= word;
-            }
+        // Row-major traversal turns the random-write CSC scatter into one
+        // sequential output store per row. Lanczos block words are almost
+        // never zero, so the old per-column zero branch did not prune useful
+        // work. This is the medium-row layout used by the YAFU/msieve packed
+        // multiply, without its fixed-size block encoding.
+        let workers = threads.max(1).min(out.len());
+        if workers == 1 || self.nonzeros() < 250_000 {
+            self.mul_b_rows(input, out, 0);
+            return;
         }
+        let chunk = out.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (chunk_index, values) in out.chunks_mut(chunk).enumerate() {
+                let row_start = chunk_index * chunk;
+                scope.spawn(move || self.mul_b_rows(input, values, row_start));
+            }
+        });
     }
 
     /// `out = Bᵀ * input`.
-    fn mul_bt(&self, input: &[u64], out: &mut [u64]) {
+    fn mul_bt(&self, input: &[u64], out: &mut [u64], threads: usize) {
         debug_assert_eq!(input.len(), self.rows());
         debug_assert_eq!(out.len(), self.columns());
-        for (column, value) in out.iter_mut().enumerate() {
+        let workers = threads.max(1).min(out.len());
+        if workers == 1 || self.nonzeros() < 250_000 {
+            self.mul_bt_columns(input, out, 0);
+            return;
+        }
+        let chunk = out.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (chunk_index, values) in out.chunks_mut(chunk).enumerate() {
+                let column_start = chunk_index * chunk;
+                scope.spawn(move || self.mul_bt_columns(input, values, column_start));
+            }
+        });
+    }
+
+    fn mul_b_rows(&self, input: &[u64], out: &mut [u64], row_start: usize) {
+        for (offset, value) in out.iter_mut().enumerate() {
+            let row = row_start + offset;
+            let start = self.csr_offsets[row] as usize;
+            let end = self.csr_offsets[row + 1] as usize;
+            *value = self.csr_columns[start..end]
+                .iter()
+                .fold(0, |word, &column| word ^ input[column as usize]);
+        }
+    }
+
+    fn mul_bt_columns(&self, input: &[u64], out: &mut [u64], column_start: usize) {
+        for (offset, value) in out.iter_mut().enumerate() {
+            let column = column_start + offset;
             let start = self.csc_offsets[column] as usize;
             let end = self.csc_offsets[column + 1] as usize;
             *value = self.csc_rows[start..end]
@@ -79,21 +113,24 @@ struct Lanczos<'a> {
     matrix: &'a SparseBinaryMatrix,
     seed: u64,
     row_scratch: Vec<u64>,
+    threads: usize,
 }
 
 impl<'a> Lanczos<'a> {
-    fn new(matrix: &'a SparseBinaryMatrix, seed: u64) -> Self {
+    fn new(matrix: &'a SparseBinaryMatrix, seed: u64, threads: usize) -> Self {
         Self {
             matrix,
             seed,
             row_scratch: vec![0; matrix.rows()],
+            threads: threads.max(1),
         }
     }
 
     /// Apply the symmetric matrix `A = BᵀB` without materializing it.
     fn apply_a(&mut self, input: &[u64], out: &mut [u64]) {
-        self.matrix.mul_b(input, &mut self.row_scratch);
-        self.matrix.mul_bt(&self.row_scratch, out);
+        self.matrix
+            .mul_b(input, &mut self.row_scratch, self.threads);
+        self.matrix.mul_bt(&self.row_scratch, out, self.threads);
     }
 
     fn random_word(&mut self) -> u64 {
@@ -139,8 +176,8 @@ impl<'a> Lanczos<'a> {
                 }
                 let mut bx = vec![0; self.matrix.rows()];
                 let mut bv = vec![0; self.matrix.rows()];
-                self.matrix.mul_b(&x, &mut bx);
-                self.matrix.mul_b(&v[0], &mut bv);
+                self.matrix.mul_b(&x, &mut bx, self.threads);
+                self.matrix.mul_b(&v[0], &mut bv, self.threads);
                 return Some(combine_columns(n, self.matrix.rows(), &x, &v[0], &bx, &bv));
             }
 
@@ -491,12 +528,74 @@ mod tests {
             })
             .collect();
         let matrix = SparseBinaryMatrix::from_columns(rows, &matrix_columns).unwrap();
-        let dependencies = matrix.block_lanczos_dependencies(16);
+        let dependencies = matrix.block_lanczos_dependencies(16, 1);
         assert!(!dependencies.is_empty());
         assert!(
             dependencies
                 .iter()
                 .all(|dependency| matrix.verify_dependency(dependency))
         );
+    }
+
+    #[test]
+    #[ignore = "manual CSR-versus-CSC block-multiply performance measurement"]
+    fn profile_block_multiply_layout() {
+        let rows = 50_000;
+        let columns = 50_100;
+        let mut state = 0xa076_1d64_78bd_642fu64;
+        let matrix_columns: Vec<Vec<u32>> = (0..columns)
+            .map(|_| {
+                let mut column = Vec::with_capacity(100);
+                for _ in 0..100 {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    column.push((state as usize % rows) as u32);
+                }
+                column
+            })
+            .collect();
+        let matrix = SparseBinaryMatrix::from_columns(rows, &matrix_columns).unwrap();
+        let input: Vec<u64> = (0..columns)
+            .map(|index| (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .collect();
+        let mut row_major = vec![0; rows];
+        let mut transposed = vec![0; columns];
+        let mut column_major = vec![0; rows];
+
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            matrix.mul_b(&input, &mut row_major, 1);
+        }
+        let row_time = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            column_major.fill(0);
+            for (column, &word) in input.iter().enumerate() {
+                let start = matrix.csc_offsets[column] as usize;
+                let end = matrix.csc_offsets[column + 1] as usize;
+                for &row in &matrix.csc_rows[start..end] {
+                    column_major[row as usize] ^= word;
+                }
+            }
+        }
+        let column_time = started.elapsed();
+        assert_eq!(row_major, column_major);
+        eprintln!("PROFILE mul_b csr={row_time:?} csc={column_time:?}");
+        for threads in [1, 2, 4, 8, 16] {
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                matrix.mul_b(&input, &mut row_major, threads);
+            }
+            let forward = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                matrix.mul_bt(&row_major, &mut transposed, threads);
+            }
+            let transpose = started.elapsed();
+            eprintln!(
+                "PROFILE matvec threads={threads} forward={forward:?} transpose={transpose:?}"
+            );
+        }
     }
 }

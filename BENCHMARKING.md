@@ -1,8 +1,8 @@
 # Factorization benchmarks
 
 The primary browser performance target is hard composite integers from 192
-through 272 bits; native high-digit validation extends through the 333-bit
-RSA-100 workload. Results are only comparable when they use the same input,
+through 272 bits; native high-digit validation extends through the 364-bit
+RSA-110 workload. Results are only comparable when they use the same input,
 runtime/build, machine, worker count, warm-up policy, and factor verification.
 Report both wall time and the complete prime factorization.
 
@@ -20,13 +20,17 @@ For high-digit SIQS on native and Wasm, the initial automatic scale is:
 | 289–296 | 87–89 | 1,200,000 | 262,144 | 120 | yes |
 | 297–304 | 90–92 | 1,500,000 | 262,144 | 120 | yes |
 | 305–312 | 92–94 | 1,800,000 | 262,144 | 150 | yes |
-| 313–320 | 95–97 | 2,250,000 | 262,144 | 150 | yes |
-| 321–333 | 97–100 | 3,000,000 | 262,144 | 145 | yes |
+| 313–319 | 95–97 | 2,250,000 | 262,144 | 150 | yes |
+| 320 | 97 | 2,750,000 | 491,520 | 130 | yes |
+| 321–333 | 97–100 | 3,250,000 | 524,288 | 145 | yes |
+| 334–368 | 101–111 | 3,000,000 | 262,144 | 145 | yes |
 
-DLP products through 320 bits are capped at 12× or 16× the
-factor-base-bound square. The 321–333 tier uses a measured 1,214× cap and a
-102-bit report cutoff; its 1.0926e16 product window matches the RSA-100
-reference workload while retaining a 145B per-prime cap.
+DLP products through 319 bits are capped at 12× or 16× the factor-base-bound
+square. The exact 320-bit crossover uses an 873× cap (6.6021e15), a 100-bit
+report cutoff, and 1,024-polynomial family packets. The 321–333 tier uses a
+1,035× cap at B=3.25M; the 334–368 tier uses a measured 1,214× cap at B=3M.
+Both give an approximately 1.093e16 product window and a 102-bit report cutoff
+while retaining a 145B per-prime cap.
 
 On the 96-thread Xeon 8259CL tuning host, fixed 289- and 304-bit balanced
 semiprimes completed in 41.8 s and 103.5 s. The original RSA-100 result was
@@ -43,6 +47,54 @@ run without profiling, returned the exact RSA-100 factors in 320.1 s with a
 1.48 GiB peak resident set. This does not match the clean portable YAFU
 reference at 185.94 s; the remaining gap is relation-sieve throughput, not
 block Lanczos.
+
+The 364-bit RSA-110 validation used the challenge value
+`35794234179725868774991807832568455403003778024228226193532908190484670252364677411513516111204504060317568667`
+and 192 workers on a 384-logical-CPU host. The inherited RSA-100 implementation
+returned the exact supplied factors in 392.50 s with 2,091,752 KiB peak RSS.
+Runtime AVX2 root advancement and 4,096-variant RSA-110 families reduced that
+to 369.70 s (−5.8%) and 2,086,912 KiB. Short profiling measured root-update CPU
+per polynomial down about 21% and family-setup CPU down about 36%. Bounds of
+2M, 4M, and 6M were sampled and all reduced early useful-column throughput, so
+the qualified tier retains the 3M base rather than trading a larger matrix for
+more smooth relations.
+
+The subsequent matched 192-worker gate on a Xeon 6975P-C added movemask-based
+report scanning and a row-major, eight-way block-Lanczos multiply. RSA-110
+returned the supplied factors in 366.12 s (349.62 s collection, 15.72 s LA and
+extraction) with 2,062,320 KiB peak RSS. The supplied portable YAFU 3.1.9 binary
+on the same input, host, and worker count took 405.06 s and 9,412,624 KiB; its
+333.77 s collection fed a 207k-row reduced matrix and its reported Lanczos time
+was 210.83 s. Rusqsieve's reduced matrix was 96k rows.
+
+At the lower crossover, a fixed balanced 320-bit semiprime
+`1756278678942249845993617650632944122050045962599888588598430499675718186088530648734896935076713`
+factored as
+`1293851336743492807283211439665086943021713244083 ×
+1357403767393126460672213357525616807202357674611`. The retained 192-worker
+profiled run took 33.11 s (20.92 s collection, 11.69 s LA/extraction), compared
+with portable YAFU at 33.60 s. An unprofiled 384-worker run took 30.50 s. The
+older narrow-DLP default took 42.19 s; a bucket-sieve prototype regressed to
+68.08 s and was removed.
+
+The intervening 330-bit RSA-100 gate used
+`1522605027922533360535618378132637429718068114961380688657908494580122963258952897654000350692006139`.
+The retained 3.25M/524,288 geometry, 102-bit report cutoff, 1.0932e16 DLP
+window, and 2,048-pattern families returned its published factors in 54.01 s
+(36.46 s collection, 16.81 s LA/extraction) with 1,995,804 KiB peak RSS. This
+is an 86% reduction from the old 320.1 s release gate, but remains 6.5% behind
+the matched portable YAFU result of 50.70 s (30.44 s collection and 19.16 s
+reported Lanczos) on this one midpoint. Exact YAFU-scale 3.22M geometry took
+57.35 s, 1,024-pattern families took 57.39 s, and deeper reporting took
+55.78 s, so all three were rejected. The endpoint gates above and below this
+input beat YAFU; no all-input parity claim is inferred from them.
+
+The report-scan microbenchmark processed 2,000 524,288-byte streams in 19.90 ms
+with AVX2 versus 270.02 ms scalar. On a synthetic 50k-row/5M-nonzero matrix,
+row-major `B·x` took 22.6–24.7 ms per ten loops versus 47.6–48.0 ms for the old
+column scatter; scoped eight-way multiplication reduced a paired forward/
+transpose pass to about 9.6/9.6 ms. Node 26.5.1 end-to-end architecture checks
+also returned the expected factors from both scalar Wasm and `simd128` Wasm.
 
 The 281–288 tier removes the old drop from a 700k prime bound at 280 bits to
 500k at 281. On an exact 288-bit balanced fixture, the old 500k/327,680 policy

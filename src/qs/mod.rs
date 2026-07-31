@@ -385,12 +385,24 @@ pub mod parameters {
             289..=296 => (1_200_000, 262_144, -3, 120, true, 12),
             297..=304 => (1_500_000, 262_144, -3, 120, true, 16),
             305..=312 => (1_800_000, 262_144, -3, 150, true, 16),
-            313..=320 => (2_250_000, 262_144, -3, 150, true, 16),
-            // RSA-100: a 102-bit report cutoff and YAFU-scale DLP window
-            // reduce the verified collection from 9.31M to 4.71M
-            // polynomials.  `1214 * B²` is 1.0926e16 at the 3M bound,
-            // matching the useful two-large-prime product range while the
-            // per-prime cap remains 145B.
+            313..=319 => (2_250_000, 262_144, -3, 150, true, 16),
+            // Match the high-yield geometry of the portable YAFU reference at
+            // the 320-bit crossover. Together with 1,024-polynomial packets,
+            // this retained an exact 33.11 s run versus YAFU's 33.60 s on the
+            // same 192-worker host. `873 * B²` is 6.6021e15, matching YAFU's
+            // two-large-prime product range; -21 gives the measured 100-bit
+            // report cutoff.
+            320 => (2_750_000, 491_520, -21, 130, true, 873),
+            // RSA-100 benefits from the same wider geometry as the 320-bit
+            // crossover. `1035 * B²` is 1.0932e16, matching YAFU's useful DLP
+            // window while retaining the 145B per-prime cap.
+            321..=333 => (3_250_000, 524_288, -23, 145, true, 1_035),
+            // RSA-110's smaller base/matrix wins end to end despite collecting
+            // a few seconds longer than YAFU. `1214 * B²` is 1.0926e16.
+            334..=368 => (3_000_000, 262_144, -23, 145, true, 1_214),
+            // Wider inputs remain accepted by the public 512-bit capacity
+            // contract, but RSA-110 is the highest performance-qualified
+            // balanced-semiprime tier.
             _ => (3_000_000, 262_144, -23, 145, true, 1_214),
         };
         EngineParams {
@@ -449,9 +461,13 @@ mod tests {
             (305, 1_800_000, 262_144, -3, 150, 16),
             (312, 1_800_000, 262_144, -3, 150, 16),
             (313, 2_250_000, 262_144, -3, 150, 16),
-            (320, 2_250_000, 262_144, -3, 150, 16),
-            (321, 3_000_000, 262_144, -23, 145, 1_214),
-            (333, 3_000_000, 262_144, -23, 145, 1_214),
+            (319, 2_250_000, 262_144, -3, 150, 16),
+            (320, 2_750_000, 491_520, -21, 130, 873),
+            (321, 3_250_000, 524_288, -23, 145, 1_035),
+            (333, 3_250_000, 524_288, -23, 145, 1_035),
+            (334, 3_000_000, 262_144, -23, 145, 1_214),
+            (364, 3_000_000, 262_144, -23, 145, 1_214),
+            (368, 3_000_000, 262_144, -23, 145, 1_214),
         ];
         for (bits, bound, half_width, threshold, large_prime_mult, double_mult) in expected {
             let params = engine_params(bits);

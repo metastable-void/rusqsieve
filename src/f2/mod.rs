@@ -344,13 +344,14 @@ impl SparseBinaryMatrix {
     /// the O(n³) dense step, turning the linear-algebra phase from a bottleneck
     /// into a small fraction of the run at large input sizes.
     pub fn filtered_dependencies(&self) -> Result<DependencySet, MatrixError> {
-        self.filtered_dependencies_profiled(false, false)
+        self.filtered_dependencies_profiled(false, false, 1)
     }
 
     pub(crate) fn filtered_dependencies_profiled(
         &self,
         profile: bool,
         prefer_block_lanczos: bool,
+        lanczos_threads: usize,
     ) -> Result<DependencySet, MatrixError> {
         #[cfg(not(any(unix, windows)))]
         let _ = profile;
@@ -439,7 +440,7 @@ impl SparseBinaryMatrix {
         }
         if alive_cols.len() == ncols || alive_cols.len() <= reduced_rows {
             if prefer_block_lanczos {
-                let dependencies = self.block_lanczos_dependencies(64);
+                let dependencies = self.block_lanczos_dependencies(64, lanczos_threads);
                 return (!dependencies.is_empty())
                     .then_some(dependencies)
                     .ok_or(MatrixError::LanczosFailure);
@@ -491,7 +492,7 @@ impl SparseBinaryMatrix {
         let use_m4ri =
             !use_lanczos && reduced.columns() >= M4RI_MIN_COLUMNS && m4ri_bytes <= M4RI_MAX_BYTES;
         let reduced_dependencies = if use_lanczos {
-            reduced.block_lanczos_dependencies(64)
+            reduced.block_lanczos_dependencies(64, lanczos_threads)
         } else if use_m4ri {
             reduced.m4ri_dependencies::<M4RI_PANEL>(64)
         } else {
@@ -726,7 +727,9 @@ mod tests {
             })
             .collect();
         let matrix = SparseBinaryMatrix::from_columns(rows, &columns).unwrap();
-        let dependencies = matrix.filtered_dependencies_profiled(false, true).unwrap();
+        let dependencies = matrix
+            .filtered_dependencies_profiled(false, true, 1)
+            .unwrap();
         assert!(!dependencies.is_empty());
         assert!(
             dependencies

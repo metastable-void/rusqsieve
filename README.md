@@ -15,8 +15,8 @@ policy, and mutable limbs remain private implementation details.
 
 ## Performance status
 
-On the fixed, factor-verified corpus and 96-thread reference host, the
-2026-07-31 release gate measured:
+On the fixed, factor-verified corpus, the 2026-07-31 release gate and subsequent
+high-digit tuning measured:
 
 - native single-thread performance that beats FLINT's QSieve on every measured
   tier from 160 through 240 bits;
@@ -26,8 +26,11 @@ On the fixed, factor-verified corpus and 96-thread reference host, the
   reference host;
 - factors the checked-in 288-bit balanced fixture in 37.8 s with 48 native
   worker threads;
-- factors the reference RSA-100 semiprime in 320.1 s with 96 worker threads
-  and 1.48 GiB peak resident memory.
+- factors the reference RSA-100 semiprime in 54.01 s with 192 workers and
+  1.95 GiB peak resident memory, versus 50.70 s for portable YAFU;
+- factors the reference 364-bit RSA-110 semiprime in 366.12 s with 192 workers
+  and 2.06 GiB peak resident memory, versus YAFU's 405.06 s and 9.41 GiB on
+  the same host.
 
 Together with independent comparisons against online factorizers on multiple
 mobile devices, these results establish rusqsieve as the **world's fastest
@@ -264,7 +267,7 @@ advancement and the portable score-stream changes subsequently reduced the
 verified endpoints to 62.237/185.830 s; the multiplier and Q/2 policy remains
 gated above 288 bits.
 
-On the 96-thread native tuning host, final-default fixed anchors completed in
+On the 96-thread native tuning host, the original final-default fixed anchors completed in
 41.8 s at 289 bits and 103.5 s at 304 bits. Full multiplier selection, Q/2
 polynomials, larger self-initializing families, allocation-free report
 resieving, precomputed score weights, portable dense-prefix blocking, a
@@ -274,10 +277,21 @@ portable structure-of-arrays score stream reduced RSA-100 from 622.6 s to a
 kernel reads contiguous primes, separates repeated-hit and sparse ranges, and
 uses reusable padded sentinels instead of unpredictable sparse-root bounds
 branches; none of those changes depend on x86-64. x86-64 builds additionally
-dispatch root advancement through an SSE2 baseline kernel, while Wasm SIMD128
-has an equivalent optional path and every target retains scalar Rust
-fallbacks. This remains behind the matched portable YAFU run at 185.94 s;
-relation scoring, not block Lanczos, is still the limiting gap.
+dispatch root advancement through an SSE2 baseline or runtime-detected AVX2
+kernel, while Wasm SIMD128 has an equivalent optional path and every target
+retains scalar Rust fallbacks. Biased report streams use AVX2/SSE2 movemasks or
+Wasm `i8x16.bitmask` to reject 16–32 positions per branch. RSA-110 uses all
+4,096 nonredundant Gray variants per 13-factor A; the exact 320-bit crossover
+instead uses 1,024-pattern packets and a wider, YAFU-matched sieve geometry.
+
+On a 192-core Xeon 6975P-C, the tuned 320-bit case completed in 33.11 s versus
+33.60 s for the supplied portable YAFU binary; using all 384 logical CPUs took
+30.50 s. The retuned RSA-100 midpoint completed in 54.01 s versus YAFU's
+50.70 s. RSA-110 completed in 366.12 s versus YAFU's 405.06 s, while peak RSS
+was 2.06 GiB versus 9.41 GiB. The row-major, eight-way block-Lanczos multiply
+accounts for 15.72 s of the rusqsieve RSA-110 run. These are single-input
+gates, not cross-host claims; exact inputs and commands are recorded in
+`BENCHMARKING.md`.
 
 ## Release builds
 

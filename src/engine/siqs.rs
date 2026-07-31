@@ -40,12 +40,15 @@ fn sieve_family_inner(
     let base = &ctx.base;
     let nfb = base.len();
     let s = aidx.len();
-    // A 13-prime coefficient has 4,096 sign patterns up to global negation,
-    // but 2,048-polynomial jobs give substantially better 96-way load
-    // balance in the report-heavy DLP tiers and match production SIQS family
-    // sizing. Root setup is still amortized four times better than the old
-    // 512-polynomial cap.
-    let nvar = (s - 1).min(11);
+    // A 13-prime coefficient has 4,096 sign patterns up to global negation.
+    // Near 320 bits, 1,024-pattern packets match the useful coefficient life
+    // while limiting the speculative tail of a wide native worker pool. Larger
+    // tiers amortize their O(factor-base) root/Bainv setup over longer packets.
+    let nvar = match ctx.n.bit_len() {
+        ..=320 => (s - 1).min(10),
+        321..=333 => (s - 1).min(11),
+        _ => (s - 1).min(12),
+    };
     let variants = 1u64 << nvar;
 
     // SIQS B-values: b = Σ ±Bⱼ, with Bⱼ ≡ ±sqrt(n) (mod qⱼ), 0 (mod other q).
