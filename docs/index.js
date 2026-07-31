@@ -15,8 +15,14 @@ const MAX_FAMILIES = 100_000;
 const MAX_INPUT_BITS = 512;
 const MAX_DECIMAL_DIGITS = 155;
 const BOOT_TIMEOUT_MS = 30_000;
-const JOB_TIMEOUT_MS = 120_000;
-const RUN_TIMEOUT_MS = 30 * 60_000;
+// A hard wall-clock limit rejects large inputs that are still making useful
+// progress. Only abandon a run when the whole worker pool and coordinator have
+// been silent while the page is visible. A single stuck worker may reduce
+// throughput, but the remaining workers can still complete the factorization.
+const STALL_TIMEOUT_MS = 10 * 60_000;
+// If the watchdog callback itself was delayed this much, the browser or machine
+// was suspended; that gap is not evidence that the worker runtime hung.
+const WATCHDOG_LATE_GRACE_MS = 30_000;
 
 const els = {
   input: document.getElementById("input"),
@@ -184,16 +190,53 @@ function siqsParallel(decimal, bits, report) {
     let finished = false;
     const workerBusy = new Array(workers.length).fill(false);
     const workerPrepared = new Array(workers.length).fill(false);
-    const jobTimers = new Map();
-    const runTimer = setTimeout(
-      () => fail(new Error("factorization timed out")),
-      RUN_TIMEOUT_MS,
-    );
+    let stallTimer = null;
+    let lastActivity = performance.now();
+
+    const clearStallTimer = () => {
+      if (stallTimer !== null) clearTimeout(stallTimer);
+      stallTimer = null;
+    };
+    const armStallWatchdog = () => {
+      clearStallTimer();
+      if (finished || document.hidden) return;
+      const remaining = Math.max(
+        0,
+        STALL_TIMEOUT_MS - (performance.now() - lastActivity),
+      );
+      const deadline = performance.now() + remaining;
+      stallTimer = setTimeout(() => {
+        const now = performance.now();
+        if (now - deadline > WATCHDOG_LATE_GRACE_MS) {
+          lastActivity = now;
+          armStallWatchdog();
+          return;
+        }
+        const idleMilliseconds = now - lastActivity;
+        if (!finished && !document.hidden && idleMilliseconds >= STALL_TIMEOUT_MS) {
+          fail(new Error("factorization stalled: no worker activity for 10 minutes"));
+        } else {
+          armStallWatchdog();
+        }
+      }, remaining);
+    };
+    const noteActivity = () => {
+      lastActivity = performance.now();
+      armStallWatchdog();
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        clearStallTimer();
+      } else {
+        // Browser suspension looks like a long wall-clock gap. Give workers a
+        // fresh interval after the page becomes active before declaring a hang.
+        noteActivity();
+      }
+    };
 
     const cleanup = () => {
-      clearTimeout(runTimer);
-      for (const timer of jobTimers.values()) clearTimeout(timer);
-      jobTimers.clear();
+      clearStallTimer();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       coord.onmessage = null;
       coord.onerror = null;
       coord.onmessageerror = null;
@@ -237,16 +280,9 @@ function siqsParallel(decimal, bits, report) {
       nextFamily += count;
       workerBusy[workerIndex] = true;
       activeJobs++;
-      const timer = setTimeout(
-        () => fail(new Error(`sieve worker ${workerIndex + 1} timed out`)),
-        JOB_TIMEOUT_MS,
-      );
-      jobTimers.set(workerIndex, timer);
       try {
         worker.postMessage({ cmd: "sieve", family, count, gen: myGen });
       } catch (error) {
-        clearTimeout(timer);
-        jobTimers.delete(workerIndex);
         workerBusy[workerIndex] = false;
         activeJobs--;
         fail(error);
@@ -259,8 +295,6 @@ function siqsParallel(decimal, bits, report) {
         fail(new Error(`unexpected response from idle sieve worker ${workerIndex + 1}`));
         return false;
       }
-      clearTimeout(jobTimers.get(workerIndex));
-      jobTimers.delete(workerIndex);
       workerBusy[workerIndex] = false;
       activeJobs--;
       return true;
@@ -268,6 +302,7 @@ function siqsParallel(decimal, bits, report) {
 
     coord.onmessage = ({ data }) => {
       if (data?.gen !== myGen) return;
+      noteActivity();
       if (data.type === "error") {
         fail(new Error(data.error || "coordinator failed"));
       } else if (data.type === "session") {
@@ -354,6 +389,7 @@ function siqsParallel(decimal, bits, report) {
         // Every run response, including errors, is generation-scoped. Old jobs
         // may finish after a successful factor was already returned.
         if (data?.gen !== myGen) return;
+        noteActivity();
         if (data.type === "error") {
           fail(new Error(data.error || `sieve worker ${workerIndex + 1} failed`));
           return;
@@ -402,6 +438,8 @@ function siqsParallel(decimal, bits, report) {
       w.onmessageerror = () =>
         fail(new Error(`sieve worker ${workerIndex + 1} returned an invalid message`));
     });
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    armStallWatchdog();
     try {
       coord.postMessage({ cmd: "new", n: decimal, gen: myGen });
     } catch (error) {

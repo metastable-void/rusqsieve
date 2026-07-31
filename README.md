@@ -184,11 +184,14 @@ merges families deterministically, filters the matrix, solves for dependencies,
 and extracts a verified nontrivial factor.
 
 The reference glue validates packet envelopes and relation-batch framing,
-ignores obsolete generations, bounds initialization/jobs/runs with timeouts,
+ignores obsolete generations, bounds initialization with a timeout, detects a
+stalled factorization after ten visible minutes without worker activity,
 reports relation-budget exhaustion, and rebuilds the Worker runtime after a
-failure. An extraction that finds only trivial dependencies retains its
-relations and requests a surplus before retrying. Browser input is capped at
-the same 512-bit supported limit as native entry points.
+failure. Advancing runs have no wall-clock limit, and time spent with the page
+hidden does not count as a stall. An extraction that finds only trivial
+dependencies retains its relations and requests a surplus before retrying.
+Browser input is capped at the same 512-bit supported limit as native entry
+points.
 
 Notable performance work includes:
 
