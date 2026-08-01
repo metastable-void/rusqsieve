@@ -24,6 +24,7 @@ For high-digit SIQS on native and Wasm, the initial automatic scale is:
 | 320 | 97 | 2,750,000 | 491,520 | 130 | yes |
 | 321–333 | 97–100 | 3,250,000 | 524,288 | 145 | yes |
 | 334–368 | 101–111 | 3,000,000 | 262,144 | 145 | yes |
+| 369–400 | 112–120 | 6,000,000 | 524,288 | 145 | yes |
 
 DLP products through 319 bits are capped at 12× or 16× the factor-base-bound
 square. The exact 320-bit crossover uses an 873× cap (6.6021e15), a 100-bit
@@ -31,6 +32,31 @@ report cutoff, and 1,024-polynomial family packets. The 321–333 tier uses a
 1,035× cap at B=3.25M; the 334–368 tier uses a measured 1,214× cap at B=3M.
 Both give an approximately 1.093e16 product window and a 102-bit report cutoff
 while retaining a 145B per-prime cap.
+
+**The 369–400 tier is not performance-qualified.** RSA-110 at 364 bits remains
+the highest tier with a competitive claim; 400 bits is the sieve's accepted
+range limit (`engine::MAX_SIQS_BITS`), not a speed target, and 120-digit work
+belongs to GNFS. The tier exists because the range previously inherited
+RSA-110's parameters unchanged while its residues were ~2^17 larger, which
+collapsed yield: a 384-bit balanced semiprime retained 276 relations from
+4.9M polynomials against a 108,838 relation target.
+
+Selection was measured on that 384-bit semiprime with 64 workers, 130–150 s per
+configuration, reading relations and partials per second from
+`RUSQSIEVE_PROFILE` checkpoints:
+
+| prime bound | half-width | relations/s | partials/s | relation target |
+|---:|---:|---:|---:|---:|
+| 3,000,000 | 262,144 | 1.92 | 198 | 108,838 |
+| 6,000,000 | 524,288 | 5.02 | 395 | 206,965 |
+| 9,000,000 | 524,288 | 7.04 | 476 | 301,893 |
+| 6,000,000 | 262,144 | 4.91 | 396 | 206,965 |
+
+Cycle yield grows roughly as partials² / π(large-prime bound) and supplies most
+of the late relations, so projected completion for the three fast rows lands
+within about 20% of each other; the chosen row has the smallest matrix among
+them. A large-prime multiplier sweep at 6M/524,288 over 145, 40, 12, and 4
+moved projected completion by under 15%, so the multiplier stays at 145.
 
 On the 96-thread Xeon 8259CL tuning host, fixed 289- and 304-bit balanced
 semiprimes completed in 41.8 s and 103.5 s. The original RSA-100 result was

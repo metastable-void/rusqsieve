@@ -47,13 +47,13 @@ must not be used where operand-dependent timing reveals a secret.
 Add the Rust library:
 
 ```sh
-cargo add rusqsieve@0.4.0
+cargo add rusqsieve@0.4.2
 ```
 
 Install the native CLI:
 
 ```sh
-cargo install rusqsieve --version 0.4.0
+cargo install rusqsieve --version 0.4.2
 ```
 
 Or build the optimized native library and CLI from source:

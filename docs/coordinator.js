@@ -23,7 +23,7 @@ self.onmessage = async ({ data }) => {
       if (ex) throw new Error("coordinator is already initialized");
       ex = await instantiate(data.module);
       const abi = ex.qs_abi_version();
-      if (abi !== 2) throw new Error(`unsupported rusqsieve wasm ABI ${abi}`);
+      if (abi !== 3) throw new Error(`unsupported rusqsieve wasm ABI ${abi}`);
       // Report the engine's sieve range rather than duplicating it in the UI. The main thread
       // uses it to reject an over-wide composite with a specific message before spinning up a
       // run that `qs_coord_new` would refuse anyway.

@@ -79,6 +79,12 @@ const char *rusqsieve_factors_get(
  * threads == 0 uses available parallelism capped at 48. A nonzero value is
  * capped at 256; the engine may cap smaller inputs further.
  *
+ * The width of n is not itself limited: small factors are removed by trial
+ * division, perfect-power detection, and Pollard-Brent, none of which is width
+ * gated. RUSQSIEVE_INPUT_OUT_OF_RANGE is returned when n exceeds the library's
+ * integer capacity, or when a composite wider than the quadratic sieve's
+ * 400-bit range survives those stages and would have to be sieved.
+ *
  * On success, factors is replaced with the complete sorted factorization.
  * Prime factors are repeated according to multiplicity; n == "1" succeeds
  * with rusqsieve_factors_len(factors) == 0. On failure, factors is left empty.

@@ -1,7 +1,7 @@
 # rusqsieve 0.4 implementation specification
 
 This document specifies the supported behavior and current architecture of
-rusqsieve 0.4, release-verified on 2026-07-31. It describes the implementation
+rusqsieve 0.4, release-verified on 2026-08-01. It describes the implementation
 that is shipped, not an aspirational module layout or a compatibility promise
 for private internals.
 
@@ -189,7 +189,14 @@ Observable behavior:
 - multiplicities are preserved;
 - every returned factor has passed the implementation's probable-prime test;
 - the result can verify its product against the original input;
-- callback cancellation returns `FactorError::Cancelled`.
+- callback cancellation returns `FactorError::Cancelled`;
+- input width alone never causes rejection; only a composite that reaches the
+  quadratic sieve is range limited, returning
+  `FactorError::SiqsCompositeTooLarge`;
+- sieving that spends its family budget short of the relation target returns
+  `FactorError::InsufficientRelations`, and linear algebra that finds no
+  nontrivial dependency returns `FactorError::NoDependency`; neither is
+  reported as `FactorError::ResourceLimit`.
 
 The no-observer path must remain separately monomorphized so progress timing and
 callback machinery are compiled out of ordinary `factor` and `factor_with`
@@ -586,6 +593,7 @@ The browser frontend relies on:
 
 ```text
 qs_abi_version
+qs_max_siqs_bits
 qs_alloc
 qs_dealloc
 qs_buffer_pointer
@@ -598,11 +606,17 @@ qs_worker_free
 
 qs_coord_new
 qs_coord_target
+qs_coord_family_budget
 qs_coord_relations
 qs_coord_submit
 qs_coord_extract
 qs_coord_free
 ```
+
+The Wasm ABI version is 3. `qs_max_siqs_bits` and `qs_coord_family_budget` were
+added in that revision, and the reference glue depends on both rather than
+duplicating the values, so a version-2 module paired with current glue is
+rejected at initialization instead of faulting on a missing export.
 
 Handles contain a 16-bit slot and 16-bit generation. Generation checks reject
 ordinary stale-handle reuse; a slot can alias an ancient handle after 65,535
@@ -804,6 +818,16 @@ are:
 - no ECM for medium factors in unbalanced composites;
 - high-digit SIQS tiers still need multi-input wall-time sweeps on representative
   native hosts;
+- the 369..=400-bit tier is a single-input yield measurement, not a qualified
+  wall-time result. It exists so the range makes steady, reportable progress up
+  to the sieve's accepted limit; RSA-110 at 364 bits remains the highest tier
+  with a competitive claim;
+- retained partials are not memory-bounded. Each holds a fixed-width root and a
+  power list, so a run that sieves long enough for the large-prime graph to
+  percolate at the highest tiers can reach multiple gigabytes of resident
+  partials. The scaled family budget makes such runs reachable where the former
+  flat cap ended them early. There is no accounting that would let the engine
+  report `FactorError::ResourceLimit` before the allocator fails;
 - cache-blocked/bucket tuning still needs representative small-L2 mobile
   measurements;
 - parameter tables need multi-input rather than single-sample sweeps at every

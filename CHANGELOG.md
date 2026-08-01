@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.2 — Unreleased
+## 0.4.2 — 2026-08-01
 
 - Fixed exhausted sieving being reported as a memory limit. The native
   scheduler exited its family loop without checking whether the relation target
@@ -39,6 +39,18 @@
   `browser-arch-check` now read the budget from the session
   (`qs_coord_family_budget`) and the sieve limit from the runtime
   (`qs_max_siqs_bits`) rather than hard-coding either.
+- Raised the Wasm ABI to version 3 for those two new exports. The glue depends
+  on them rather than duplicating the values, so a version-2 module paired with
+  current glue is now rejected at initialization instead of faulting on a
+  missing export. The native C ABI is unchanged at version 2: no function was
+  added or removed, though `RUSQSIEVE_INPUT_OUT_OF_RANGE` now reflects the
+  composite-based range rule and no longer fires on input width alone.
+- `make docs-verify` now checks that every `ex.qs_*` export the published glue
+  calls exists in `docs/rusqsieve.wasm` and `docs/rusqsieve-simd.wasm`. The
+  previous check only resolved file references, so a `docs/` tree carrying wasm
+  older than its JavaScript passed while the deployed demo failed at
+  coordinator initialization — which is exactly what this release would have
+  shipped.
 
 ## 0.4.1 — 2026-08-01
 

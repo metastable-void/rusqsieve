@@ -144,7 +144,7 @@ function waitForWorkerReady(worker, module, requireAbi, signal) {
       if (data?.type === "error") {
         finish(new Error(data.error || "worker initialization failed"));
       } else if (data?.type === "ready") {
-        if (requireAbi && data.abi !== 2) {
+        if (requireAbi && data.abi !== 3) {
           finish(new Error(`unsupported rusqsieve wasm ABI ${String(data.abi)}`));
         } else {
           finish(null, data);

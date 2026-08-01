@@ -4,7 +4,11 @@ use crate::{Natural, PARTS};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
 
-const ABI_VERSION: u32 = 2;
+// 3 adds `qs_max_siqs_bits` and `qs_coord_family_budget`. The glue does not merely tolerate these
+// — it reads the sieve range and the family budget from them instead of hard-coding either — so a
+// v2 module paired with current glue would fault on a missing export rather than degrade. The
+// version guard has to reject that pairing.
+const ABI_VERSION: u32 = 3;
 const MAX_PACKET: usize = 16 * 1024 * 1024;
 type WasmNatural = Natural;
 struct Slot<T> {

@@ -69,8 +69,16 @@ docs-verify:
 			fi; \
 		done; \
 	done; \
+	for wasm in $(DOCS)/rusqsieve.wasm $(DOCS)/rusqsieve-simd.wasm; do \
+		for sym in $$(grep -ohE '\bex\.qs_[A-Za-z0-9_]+' $(DOCS)/*.js | cut -d. -f2 | sort -u); do \
+			if ! grep -qa "$$sym" "$$wasm"; then \
+				echo "$$wasm has no export $$sym; docs/ predates the glue (run: make docs)"; \
+				missing=1; \
+			fi; \
+		done; \
+	done; \
 	if [ $$missing -ne 0 ]; then echo "docs/ is incomplete"; exit 1; fi; \
-	echo "docs/: all $$(ls $(DOCS) | wc -l | tr -d ' ') files present, every reference resolves."
+	echo "docs/: all $$(ls $(DOCS) | wc -l | tr -d ' ') files present, every reference and wasm export resolves."
 
 docs: $(DOCS_FILES) docs-verify
 	@echo "docs/ ready for GitHub Pages (scalar $$(ls -lh $(DOCS)/rusqsieve.wasm | awk '{print $$5}'), SIMD $$(ls -lh $(DOCS)/rusqsieve-simd.wasm | awk '{print $$5}'))."
