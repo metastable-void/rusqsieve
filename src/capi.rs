@@ -19,7 +19,8 @@ pub enum RusqsieveStatus {
     InvalidArgument = 1,
     /// The input was not an unsigned decimal integer.
     InvalidDecimal = 2,
-    /// The input was zero, exceeded capacity, or exceeded the 512-bit SIQS range.
+    /// The input was zero, exceeded capacity, or required the quadratic sieve on a composite
+    /// wider than its supported range. Input width alone does not produce this status.
     InputOutOfRange = 3,
     /// No complete factorization was found.
     FactorizationFailed = 4,
@@ -266,7 +267,7 @@ fn factor_impl(
         #[allow(unreachable_patterns)]
         _ => RusqsieveStatus::InvalidDecimal,
     })?;
-    if n.is_zero() || n.bit_len() > 512 {
+    if n.is_zero() {
         return Err(RusqsieveStatus::InputOutOfRange);
     }
 
@@ -281,6 +282,9 @@ fn factor_impl(
     let config = FactorConfig::default().with_parallelism(parallelism);
     let result = factor_with_progress(n, config, observer).map_err(|error| match error {
         FactorError::Cancelled => RusqsieveStatus::Cancelled,
+        FactorError::SiqsCompositeTooLarge(_)
+        | FactorError::InputTooLarge
+        | FactorError::CapacityExceeded => RusqsieveStatus::InputOutOfRange,
         _ => RusqsieveStatus::FactorizationFailed,
     })?;
 

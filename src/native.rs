@@ -77,9 +77,9 @@ where
     if input.is_zero() {
         return Err(FactorError::ZeroHasNoPrimeFactorization);
     }
-    if input.bit_len() > 512 {
-        return Err(FactorError::InputTooLarge);
-    }
+    // No blanket width cap. The sieve's range limit is enforced against the composite that
+    // actually reaches it (see `engine::MAX_SIQS_BITS`), so a wide input built from small factors
+    // still factors; only a wide *hard* cofactor is refused. Capacity is the sole limit here.
     let mut bytes = vec![0u8; P * 8];
     let written = input
         .write_le_bytes(&mut bytes)
@@ -163,7 +163,11 @@ where
         crate::engine::EngineError::ResourceLimit => {
             FactorError::ResourceLimit(crate::ResourceLimitKind::Memory)
         }
+        crate::engine::EngineError::SiqsInputTooLarge(bits) => {
+            FactorError::SiqsCompositeTooLarge(bits)
+        }
         crate::engine::EngineError::InsufficientRelations => FactorError::InsufficientRelations,
+        crate::engine::EngineError::NoDependency => FactorError::NoDependency,
         crate::engine::EngineError::PolynomialSelection(message) => {
             FactorError::PolynomialSelection(message)
         }

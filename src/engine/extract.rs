@@ -18,9 +18,18 @@ pub(super) fn extract(ctx: &Context, columns: &[Column]) -> Result<Natural, Engi
         .collect();
     let matrix = SparseBinaryMatrix::from_columns(ctx.base.len() + 1, &matrix_cols)
         .map_err(|_| EngineError::InvalidDependency)?;
+    // Preserve what the solver actually reported. Collapsing every variant into `ResourceLimit`
+    // made a rank-deficient matrix — the ordinary consequence of too few relations — surface as
+    // "resource limit exceeded: Memory" on machines with gigabytes to spare.
     let dependencies = matrix
         .filtered_dependencies_profiled(ctx.profile, ctx.use_block_lanczos, ctx.la_threads)
-        .map_err(|_| EngineError::ResourceLimit)?;
+        .map_err(|error| match error {
+            MatrixError::ResourceLimit => EngineError::ResourceLimit,
+            MatrixError::NoDependencies => EngineError::NoDependency,
+            MatrixError::DimensionOverflow
+            | MatrixError::IndexOutOfRange
+            | MatrixError::MalformedOffsets => EngineError::InvalidDependency,
+        })?;
     for dep in dependencies.iter() {
         if !matrix.verify_dependency(dep) {
             return Err(EngineError::InvalidDependency);

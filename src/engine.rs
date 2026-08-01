@@ -15,7 +15,7 @@ mod root_wasm;
 mod siqs;
 mod wire;
 
-use crate::f2::SparseBinaryMatrix;
+use crate::f2::{MatrixError, SparseBinaryMatrix};
 use crate::factor::FactorTuning;
 #[cfg(any(unix, windows))]
 use crate::natural::MontgomeryContext;
@@ -53,8 +53,13 @@ pub struct EngineProgress {
 #[derive(Debug)]
 pub enum EngineError {
     Setup(String),
+    /// The composite handed to SIQS is wider than [`MAX_SIQS_BITS`].
+    SiqsInputTooLarge(usize),
     InsufficientRelations,
     NoFactor,
+    /// The filtered matrix admitted no nontrivial dependency. Distinct from [`Self::NoFactor`],
+    /// which means dependencies existed but every one produced a trivial gcd.
+    NoDependency,
     Worker(String),
     PolynomialSelection(String),
     InvalidDependency,
@@ -321,12 +326,36 @@ pub(crate) mod stage_counts {
     }
 }
 
+/// Widest composite this engine will attempt with SIQS.
+///
+/// 400 bits is a little over 120 decimal digits, which is the practical edge of the quadratic
+/// sieve: past it GNFS wins by margins no amount of sieve tuning recovers. The cap is deliberately
+/// applied to the composite *handed to SIQS*, not to the caller's input, so an arbitrarily wide
+/// number whose factors are small still factors normally — only the hard cofactor is bounded.
+pub const MAX_SIQS_BITS: usize = 400;
+
 /// Polynomial families any one scheduler will issue before giving up.
 ///
 /// Both the native thread scheduler and [`EngineSession`] use this single bound; v0.2.0 had two
 /// uncoordinated 100 000 caps for the same job. Reaching it means the relation target was not met
 /// and surfaces as [`EngineError::InsufficientRelations`] rather than a silent wrong answer.
-const MAX_FAMILIES: u64 = 100_000;
+///
+/// The budget has to scale with input width. Relations arrive at a roughly constant rate per
+/// family, but the *target* grows with the factor base and most of the late yield comes from
+/// large-prime cycles, whose count grows superlinearly and therefore only pays off deep into a
+/// run. A flat 100 000 was sized for the ≤288-bit tiers and silently truncated everything above
+/// it: a 399-bit composite exhausted the whole budget at 13% of its relation target. Measured on
+/// a 384-bit semiprime at the 369..=400 tier, a complete run needs on the order of 30 000
+/// families; the tiers below leave roughly an order of magnitude of headroom over that.
+const fn family_budget(bits: usize) -> u64 {
+    match bits {
+        // Performance-qualified browser and native tiers. Unchanged: every one of these reaches
+        // its target in far fewer families, so raising the ceiling would only mask a regression.
+        ..=288 => 100_000,
+        289..=368 => 250_000,
+        _ => 750_000,
+    }
+}
 
 /// Prepare an immutable context without creating threads.
 pub fn prepare(n: Natural, tuning: &FactorTuning) -> Result<EngineContext, EngineError> {
@@ -339,6 +368,12 @@ fn prepare_with_la_threads(
     la_threads: usize,
 ) -> Result<EngineContext, EngineError> {
     let input_bits = n.bit_len();
+    // Refuse the job here rather than at the caller's input width: this is the one choke point
+    // every scheduler (native, WASM coordinator, WASM worker) passes through, and it sees the
+    // composite that actually reaches the sieve rather than whatever the caller started with.
+    if input_bits > MAX_SIQS_BITS {
+        return Err(EngineError::SiqsInputTooLarge(input_bits));
+    }
     let mut p = crate::qs::parameters::engine_params(input_bits);
     if let Some(bound) = tuning.factor_base_bound {
         p.factor_base_bound = bound;
@@ -498,6 +533,7 @@ pub fn execute(context: &EngineContext, job: EngineJob) -> EngineJobResult {
 pub struct EngineSession {
     context: EngineContext,
     target: usize,
+    budget: u64,
     next_job: u64,
     next_merge: u64,
     polynomials: u64,
@@ -508,9 +544,11 @@ pub struct EngineSession {
 impl EngineSession {
     pub fn new(context: EngineContext) -> Self {
         let target = relation_target(context.0.base.len(), context.0.relation_percent);
+        let budget = family_budget(context.0.n.bit_len());
         Self {
             context,
             target,
+            budget,
             next_job: 0,
             next_merge: 0,
             polynomials: 0,
@@ -518,6 +556,16 @@ impl EngineSession {
             buffered: BTreeMap::new(),
             seen_a: HashSet::new(),
         }
+    }
+    /// Polynomial families this session will issue in total. Schedulers that assign family
+    /// numbers themselves (the WASM coordinator) must not issue beyond this.
+    pub fn family_budget(&self) -> u64 {
+        self.budget
+    }
+    /// Whether every family has been issued without reaching the relation target. A caller that
+    /// sees this should report exhaustion rather than attempt extraction.
+    pub fn budget_exhausted(&self) -> bool {
+        self.next_job >= self.budget && !self.is_ready()
     }
     /// Hand out up to `maximum` polynomial families to sieve.
     ///
@@ -530,7 +578,7 @@ impl EngineSession {
             return Vec::new();
         }
         let mut jobs = Vec::with_capacity(maximum);
-        while jobs.len() < maximum && self.next_job < MAX_FAMILIES {
+        while jobs.len() < maximum && self.next_job < self.budget {
             jobs.push(EngineJob {
                 family: self.next_job,
             });
@@ -589,6 +637,12 @@ impl EngineSession {
         self.polynomials
     }
     pub fn extract_factor(&self) -> Result<Natural, EngineError> {
+        // Running the linear algebra on a matrix with far fewer columns than factor-base rows
+        // cannot produce a dependency, and the failure it does produce says nothing useful about
+        // why. Report the real condition instead.
+        if !self.is_ready() {
+            return Err(EngineError::InsufficientRelations);
+        }
         extract::extract(&self.context.0, &self.collector.columns)
     }
 }
@@ -761,6 +815,7 @@ fn find_factor(
     let t_fb = std::time::Instant::now();
     let ctx = prepare_with_la_threads(n.clone(), tuning, threads)?.0;
     let target = relation_target(ctx.base.len(), ctx.relation_percent);
+    let budget = family_budget(n.bit_len());
     if prof {
         let (score_cutoff, score_bias, exact_scores) = siqs::choose_a(&ctx, 0)
             .map(|(a, _)| {
@@ -848,7 +903,7 @@ fn find_factor(
     let mut timing = [0u64; 4];
     let mut seen_a = HashSet::new();
     let mut cancelled = false;
-    while collector.columns.len() < target && completed < MAX_FAMILIES && !cancelled {
+    while collector.columns.len() < target && completed < budget && !cancelled {
         let r = res_rx
             .recv()
             .map_err(|_| EngineError::Worker("worker result channel disconnected".into()))?;
@@ -914,10 +969,7 @@ fn find_factor(
             // useless full-family tail before linear algebra can start.
             cancellation.store(true, AtomicOrdering::Relaxed);
         }
-        while outstanding < threads * 2
-            && next_send < MAX_FAMILIES
-            && collector.columns.len() < target
-        {
+        while outstanding < threads * 2 && next_send < budget && collector.columns.len() < target {
             job_tx
                 .send(Some(next_send))
                 .map_err(|_| EngineError::Worker("worker job channel disconnected".into()))?;
@@ -948,6 +1000,19 @@ fn find_factor(
     }
     if cancelled {
         return Err(EngineError::Cancelled);
+    }
+    // The loop above exits on one of three conditions, and only one of them means success. Without
+    // this check, an exhausted family budget fell through into the linear algebra with a matrix
+    // far too narrow to admit a dependency, and the resulting solver failure was reported as a
+    // memory limit — an error that described neither the cause nor the remedy.
+    if collector.columns.len() < target {
+        if prof {
+            eprintln!(
+                "PROFILE budget_exhausted families={completed} relations={} target={target}",
+                collector.columns.len()
+            );
+        }
+        return Err(EngineError::InsufficientRelations);
     }
     if prof {
         eprintln!(
@@ -2353,6 +2418,77 @@ fn knuth_schroeppel(n: &Natural) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sieve range is enforced at `prepare`, the one point every scheduler passes through, and
+    /// it is enforced on the composite rather than on anything the caller started with.
+    #[test]
+    fn prepare_rejects_composites_above_the_siqs_ceiling() {
+        // 401 bits: one over the line, and a genuine semiprime so nothing else can reject it.
+        let wide = Natural::from_decimal(
+            "3872498856681097288856216400786342693014438579089271057383667301012033\
+             051304191351486034920193821931899864729911531368699",
+        )
+        .expect("401-bit test value");
+        assert_eq!(wide.bit_len(), 401);
+        assert!(matches!(
+            prepare(wide, &FactorTuning::default()),
+            Err(EngineError::SiqsInputTooLarge(401))
+        ));
+
+        // Directly below the ceiling the same call must build a real sieve, so the bound is a
+        // boundary rather than a blanket refusal of large work.
+        let inside = Natural::from_decimal(
+            "2088215395251987988508198170866285429326513389712811066669121976156893\
+             154145354354068456327350848764053227833851662160699",
+        )
+        .expect("400-bit test value");
+        assert_eq!(inside.bit_len(), 400);
+        assert!(prepare(inside, &FactorTuning::default()).is_ok());
+    }
+
+    /// Extraction below the relation target is not a solver failure, and must not be reported as
+    /// one. This is the session-side half of the fix; the native scheduler stops before its own
+    /// `extract` call for the same reason.
+    #[test]
+    fn session_extraction_below_target_reports_insufficient_relations() {
+        let p = Natural::from_u64(21_293_688_545_713_669);
+        let q = Natural::from_u64(31_385_813_854_515_511);
+        let context = prepare(p.checked_mul(&q).unwrap(), &FactorTuning::default()).unwrap();
+        let session = EngineSession::new(context);
+        assert!(session.target() > 0);
+        assert_eq!(session.relations(), 0);
+        assert!(!session.is_ready());
+        // Not yet exhausted: no family has been issued, so there is budget left to spend.
+        assert!(!session.budget_exhausted());
+        assert!(session.family_budget() >= 100_000);
+        assert!(matches!(
+            session.extract_factor(),
+            Err(EngineError::InsufficientRelations)
+        ));
+    }
+
+    /// Pollard-Brent is deliberately outside the sieve's range limit: it is how a wide input made
+    /// of small factors gets peeled at all. Sizing its budget must therefore stay defined — and
+    /// nonzero — for widths the sieve itself refuses.
+    #[test]
+    fn rho_budget_is_defined_above_the_siqs_ceiling() {
+        for bits in [MAX_SIQS_BITS + 1, 512, 1024] {
+            assert!(rho_budget(bits) >= 1_024, "{bits}-bit rho budget");
+        }
+    }
+
+    /// The family budget exists to stop a run that cannot finish, not to truncate one that can.
+    /// It must never shrink as inputs get harder.
+    #[test]
+    fn family_budget_is_monotonic_in_input_width() {
+        let mut previous = 0;
+        for bits in [128, 256, 288, 289, 320, 368, 369, 400] {
+            let budget = family_budget(bits);
+            assert!(budget >= previous, "{bits}-bit budget regressed");
+            previous = budget;
+        }
+        assert!(family_budget(MAX_SIQS_BITS) > family_budget(288));
+    }
 
     /// `find_factor` used to carry its own copy of the whole of `prepare`, and the two copies had
     /// already diverged on this one expression: `prepare` translated sieve roots by

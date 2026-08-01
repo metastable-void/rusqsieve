@@ -251,11 +251,14 @@ to abandon queued work, joins them, and returns `FactorError::Cancelled`.
 unsigned integer containing `P` little-endian `u64` limbs.
 
 The default capacity is fixed at `Natural<16>` / 1024 bits. Blocking
-factorization consistently rejects values wider than 512 bits, independent of
-the const-generic storage width selected by the caller.
+factorization accepts any value within the caller's const-generic storage
+width; input width alone is never a rejection reason.
 
-This is a storage limit, not a practical factorization claim. NFS is appropriate
-for hard composites substantially beyond this project's SIQS range.
+The range limit applies to the composite handed to the quadratic sieve, which
+is capped at 400 bits. Stages that precede the sieve — trial division, the
+primality test, perfect-power detection, and Pollard–Brent — are not width
+limited, so a wide input whose factors are small is ordinary work. NFS is
+appropriate for hard composites beyond this project's SIQS range.
 
 Public behavior:
 
@@ -298,10 +301,21 @@ The optimized blocking engine performs:
 7. recursively factor divisor and cofactor;
 8. sort the complete factor list.
 
-The high-level API accepts any `Natural<P>` whose value is at most 512
-significant bits and converts it into the fixed optimized engine width without
-changing the value. Larger values return `FactorError::InputTooLarge`; there is
-no private slow fallback.
+The high-level API accepts any `Natural<P>` that fits the engine's fixed
+optimized width and converts it without changing the value; a value beyond that
+capacity returns `FactorError::InputTooLarge`. There is no private slow
+fallback.
+
+Step 6 is the only width-limited stage. A composite wider than 400 bits reaching
+it returns `FactorError::SiqsCompositeTooLarge(bits)`, where `bits` is the
+composite's width, not the caller's input. Steps 1–5 run regardless of input
+width, so a wide input with small factors completes through them.
+
+Sieving that spends its whole polynomial-family budget without reaching the
+relation target returns `FactorError::InsufficientRelations`. The budget scales
+with input width. Linear algebra that finds no nontrivial dependency in a matrix
+that did meet its target returns `FactorError::NoDependency`. Neither is
+reported as a resource limit.
 
 Polynomial-family selection is deterministic for a fixed version, input, and
 configuration. Portable/browser sessions merge results by family number.
@@ -551,12 +565,15 @@ JavaScript performs inexpensive recursive preprocessing with `BigInt`: trial
 division, Miller–Rabin, perfect powers, and bounded Pollard–Brent. Hard
 composites are sent to the Wasm SIQS coordinator.
 
-The reference frontend enforces the same 512-bit input ceiling as the native
-entry points. Per-run messages, including errors, are generation-scoped.
-Worker initialization, individual sieve jobs, and complete runs are bounded by
-timeouts; a failed run terminates and rebuilds the Worker runtime. The browser
-scheduler issues at most the engine's 100,000-family budget and reports
-exhaustion once no jobs or submissions remain. If the first dependency set
+The reference frontend applies the engine's 400-bit sieve limit to the composite
+it sends the coordinator, not to the number the user typed, and reads that limit
+from the runtime (`qs_max_siqs_bits`) rather than duplicating it. Per-run
+messages, including errors, are generation-scoped. Worker initialization,
+individual sieve jobs, and complete runs are bounded by timeouts; a failed run
+terminates and rebuilds the Worker runtime. The browser scheduler reads the
+engine's family budget from its session (`qs_coord_family_budget`), issues at
+most that many families, and reports exhaustion once no jobs or submissions
+remain. If the first dependency set
 yields no nontrivial factor, the coordinator retains its session, requests a
 relation surplus, and retries instead of discarding collected work.
 

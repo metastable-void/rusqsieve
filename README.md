@@ -95,11 +95,18 @@ Use `factor` for defaults, `factor_with` for configuration, or
 cancellation. The ordinary no-observer path is separately monomorphized so
 callback and progress-clock machinery is compiled out.
 
-The default `Natural` has a fixed 1024-bit storage capacity. The factorization
-entry points consistently accept values through 512 bits; this is not a claim
-that hard 512-bit semiprimes are practical, and NFS is the appropriate
-algorithm at that scale. Arithmetic operators on `Natural` wrap at capacity,
-while `checked_*` methods report overflow.
+The default `Natural` has a fixed 1024-bit storage capacity, and the
+factorization entry points accept any value that fits it. Input width is not
+itself a limit: small factors are removed by trial division, perfect-power
+detection, and Pollard–Brent, none of which is width-gated, so a very wide
+number built from small factors factors normally.
+
+The limit applies to the *composite that reaches the quadratic sieve*, which is
+capped at 400 bits — a little over 120 decimal digits, roughly where GNFS
+overtakes SIQS by margins no sieve tuning recovers. A composite above that
+returns `FactorError::SiqsCompositeTooLarge`, carrying the composite's bit
+length rather than the caller's. Arithmetic operators on `Natural` wrap at
+capacity, while `checked_*` methods report overflow.
 
 All supported public items are covered by rustdoc, enforced with
 `deny(missing_docs)`. The complete 0.4 contract and implementation architecture
@@ -192,9 +199,11 @@ stalled factorization after ten visible minutes without worker activity,
 reports relation-budget exhaustion, and rebuilds the Worker runtime after a
 failure. Advancing runs have no wall-clock limit, and time spent with the page
 hidden does not count as a stall. An extraction that finds only trivial
-dependencies retains its relations and requests a surplus before retrying.
-Browser input is capped at the same 512-bit supported limit as native entry
-points.
+dependencies retains its relations and requests a surplus before retrying. The
+browser peels small factors on the main thread and applies the same 400-bit
+sieve limit as native entry points to the composite it hands the coordinator;
+the scheduler reads its family budget from the session rather than assuming a
+constant, so it cannot stop a large run before the engine would.
 
 Notable performance work includes:
 

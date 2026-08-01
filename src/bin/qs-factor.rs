@@ -48,12 +48,10 @@ fn run() -> Result<(), String> {
     if natural.is_one() {
         return Ok(());
     }
-    if natural.bit_len() > 512 {
-        return Err(format!(
-            "input is {} bits; qs-factor's SIQS engine supports at most 512 bits",
-            natural.bit_len()
-        ));
-    }
+    // Width alone is not a reason to refuse: the engine peels small factors first and only the
+    // composite that reaches the quadratic sieve is range-limited. A wide input made of small
+    // factors is ordinary work; a wide hard semiprime is rejected by the engine with a message
+    // naming the composite's bit length.
 
     let show_progress = options.progress == ProgressMode::Always
         || options.progress == ProgressMode::Auto && io::stderr().is_terminal();

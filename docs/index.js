@@ -9,11 +9,19 @@ const SCALAR_WASM_URL = new URL("./rusqsieve.wasm", import.meta.url);
 // Small jobs reduce the tail after the relation target is reached. Two
 // families was consistently best in Node/V8 from 192 through 256 bits.
 const BATCH = 2;
-// Keep the browser scheduler on the engine's bounded family domain. The last
-// issued family is MAX_FAMILIES - 1.
-const MAX_FAMILIES = 100_000;
-const MAX_INPUT_BITS = 512;
-const MAX_DECIMAL_DIGITS = 155;
+// The engine's family budget scales with input width, so it is read per session from the
+// coordinator (`qs_coord_family_budget`) rather than hard-coded here. A stale constant would
+// either stop a large run early or issue families the engine has already stopped accepting.
+//
+// Input width alone no longer limits a run: the number is peeled with BigInt trial division,
+// perfect-power detection, and Pollard-Brent first, and only the hard composite that survives is
+// range-limited. These two bound what `Natural` can hold (PARTS = 16, so 1024 bits); the sieve's
+// own ceiling arrives from the coordinator as `maxSiqsBits`.
+const MAX_INPUT_BITS = 1024;
+const MAX_DECIMAL_DIGITS = 309;
+// Set from the coordinator's ready message; the fallback matches `engine::MAX_SIQS_BITS` and is
+// only used if a runtime somehow reports nothing.
+let maxSiqsBits = 400;
 const BOOT_TIMEOUT_MS = 30_000;
 // A hard wall-clock limit rejects large inputs that are still making useful
 // progress. Only abandon a run when the whole worker pool and coordinator have
@@ -79,6 +87,11 @@ async function boot() {
     coord = nextCoord;
     workers = nextWorkers;
     runtimeReady = true;
+    // Take the sieve's range from the engine that will actually run, so the UI limit and the
+    // coordinator's own check can never drift apart across a rebuild.
+    if (Number.isInteger(coordinatorReady.maxSiqsBits) && coordinatorReady.maxSiqsBits > 0) {
+      maxSiqsBits = coordinatorReady.maxSiqsBits;
+    }
     els.workers.textContent =
       `${nWorkers} worker${nWorkers === 1 ? "" : "s"} · ${wasmFlavor} · ` +
       `ABI v${coordinatorReady.abi}`;
@@ -184,6 +197,7 @@ function siqsParallel(decimal, bits, report) {
     let target = 0;
     let relations = 0;
     let nextFamily = 0;
+    let familyBudget = 0;
     let activeJobs = 0;
     let pendingSubmissions = 0;
     let preparedWorkers = 0;
@@ -261,22 +275,28 @@ function siqsParallel(decimal, bits, report) {
     const maybeExhausted = () => {
       if (
         !finished &&
-        nextFamily >= MAX_FAMILIES &&
+        familyBudget > 0 &&
+        nextFamily >= familyBudget &&
         activeJobs === 0 &&
         pendingSubmissions === 0 &&
         preparedWorkers === workers.length
       ) {
-        fail(new Error(`relation budget exhausted after ${MAX_FAMILIES} families`));
+        fail(
+          new Error(
+            `relation budget exhausted after ${familyBudget} families ` +
+              `(${relations}/${target} relations)`,
+          ),
+        );
       }
     };
     const dispatch = (worker, workerIndex) => {
       if (finished || workerBusy[workerIndex]) return false;
-      if (nextFamily >= MAX_FAMILIES) {
+      if (familyBudget <= 0 || nextFamily >= familyBudget) {
         maybeExhausted();
         return false;
       }
       const family = nextFamily;
-      const count = Math.min(BATCH, MAX_FAMILIES - nextFamily);
+      const count = Math.min(BATCH, familyBudget - nextFamily);
       nextFamily += count;
       workerBusy[workerIndex] = true;
       activeJobs++;
@@ -310,7 +330,12 @@ function siqsParallel(decimal, bits, report) {
           fail(new Error("coordinator returned an invalid relation target"));
           return;
         }
+        if (!Number.isInteger(data.familyBudget) || data.familyBudget <= 0) {
+          fail(new Error("coordinator returned an invalid family budget"));
+          return;
+        }
         target = data.target;
+        familyBudget = data.familyBudget;
         try {
           for (const w of workers) {
             w.postMessage({ cmd: "prepare", n: decimal, gen: myGen });
@@ -482,7 +507,18 @@ async function factorize(N, report) {
       stack.push(d, c / d);
       continue;
     }
-    const factor = await siqsParallel(c.toString(), bitLength(c), report);
+    // Everything cheap has been tried and `c` is a hard composite. This is the only place a width
+    // limit applies: trial division, the primality test, perfect powers, and Pollard-Brent above
+    // all ran without one, so a wide number built from small factors never reaches here.
+    const compositeBits = bitLength(c);
+    if (compositeBits > maxSiqsBits) {
+      throw new Error(
+        `this number needs the quadratic sieve on a ${compositeBits}-bit composite, ` +
+          `above the ${maxSiqsBits}-bit limit — numbers of any size still factor when ` +
+          `their factors are small`,
+      );
+    }
+    const factor = await siqsParallel(c.toString(), compositeBits, report);
     if (factor <= 1n || factor >= c || c % factor !== 0n) {
       throw new Error("quadratic sieve returned an invalid factor");
     }

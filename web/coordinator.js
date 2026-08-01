@@ -24,7 +24,10 @@ self.onmessage = async ({ data }) => {
       ex = await instantiate(data.module);
       const abi = ex.qs_abi_version();
       if (abi !== 2) throw new Error(`unsupported rusqsieve wasm ABI ${abi}`);
-      self.postMessage({ type: "ready", abi });
+      // Report the engine's sieve range rather than duplicating it in the UI. The main thread
+      // uses it to reject an over-wide composite with a specific message before spinning up a
+      // run that `qs_coord_new` would refuse anyway.
+      self.postMessage({ type: "ready", abi, maxSiqsBits: ex.qs_max_siqs_bits() });
       return;
     }
     if (data.cmd === "new") {
@@ -53,6 +56,9 @@ self.onmessage = async ({ data }) => {
         type: "session",
         gen: generation,
         target: extractionTarget,
+        // The family budget scales with input width, so the scheduler on the main thread has to
+        // read it from the session it is actually driving instead of assuming a constant.
+        familyBudget: ex.qs_coord_family_budget(session),
       });
       return;
     }

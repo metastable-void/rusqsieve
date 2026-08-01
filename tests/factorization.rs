@@ -79,6 +79,92 @@ fn perfect_power_and_recursive_multifactor_inputs() {
     assert_eq!(factors.multiplicity(&odd).unwrap().get(), 1);
 }
 
+/// Width alone must not disqualify an input. Everything here is far wider than the quadratic
+/// sieve's 400-bit range, and every one of them factors completely, because the factors are
+/// reachable by trial division and Pollard-Brent and the sieve is never consulted.
+///
+/// The engine used to reject anything over 512 bits up front, on the caller's input width, which
+/// refused work it could do trivially. The range limit now applies only to a composite that
+/// actually reaches SIQS.
+#[test]
+fn wide_inputs_with_rho_reachable_factors_factor_completely() {
+    // 506 bits, thirty-two distinct 16-bit primes. Sized so the whole ladder stays in Pollard-
+    // Brent's reach: `rho_budget` shrinks with the cofactor, and factors much larger than this
+    // outrun it partway down and fall through to the sieve. Verified to enter SIQS zero times.
+    let expected: [&str; 32] = [
+        "50119", "50231", "51239", "52121", "52223", "52837", "52967", "53527", "53549", "53591",
+        "53917", "54331", "54347", "55001", "55291", "55763", "55787", "55949", "56359", "57587",
+        "57689", "58897", "59183", "60427", "61561", "61717", "62653", "64591", "64747", "64877",
+        "65011", "65371",
+    ];
+    let input = Natural::<16>::from_decimal(
+        "1376775833903088655333039822117419079135686880866602737071940539886253922\
+         79103037177076957972313736914320822855524800052427782940879523556486820043373181",
+    )
+    .unwrap();
+    assert_eq!(input.bit_len(), 506);
+    let factors = factor(input.clone()).unwrap();
+    assert!(factors.verify_product(&input));
+    assert_eq!(factors.total_len(), 32);
+    assert_eq!(
+        factors
+            .expanded()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    // 511 bits, but the hard part is a 320-bit *prime*: the six small factors peel off and the
+    // cofactor is settled by the primality test, so nothing is ever handed to the sieve. A
+    // width-based gate would have rejected this outright.
+    let mixed = Natural::<16>::from_decimal(
+        "5095761221610806052403790675953969613924327896615930674429444570224327135\
+         255024776878949868364526366809455906988948729433090635881939673406756856142258511",
+    )
+    .unwrap();
+    assert_eq!(mixed.bit_len(), 511);
+    let factors = factor(mixed.clone()).unwrap();
+    assert!(factors.verify_product(&mixed));
+    assert_eq!(factors.total_len(), 7);
+    let big = Natural::<16>::from_decimal(
+        "1822715629003050836886041093405870953882958356267076001214210352068467068\
+         972779348077648099904357",
+    )
+    .unwrap();
+    assert_eq!(big.bit_len(), 320);
+    assert_eq!(factors.multiplicity(&big).unwrap().get(), 1);
+
+    // A power-of-two shift is the degenerate case of the same rule: arbitrarily wide, trivially
+    // factored, and nowhere near the sieve.
+    let odd = Natural::<16>::from_u64(1_000_003);
+    let wide = odd.clone() << 900;
+    assert_eq!(wide.bit_len(), 920);
+    let factors = factor(wide.clone()).unwrap();
+    assert!(factors.verify_product(&wide));
+    assert_eq!(
+        factors.multiplicity(&Natural::from_u64(2)).unwrap().get(),
+        900
+    );
+    assert_eq!(factors.multiplicity(&odd).unwrap().get(), 1);
+}
+
+/// The other half of the contract: a composite that genuinely needs the sieve and is too wide for
+/// it is refused with an error naming the composite, not the input.
+#[test]
+#[ignore = "burns a full Pollard-Brent budget on a 416-bit semiprime before the sieve is asked"]
+fn oversized_hard_composites_are_refused_by_the_sieve_not_the_input_width() {
+    let hard = Natural::<16>::from_decimal(
+        "1265686468695484903648964277331152191512075117088221193348532259113389592\
+         93458582681292290648687613986290058064435220042047901",
+    )
+    .unwrap();
+    assert_eq!(hard.bit_len(), 416);
+    assert!(matches!(
+        factor(hard),
+        Err(FactorError::SiqsCompositeTooLarge(416))
+    ));
+}
+
 #[test]
 fn configuration_is_validated_and_encapsulated() {
     assert_eq!(Parallelism::threads(0), None);

@@ -43,7 +43,9 @@ for (let i = 0; i < nWorkers; i++) {
 console.log(`ABI v${abi}, ${nWorkers} sieve workers + 1 coordinator worker`);
 
 const BATCH = 2;
-const MAX_FAMILIES = 100000;
+// Read from the session rather than hard-coded: the engine scales the family budget with input
+// width, and a stale constant here would stop a large run before the engine would.
+let familyBudget = 0;
 const gen = 1;
 let nextFamily = 0;
 let finished = false;
@@ -62,7 +64,7 @@ const factor = await new Promise((resolve, reject) => {
     if (finished) return;
     const family = nextFamily;
     nextFamily += BATCH;
-    if (nextFamily > MAX_FAMILIES) return fail("relation budget exhausted");
+    if (familyBudget && nextFamily > familyBudget) return fail("relation budget exhausted");
     w.postMessage({ cmd: "sieve", family, count: BATCH, gen });
   };
 
@@ -71,6 +73,10 @@ const factor = await new Promise((resolve, reject) => {
     if (data.gen !== gen) return;
     if (data.type === "session") {
       target = data.target;
+      familyBudget = data.familyBudget;
+      if (!Number.isInteger(familyBudget) || familyBudget <= 0) {
+        return fail("coordinator returned an invalid family budget");
+      }
       for (const w of workers) w.postMessage({ cmd: "prepare", n: decimal, gen });
     } else if (data.type === "submitted") {
       if (!finished) dispatch(workers[data.worker]);

@@ -400,10 +400,33 @@ pub mod parameters {
             // RSA-110's smaller base/matrix wins end to end despite collecting
             // a few seconds longer than YAFU. `1214 * B²` is 1.0926e16.
             334..=368 => (3_000_000, 262_144, -23, 145, true, 1_214),
-            // Wider inputs remain accepted by the public 512-bit capacity
-            // contract, but RSA-110 is the highest performance-qualified
-            // balanced-semiprime tier.
-            _ => (3_000_000, 262_144, -23, 145, true, 1_214),
+            // Up to the 400-bit SIQS ceiling (see `engine::MAX_SIQS_BITS`). Reusing RSA-110's
+            // geometry here was the single worst thing this table did: the residues are ~2^17
+            // larger while the factor base and interval stayed put, so a 384-bit semiprime
+            // retained 276 relations from 4.9M polynomials against a 108 838 target.
+            //
+            // Measured on a 384-bit balanced semiprime, 64 workers, 130-150 s per configuration,
+            // reading relations and partials per second off `RUSQSIEVE_PROFILE` checkpoints:
+            // - `(3.0M, 262144)` 1.92 rel/s, 198 partials/s, target 108 838;
+            // - `(6.0M, 524288)` 5.02 rel/s, 395 partials/s, target 206 965;
+            // - `(9.0M, 524288)` 7.04 rel/s, 476 partials/s, target 301 893;
+            // - `(6.0M, 262144)` 4.91 rel/s, 396 partials/s, target 206 965.
+            // Folding in cycle yield (which grows as partials²/π(large-prime bound) and supplies
+            // most of the late relations) all four land within ~20% of each other on projected
+            // completion, so this picks the one with the smallest matrix among the fast group.
+            // A large-prime sweep at `(6.0M, 524288)` — multipliers 145/40/12/4 — moved projected
+            // completion by less than 15% and is left at 145.
+            //
+            // This tier is honest about what it is: enough to keep a 369..=400-bit input making
+            // steady, reportable progress. Inputs in this range are GNFS work; none of them is a
+            // performance-qualified SIQS tier the way RSA-100 and RSA-110 are.
+            369..=400 => (6_000_000, 524_288, -23, 145, true, 1_214),
+            // No sieve is ever built from this arm — the engine rejects composites above
+            // `MAX_SIQS_BITS` before parameters reach a factor base. It is still live: Pollard-
+            // Brent sizes its iteration budget from `engine_params`, and rho is deliberately
+            // *not* gated by width, so a 600-bit input with a small factor still gets a real
+            // attempt to peel it before the sieve is consulted.
+            _ => (6_000_000, 524_288, -23, 145, true, 1_214),
         };
         EngineParams {
             factor_base_bound,

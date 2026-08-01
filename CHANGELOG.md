@@ -1,6 +1,46 @@
 # Changelog
 
-## 0.4.1 — Unreleased
+## 0.4.2 — Unreleased
+
+- Fixed exhausted sieving being reported as a memory limit. The native
+  scheduler exited its family loop without checking whether the relation target
+  had been met and ran the linear algebra anyway; on a rank-deficient matrix the
+  solver returned no dependency, and `extract` mapped every `MatrixError` to
+  `ResourceLimit`, so a 399-bit input that reached 13% of its target failed with
+  "resource limit exceeded: Memory" on a machine with gigabytes free. Budget
+  exhaustion now returns `FactorError::InsufficientRelations`, and solver
+  outcomes keep their own identities: the new `FactorError::NoDependency` covers
+  a matrix that met its target but admitted no nontrivial dependency, while
+  `ResourceLimit` is reserved for an actual allocation bound.
+  `EngineSession::extract_factor` refuses to run below target for the same
+  reason, and `budget_exhausted` reports the condition to schedulers.
+- Replaced the blanket 512-bit input rejection with a 400-bit limit on the
+  composite that reaches SIQS. Trial division, the primality test,
+  perfect-power detection, and Pollard–Brent are not width limited, so an input
+  of any width whose factors are small now factors normally — previously a
+  513-bit number that was a power of two was refused outright. A hard composite
+  above the sieve's range returns `FactorError::SiqsCompositeTooLarge(bits)`,
+  naming the composite rather than the caller's input. The check lives in
+  `engine::prepare`, the one point every scheduler passes through.
+- Added a 369..=400-bit parameter tier. The range previously inherited
+  RSA-110's geometry, which left the factor base and interval unchanged while
+  the residues grew by ~2^17: a 384-bit semiprime retained 276 relations from
+  4.9M polynomials against a 108,838 target. Measured at 384 bits over four
+  factor-base/interval pairs and four large-prime multipliers, the tier moves to
+  a 6.0M bound and 524,288 half-width (5.02 rel/s and 395 partials/s, against
+  1.92 and 198 for the inherited values). This keeps inputs in the range making
+  steady progress; it is not a performance-qualified tier, and 120-digit work is
+  GNFS territory.
+- Scaled the polynomial-family budget with input width — 100,000 through 288
+  bits as before, 250,000 through 368, 750,000 above — instead of a flat
+  100,000 sized for the browser tiers. Most late relations come from
+  large-prime cycles, whose yield grows superlinearly, so a fixed cap truncated
+  large runs just as they became productive. The browser scheduler and
+  `browser-arch-check` now read the budget from the session
+  (`qs_coord_family_budget`) and the sieve limit from the runtime
+  (`qs_max_siqs_bits`) rather than hard-coding either.
+
+## 0.4.1 — 2026-08-01
 
 - Bumped the crate patch version after the 0.4.0 release.
 - Performance-qualified the native SIQS path through the 364-bit RSA-110

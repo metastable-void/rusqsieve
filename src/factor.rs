@@ -157,12 +157,21 @@ pub enum FactorError {
     ZeroHasNoPrimeFactorization,
     /// A value exceeded the selected [`Natural`](crate::Natural) capacity.
     CapacityExceeded,
-    /// Inputs above the supported 512-bit SIQS range are rejected.
+    /// Inputs wider than the selected [`Natural`](crate::Natural) capacity are rejected.
     InputTooLarge,
+    /// A composite requiring the quadratic sieve exceeded the supported 400-bit range.
+    ///
+    /// This bounds the hard cofactor, not the caller's input: a number of any width whose
+    /// factors are small enough to peel off by trial division, perfect-power detection, or
+    /// Pollard–Brent never reaches the sieve and never produces this error. The payload is the
+    /// bit length of the composite that did.
+    SiqsCompositeTooLarge(usize),
     /// A configured internal resource limit was exceeded.
     ResourceLimit(ResourceLimitKind),
     /// No nontrivial divisor was recovered.
     NoNontrivialFactor,
+    /// The linear algebra found no nontrivial dependency in the collected relations.
+    NoDependency,
     /// Sieving ended before enough usable relations were available.
     InsufficientRelations,
     /// SIQS polynomial coefficients could not be selected.
@@ -182,9 +191,18 @@ impl fmt::Display for FactorError {
         match self {
             Self::ZeroHasNoPrimeFactorization => f.write_str("zero has no prime factorization"),
             Self::CapacityExceeded => f.write_str("integer capacity exceeded"),
-            Self::InputTooLarge => f.write_str("SIQS supports inputs of at most 512 bits"),
+            Self::InputTooLarge => f.write_str("input exceeds the selected integer capacity"),
+            Self::SiqsCompositeTooLarge(bits) => write!(
+                f,
+                "a {bits}-bit composite requires the quadratic sieve, which supports at most \
+                 {} bits; inputs of any width factor normally when their factors are small",
+                crate::engine::MAX_SIQS_BITS
+            ),
             Self::ResourceLimit(kind) => write!(f, "resource limit exceeded: {kind:?}"),
             Self::NoNontrivialFactor => f.write_str("no nontrivial factor found"),
+            Self::NoDependency => {
+                f.write_str("linear algebra found no nontrivial dependency; collect more relations")
+            }
             Self::InsufficientRelations => f.write_str("insufficient quadratic-sieve relations"),
             Self::PolynomialSelection(message) => f.write_str(message),
             Self::InvalidDependency => f.write_str("invalid matrix dependency"),

@@ -104,6 +104,12 @@ fn packet(kind: u16, payload: &[u8]) -> u32 {
 pub extern "C" fn qs_abi_version() -> u32 {
     ABI_VERSION
 }
+/// Widest composite the sieve accepts. The coordinator refuses anything above this, so the glue
+/// can reject it up front with a specific message instead of reporting a generic setup failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_max_siqs_bits() -> u32 {
+    engine::MAX_SIQS_BITS as u32
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn qs_alloc(size: u32, align: u32) -> u32 {
     let Ok(layout) = Layout::from_size_align(size as usize, align as usize) else {
@@ -217,6 +223,18 @@ pub extern "C" fn qs_coord_target(session: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn qs_coord_relations(session: u32) -> u32 {
     COORDS.with(|r| r.borrow().get(session).map_or(0, |s| s.relations() as u32))
+}
+/// Polynomial families this session will issue before the relation budget is spent.
+///
+/// The budget scales with input width, so a scheduler that assigns family numbers itself — as the
+/// browser coordinator does — must read it here rather than hard-coding a constant.
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_coord_family_budget(session: u32) -> u32 {
+    COORDS.with(|r| {
+        r.borrow()
+            .get(session)
+            .map_or(0, |s| u32::try_from(s.family_budget()).unwrap_or(u32::MAX))
+    })
 }
 /// Ingest a worker's `qs_worker_sieve` payload; returns the new relation count.
 #[unsafe(no_mangle)]

@@ -43,13 +43,17 @@ export function putString(ex, str) {
   return putBytes(ex, new TextEncoder().encode(str));
 }
 
-export function validateDecimalInput(text, maximumBits = 512) {
+// The default is the engine's SIQS range (`engine::MAX_SIQS_BITS`), not a general input limit:
+// both endpoints that call this — the sieve worker and the coordinator — are handed a composite
+// that the main thread has already peeled, so anything arriving here is destined for the sieve.
+// Whole-input width is bounded separately, by what `Natural` can hold.
+export function validateDecimalInput(text, maximumBits = 400) {
   if (typeof text !== "string" || !/^\d+$/u.test(text)) {
     throw new Error("input must be an unsigned decimal integer");
   }
   const significant = text.replace(/^0+/u, "") || "0";
-  // ceil(512 * log10(2)) is 155. Use the generic bound only as an
-  // allocation-avoidance precheck; the BigInt bit-length check is authoritative.
+  // Use the generic digit bound only as an allocation-avoidance precheck; the BigInt bit-length
+  // check below is authoritative.
   const maximumDigits = Math.ceil(maximumBits * Math.LOG10E * Math.LN2);
   if (significant.length > maximumDigits) {
     throw new Error(`input exceeds the ${maximumBits}-bit limit`);

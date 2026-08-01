@@ -21,7 +21,8 @@ assert.equal(bytesToBigInt(Uint8Array.of(0x34, 0x12)), 0x1234n);
 assert.equal(validateDecimalInput("00015"), "15");
 assert.throws(() => validateDecimalInput("12x"), /unsigned decimal/);
 assert.throws(() => validateDecimalInput("0"), /positive/);
-assert.throws(() => validateDecimalInput((1n << 512n).toString()), /512-bit limit/);
+assert.throws(() => validateDecimalInput((1n << 400n).toString()), /400-bit limit/);
+assert.equal(validateDecimalInput((1n << 399n).toString()), (1n << 399n).toString());
 
 const wasmPath =
   process.env.RUSQSIEVE_WASM ||
@@ -51,22 +52,26 @@ try {
 
   const oversizedWorkerInput = await request(sieve, {
     cmd: "prepare",
-    n: (1n << 512n).toString(),
+    n: (1n << 400n).toString(),
     gen: 53,
   });
   assert.equal(oversizedWorkerInput.type, "error");
   assert.equal(oversizedWorkerInput.gen, 53);
-  assert.match(oversizedWorkerInput.error, /512-bit limit/);
+  assert.match(oversizedWorkerInput.error, /400-bit limit/);
 
   const ready = await request(coordinator, { cmd: "init", module });
   assert.equal(ready.type, "ready");
   assert.equal(ready.abi, 2);
+  // The scheduler's family cap and the UI's width limit are both engine-owned now; a runtime that
+  // does not report them would leave the glue silently guessing.
+  assert.equal(ready.maxSiqsBits, 400);
 
   const decimal = "668319744971798315493259725219859";
   const session = await request(coordinator, { cmd: "new", n: decimal, gen: 61 });
   assert.equal(session.type, "session");
   assert.equal(session.gen, 61);
   assert.ok(session.target > 0);
+  assert.ok(Number.isInteger(session.familyBudget) && session.familyBudget > 0);
 
   const malformed = await request(coordinator, {
     cmd: "submit",
@@ -82,6 +87,16 @@ try {
   assert.equal(unknownCoordinator.type, "error");
   assert.equal(unknownCoordinator.gen, 61);
   assert.match(unknownCoordinator.error, /unknown coordinator command/);
+
+  // Last: `new` resets the session and generation before validating, so a rejected session must
+  // not run ahead of the gen-61 assertions above.
+  const oversizedCoordinatorInput = await request(coordinator, {
+    cmd: "new",
+    n: (1n << 400n).toString(),
+    gen: 62,
+  });
+  assert.equal(oversizedCoordinatorInput.type, "error");
+  assert.match(oversizedCoordinatorInput.error, /400-bit limit/);
 } finally {
   await Promise.all([sieve.terminate(), coordinator.terminate()]);
 }

@@ -19,7 +19,9 @@ pub enum MatrixError {
     IndexOutOfRange,
     MalformedOffsets,
     ResourceLimit,
-    LanczosFailure,
+    /// The solver returned no nontrivial dependency. Usually means the matrix has more rows than
+    /// columns — i.e. sieving stopped short of its relation target — not that anything failed.
+    NoDependencies,
 }
 impl fmt::Display for MatrixError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -443,7 +445,7 @@ impl SparseBinaryMatrix {
                 let dependencies = self.block_lanczos_dependencies(64, lanczos_threads);
                 return (!dependencies.is_empty())
                     .then_some(dependencies)
-                    .ok_or(MatrixError::LanczosFailure);
+                    .ok_or(MatrixError::NoDependencies);
             }
             let dense_bytes = ncols.saturating_mul(nrows.div_ceil(64)).saturating_mul(16);
             if dense_bytes > 256 * 1024 * 1024 {
@@ -499,7 +501,7 @@ impl SparseBinaryMatrix {
             reduced.row_echelon_dependencies(64)
         };
         if reduced_dependencies.is_empty() {
-            return Err(MatrixError::LanczosFailure);
+            return Err(MatrixError::NoDependencies);
         }
         #[cfg(any(unix, windows))]
         let echelon_done = std::time::Instant::now();
@@ -736,5 +738,49 @@ mod tests {
                 .iter()
                 .all(|dependency| matrix.verify_dependency(dependency))
         );
+    }
+
+    /// A matrix with more rows than columns is what sieving produces when it stops short of its
+    /// relation target, and it generically has no nullspace at all. Neither solver may call that
+    /// a resource limit: `extract` used to map every variant here onto `ResourceLimit`, so this
+    /// ordinary shortfall reached users as "resource limit exceeded: Memory" on machines with
+    /// gigabytes free. Block Lanczos is the path that matters most — it serves every input at or
+    /// above 272 bits, which is where the misreport was observed.
+    #[test]
+    fn rank_deficient_matrices_never_report_a_resource_limit() {
+        let rows = 300;
+        let cols = 128;
+        let mut state = 0x2f19_c47b_5d80_a613u64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Weight 20 keeps typical row weight above `MAX_STRUCTURED_WEIGHT`, so structured
+        // filtering cannot collapse the matrix and the outcome comes from the solver itself.
+        let columns: Vec<Vec<u32>> = (0..cols)
+            .map(|_| {
+                let mut values: Vec<u32> =
+                    (0..20).map(|_| (rng() as usize % rows) as u32).collect();
+                values.sort_unstable();
+                values.dedup();
+                values
+            })
+            .collect();
+        let matrix = SparseBinaryMatrix::from_columns(rows, &columns).unwrap();
+
+        assert_eq!(
+            matrix.filtered_dependencies_profiled(false, true, 1).err(),
+            Some(MatrixError::NoDependencies),
+            "an over-determined matrix has no nullspace"
+        );
+
+        // The scalar path reports the same shortfall as an empty basis rather than an error, which
+        // `extract` turns into `NoFactor`. Either way it must not be a resource limit.
+        match matrix.filtered_dependencies_profiled(false, false, 1) {
+            Ok(dependencies) => assert!(dependencies.is_empty()),
+            Err(error) => assert_eq!(error, MatrixError::NoDependencies),
+        }
     }
 }
