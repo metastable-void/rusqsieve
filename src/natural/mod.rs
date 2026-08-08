@@ -640,7 +640,7 @@ impl<const P: usize> Natural<P> {
 /// modulo `modulus`. Keeping a whole modular-arithmetic loop in that domain
 /// amortizes the two conversions and replaces Knuth division with word
 /// multiplication and carry propagation.
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows, target_arch = "wasm32", test))]
 pub(crate) struct MontgomeryContext<const P: usize> {
     modulus: Natural<P>,
     negative_inverse: u64,
@@ -649,7 +649,7 @@ pub(crate) struct MontgomeryContext<const P: usize> {
     one: Natural<P>,
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows, target_arch = "wasm32", test))]
 impl<const P: usize> MontgomeryContext<P> {
     /// Constructs a context for an odd modulus supported by the inline REDC
     /// workspace. Shipped factorization uses `P == 16`; wider user-selected

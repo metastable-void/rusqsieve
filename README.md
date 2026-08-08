@@ -230,11 +230,15 @@ failure. Advancing runs have no wall-clock limit, and time spent with the page
 hidden does not count as a stall. An extraction that finds only trivial
 dependencies retains its relations and requests a surplus before retrying. The
 browser peels small factors on the main thread and applies the same 400-bit
-sieve limit as native entry points to the composite it hands the coordinator;
-above that limit it spends a deep rho budget of its own first, sliced so the page
-keeps painting and reports progress against the budget. The scheduler reads its
-family budget from the session rather than assuming a constant, so it cannot stop
-a large run before the engine would.
+sieve limit as native entry points to the composite it hands the coordinator.
+Above that limit — and below it for a cofactor an earlier split already proved
+unbalanced — it first runs a deep Pollard–Brent in wasm (`qs_rho`) across a pool
+of rho workers, each walking a disjoint range of polynomial constants so the pool
+races that many independent walks. That keeps the main thread free and reaches a
+smallest factor of about 2^52 at 512 bits, against 2^45 for the sliced `BigInt`
+search it replaces, which remains the fallback where wasm or `Worker` is
+unavailable. The scheduler reads its family budget from the session rather than
+assuming a constant, so it cannot stop a large run before the engine would.
 
 Notable performance work includes:
 

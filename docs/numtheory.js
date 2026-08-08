@@ -170,10 +170,15 @@ export function trialDivide(n, out, limit = 100000n) {
   return n;
 }
 
+// The polynomial constants Brent tries in turn, `y^2 + c`. Each is an independent walk over the
+// same modulus, which is what makes them safe to hand to separate workers: `deepPollard` in
+// index.js deals them out so that N workers run N different walks and the first collision wins.
+export const RHO_CONSTANTS = Array.from({ length: 31 }, (_, index) => BigInt(index + 1));
+
 // Bounded Pollard-Brent. Returns a nontrivial factor of the composite `n`, or null
 // if the iteration budget was exhausted (hand the number to the sieve instead).
-export function pollardBrent(n, budget = 1 << 20) {
-  const run = pollardBrentSliced(n, budget, Infinity);
+export function pollardBrent(n, budget = 1 << 20, constants = RHO_CONSTANTS) {
+  const run = pollardBrentSliced(n, budget, Infinity, constants);
   let step = run.next();
   while (!step.done) step = run.next();
   return step.value;
@@ -189,7 +194,7 @@ export function pollardBrent(n, budget = 1 << 20) {
 // The default slice is measured, not nominal: 2^14 inner iterations is about 50 ms of BigInt work
 // on a 512-bit modulus, below the frame budget a user would notice, while leaving the macrotask
 // overhead of yielding at a few percent of the run.
-export function* pollardBrentSliced(n, budget, slice = 1 << 14) {
+export function* pollardBrentSliced(n, budget, slice = 1 << 14, constants = RHO_CONSTANTS) {
   if (n % 2n === 0n) return 2n;
   let steps = 0;
   // Slicing is counted separately from the budget: Brent's cycle-advance loop is not part of
@@ -197,7 +202,7 @@ export function* pollardBrentSliced(n, budget, slice = 1 << 14) {
   // is exactly the one that must not be allowed to block. Counting it as budget instead would
   // quietly halve the reach of every existing caller.
   let sinceYield = 0;
-  for (let c = 1n; c < 32n; c++) {
+  for (const c of constants) {
     let y = 2n;
     let r = 1n;
     let q = 1n;

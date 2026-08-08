@@ -330,9 +330,30 @@ RUSQSIEVE_RHO_ITERATIONS=4000000000 qs-factor < composite.txt
 56-bit factor out of a 512-bit input plus a 64-bit factor out of a 401-bit input, single-threaded,
 1,452 s for the pair on this host. Run it with `--nocapture` for the per-case split.
 
-The browser runs the same loop on `BigInt` at roughly an eighth of the native rate — 288k
-iterations/s at 512 bits and 115k/s at 1024 measured under Node 24.15 — and spends 2^23 iterations
-up to 512 bits and 2^22 above, about half a minute at either end, sliced into ~50 ms macrotasks.
+The browser runs the same loop in wasm across a pool of rho workers (`qs_rho`), each walking a
+disjoint range of polynomial constants. Iteration rates measured under Node 24.15 on prime moduli:
+
+| composite bits | native | wasm (scalar) | main-thread `BigInt` |
+|---:|---:|---:|---:|
+| 512 | 2,245,151/s | 654,000/s | 288,000/s |
+| 1024 | 783,282/s | 183,000/s | 115,000/s |
+
+Per-worker budget is 2^25 iterations up to 512 bits, 24M through 768, 16M above. `T` independent
+walks collide in about `1.2·sqrt(p)/sqrt(T)` iterations, so eight workers reach a smallest factor of
+roughly 2^52 at 512 bits and 2^50 at 1024 — parity with the native CLI — in about a minute of
+worker time, with the main thread free throughout.
+
+End to end on a 478-bit product of ten 48-bit primes, driving the real worker protocol on Node
+worker threads with eight workers:
+
+| ladder | result |
+|---|---|
+| `BigInt`, main thread, 2^23 budget | one factor in 12.1 s, then 33.2 s exhausted at 430 bits → sieve/refusal |
+| `BigInt`, main thread, 2^26 budget | five factors, 140 s of blocked main thread |
+| wasm pool, 2^25 per worker | five factors in **34.1 s** (5–8 s each), main thread free, 239-bit remainder to the sieve |
+
+A runtime with no module or no `Worker` falls back to the main thread's sliced `BigInt` search,
+which keeps the smaller 2^23/2^22 budget because it has to stay sliceable into ~50 ms macrotasks.
 
 ## Basic-block alignment in native builds
 

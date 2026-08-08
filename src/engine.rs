@@ -17,7 +17,7 @@ mod wire;
 
 use crate::f2::{MatrixError, SparseBinaryMatrix};
 use crate::factor::FactorTuning;
-#[cfg(any(unix, windows))]
+#[cfg(any(unix, windows, target_arch = "wasm32"))]
 use crate::natural::MontgomeryContext;
 use crate::qs::{AutoOr, FactorBaseEntry, MultiplierChoice, QsConfig, prepare_factor_base};
 use crate::{Natural, PARTS, jacobi_u64};
@@ -325,6 +325,15 @@ fn rho_budget(bits: usize, tuning: &FactorTuning, after_split: bool) -> u64 {
     }
     sieve_fraction
 }
+
+/// Polynomial constants the native ladder tries in turn, `y^2 + c`.
+///
+/// Each is an independent walk over the same modulus, which is why the browser can hand different
+/// ones to different workers and race them; the native stage runs them in sequence under one shared
+/// budget. Eight is where the sequence stops paying: a constant that has not collided by its share
+/// of the budget is not more likely to than a fresh one, and every additional constant dilutes the
+/// budget the earlier ones get.
+pub(crate) const NATIVE_RHO_CONSTANTS: core::ops::RangeInclusive<u64> = 1..=8;
 
 /// Width from which a cofactor known to be unbalanced is worth a deep rho rather than a sieve.
 ///
@@ -828,15 +837,20 @@ fn factor_node(
         return Ok(());
     }
     let mut split_by_rho = false;
-    let d = match pollard_brent_natural(&n, rho_budget(n.bit_len(), tuning, after_split), || {
-        progress(EngineProgress {
-            phase: EnginePhase::Preprocessing,
-            polynomials: 0,
-            relations: 0,
-            target: 0,
-            workers: threads,
-        })
-    })? {
+    let d = match pollard_brent_natural(
+        &n,
+        rho_budget(n.bit_len(), tuning, after_split),
+        NATIVE_RHO_CONSTANTS,
+        || {
+            progress(EngineProgress {
+                phase: EnginePhase::Preprocessing,
+                polynomials: 0,
+                relations: 0,
+                target: 0,
+                workers: threads,
+            })
+        },
+    )? {
         Some(factor) => {
             #[cfg(test)]
             stage_counts::bump(&stage_counts::RHO);
@@ -1999,13 +2013,17 @@ fn classify_cofactor(q: u64, single_limit: u64, double_limit: u64) -> Option<Lar
 }
 
 /// Bounded, cancellable Pollard-Brent over `Natural`. `iteration_limit` is the total across every
-/// polynomial constant tried, not per constant, so the caller's budget is the whole cost of the
-/// stage; see [`rho_budget`].
+/// polynomial constant in `constants`, not per constant, so the caller's budget is the whole cost of
+/// the stage; see [`rho_budget`].
 ///
-#[cfg(any(unix, windows))]
-fn pollard_brent_natural(
+/// `constants` selects which walks to run. The native ladder passes [`NATIVE_RHO_CONSTANTS`] and
+/// runs them in sequence; the browser hands a disjoint range to each of its rho workers so that the
+/// pool runs that many independent walks at once and the first collision wins.
+#[cfg(any(unix, windows, target_arch = "wasm32"))]
+pub(crate) fn pollard_brent_natural(
     n: &Natural,
     iteration_limit: u64,
+    constants: core::ops::RangeInclusive<u64>,
     mut keep_going: impl FnMut() -> bool,
 ) -> Result<Option<Natural>, EngineError> {
     if n.is_even() {
@@ -2016,7 +2034,7 @@ fn pollard_brent_natural(
     // gcd(qR mod n, n) == gcd(q, n) because odd n makes R invertible.
     let montgomery = MontgomeryContext::new(n).expect("rho modulus is odd and engine-sized");
     let mut iterations = 0u64;
-    for c_value in 1..=8u64 {
+    for c_value in constants {
         if iterations >= iteration_limit {
             return Ok(None);
         }
@@ -2977,7 +2995,7 @@ mod tests {
             polls += 1;
             true
         };
-        let result = pollard_brent_natural(&n, 4_096, poll).unwrap();
+        let result = pollard_brent_natural(&n, 4_096, NATIVE_RHO_CONSTANTS, poll).unwrap();
         assert!(
             result.is_none(),
             "4096 iterations should not split a 128-bit balanced semiprime"
@@ -3077,7 +3095,8 @@ mod tests {
             assert_eq!(n.bit_len(), bits);
             const ITERATIONS: u64 = 200_000;
             let started = std::time::Instant::now();
-            let split = pollard_brent_natural(&n, ITERATIONS, || true).unwrap();
+            let split =
+                pollard_brent_natural(&n, ITERATIONS, NATIVE_RHO_CONSTANTS, || true).unwrap();
             let elapsed = started.elapsed().as_secs_f64();
             eprintln!(
                 "BENCH wide_rho bits={bits} iterations={ITERATIONS} elapsed={elapsed:.3}s \

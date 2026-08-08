@@ -49,6 +49,9 @@ const els = {
 
 let coord = null; // coordinator Worker (owns its own wasm instance)
 let workers = []; // sieve worker pool
+// The compiled module, kept so a deep rho search can spin up its own short-lived worker pool
+// without recompiling. Sieve workers and the coordinator each instantiate their own copy of it.
+let wasmModule = null;
 let gen = 0; // generation token so stale worker messages are ignored
 let wasmFlavor = "scalar";
 let runtimeReady = false;
@@ -86,6 +89,7 @@ async function boot() {
     ]);
     coord = nextCoord;
     workers = nextWorkers;
+    wasmModule = module;
     runtimeReady = true;
     // Take the sieve's range from the engine that will actually run, so the UI limit and the
     // coordinator's own check can never drift apart across a rebuild.
@@ -111,6 +115,7 @@ function shutdownRuntime() {
   for (const worker of workers) worker.terminate();
   coord = null;
   workers = [];
+  wasmModule = null;
 }
 
 async function restartRuntime() {
@@ -144,7 +149,7 @@ function waitForWorkerReady(worker, module, requireAbi, signal) {
       if (data?.type === "error") {
         finish(new Error(data.error || "worker initialization failed"));
       } else if (data?.type === "ready") {
-        if (requireAbi && data.abi !== 3) {
+        if (requireAbi && data.abi !== 4) {
           finish(new Error(`unsupported rusqsieve wasm ABI ${String(data.abi)}`));
         } else {
           finish(null, data);
@@ -473,21 +478,96 @@ function siqsParallel(decimal, bits, report) {
   });
 }
 
-// Pollard-Brent budget for a composite the sieve has refused, in iterations. Measured in node
-// (BigInt, single-threaded) on prime moduli, which is the honest way to time a full budget: 288 k
-// iterations/s at 512 bits, 115 k/s at 1024. Brent finds `p` in about 1.2·sqrt(p) iterations, so
-// these spend roughly half a minute at either end of the range and reach a smallest factor of about
-// 2^45 at 512 bits and 2^43 at 1024 — against 2^29 for the 2^15 opening peel, which could not even
-// guarantee a 32-bit factor. Beyond this the browser is the wrong place for the search: each factor
-// bit doubles the cost, and the native CLI runs the same loop eight times faster.
-const wideRhoBudget = (bits) => (bits <= 512 ? 8 << 20 : 4 << 20);
+// How many rho workers race a deep search, and how many polynomial constants each one walks.
+// Independent walks over the same modulus collide in about `1.2·sqrt(p)/sqrt(T)` iterations for `T`
+// of them, so the pool buys a `sqrt(T)` speedup; eight is where that curve has flattened enough
+// that further workers cost more in startup and memory than they return.
+const DEEP_RHO_WORKERS = Math.max(1, Math.min(8, nWorkers));
+const DEEP_RHO_CONSTANTS_PER_WORKER = 4;
 
+// Per-worker iteration budget for a deep search, by composite width. Measured under Node against
+// the scalar wasm module on prime moduli, which is the honest way to time a full budget: 654k
+// iterations/s at 512 bits and 183k/s at 1024. These spend about a minute per attempt at either
+// end, and with eight workers racing they reach a smallest factor of roughly 2^52 at 512 bits and
+// 2^50 at 1024 — parity with what the native CLI reaches, and against 2^29 for the 2^15 opening
+// peel, which cannot even guarantee a 32-bit factor.
+const deepRhoBudget = (bits) => (bits <= 512 ? 32 << 20 : bits <= 768 ? 24 << 20 : 16 << 20);
+
+// The fallback budget, for a runtime with no wasm module or no Workers. It runs on the main thread
+// and so has to stay small enough to stay sliceable: about half a minute of BigInt work.
+const mainThreadRhoBudget = (bits) => (bits <= 512 ? 8 << 20 : 4 << 20);
+
+// Deep Pollard-Brent in wasm across a pool of workers, racing disjoint polynomial constants.
+// Resolves to a factor or null; cancellation is termination, which is why nothing here polls.
 async function deepPollard(c, bits, report) {
-  const budget = wideRhoBudget(bits);
+  if (!wasmModule) return deepPollardOnMainThread(c, bits, report);
+  const budget = deepRhoBudget(bits);
+  let pool;
+  try {
+    pool = Array.from(
+      { length: DEEP_RHO_WORKERS },
+      () => new Worker(new URL("./rho-worker.js", import.meta.url), { type: "module" }),
+    );
+  } catch {
+    return deepPollardOnMainThread(c, bits, report);
+  }
+  const started = performance.now();
+  const tickReport = () =>
+    report({
+      phase: "deepPollard",
+      n: c,
+      elapsedSeconds: (performance.now() - started) / 1000,
+      workers: pool.length,
+      budget,
+    });
+  tickReport();
+  const ticker = setInterval(tickReport, 500);
+  try {
+    return await new Promise((resolve) => {
+      let outstanding = pool.length;
+      // A worker that fails — no module, a rejected modulus, a runtime without wasm — is not a
+      // reason to fail the run: the others keep searching, and an all-failed pool resolves null,
+      // which is the same answer an exhausted budget gives.
+      const retire = () => {
+        outstanding -= 1;
+        if (outstanding <= 0) resolve(null);
+      };
+      pool.forEach((worker, index) => {
+        worker.onmessage = ({ data }) => {
+          if (data?.type === "ready") {
+            worker.postMessage({
+              cmd: "search",
+              gen: 1,
+              n: c.toString(),
+              budget,
+              first: 1 + index * DEEP_RHO_CONSTANTS_PER_WORKER,
+              count: DEEP_RHO_CONSTANTS_PER_WORKER,
+            });
+            return;
+          }
+          if (data?.type === "done") {
+            if (typeof data.factor === "string") resolve(BigInt(data.factor));
+            else retire();
+            return;
+          }
+          retire();
+        };
+        worker.onerror = retire;
+        worker.postMessage({ cmd: "init", module: wasmModule });
+      });
+    });
+  } finally {
+    clearInterval(ticker);
+    for (const worker of pool) worker.terminate();
+  }
+}
+
+async function deepPollardOnMainThread(c, bits, report) {
+  const budget = mainThreadRhoBudget(bits);
   const run = pollardBrentSliced(c, budget);
   let step = run.next();
   while (!step.done) {
-    report({ phase: "deepPollard", n: c, steps: step.value, budget });
+    report({ phase: "deepPollard", n: c, steps: step.value, budget, workers: 0 });
     await tick();
     step = run.next();
   }
@@ -579,8 +659,11 @@ const PHASE_TEXT = {
   primality: (s) => `Miller–Rabin primality test (${digits(s.n)} digits)…`,
   pollard: (s) => `Pollard's rho on a ${digits(s.n)}-digit number…`,
   deepPollard: (s) =>
-    `Too wide for the sieve — deep Pollard's rho on a ${digits(s.n)}-digit composite: ` +
-    `${Math.round((100 * s.steps) / s.budget)}% of the iteration budget…`,
+    s.workers
+      ? `Deep Pollard's rho on a ${digits(s.n)}-digit composite across ${s.workers} ` +
+        `wasm worker${s.workers === 1 ? "" : "s"} — ${formatDuration(s.elapsedSeconds)} elapsed…`
+      : `Deep Pollard's rho on a ${digits(s.n)}-digit composite: ` +
+        `${Math.round((100 * s.steps) / s.budget)}% of the iteration budget…`,
   sieving: (s) => {
     const progress =
       `Quadratic sieve: ${s.relations}/${s.target} relations across ${nWorkers} workers…`;

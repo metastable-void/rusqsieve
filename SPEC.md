@@ -605,15 +605,27 @@ composites are sent to the Wasm SIQS coordinator.
 The reference frontend applies the engine's 400-bit sieve limit to the composite
 it sends the coordinator, not to the number the user typed, and reads that limit
 from the runtime (`qs_max_siqs_bits`) rather than duplicating it. A composite
-above that limit is not refused until a deep Pollard–Brent budget has been spent
-on it, mirroring the native policy: the opening peel is sized for a sieve run
-that is about to happen, and above the ceiling no sieve run is. That search is
-sliced — it yields to the event loop about every 50 ms of BigInt work — so the
-page keeps painting and reports progress against the budget. The budgets differ
-from native because `BigInt` runs the same loop at roughly an eighth of the
-native rate: about half a minute of work at either end of the range, reaching a
-smallest factor of about 2^45 at 512 bits and 2^43 at 1024, against 2^29 for the
-opening peel, which could not even guarantee a 32-bit factor. Per-run
+above that limit — or one below it that an earlier split already proved
+unbalanced, from 257 bits up — is not handed over until a deep Pollard–Brent
+search has been spent on it, mirroring the native policy: the opening BigInt peel
+is sized for a sieve run that is about to happen, and in these cases either no
+sieve run is, or the one that would run is the wrong tool.
+
+That search runs in wasm (`qs_rho`) across a short-lived pool of rho workers, not
+on the main thread. Two things follow. The page stays interactive, so the budget
+is bounded by patience rather than by frame time; and each worker walks a disjoint
+range of polynomial constants, so the pool runs that many independent walks and
+the first collision wins — about a `sqrt(T)` speedup for `T` workers. Measured
+under Node against the scalar module, wasm runs the loop at 654k iterations/s on
+a 512-bit modulus and 183k/s at 1024, against 288k/s and 115k/s for the main
+thread's `BigInt` implementation. With eight workers and a per-worker budget of
+2^25 iterations up to 512 bits, the frontend reaches a smallest factor of roughly
+2^52 there and 2^50 at 1024 — parity with the native CLI, against 2^29 for the
+opening peel, which cannot even guarantee a 32-bit factor.
+
+A runtime with no compiled module or no `Worker` falls back to the main thread's
+sliced `BigInt` search, which yields to the event loop about every 50 ms and
+carries a smaller budget for that reason. Per-run
 messages, including errors, are generation-scoped. Worker initialization,
 individual sieve jobs, and complete runs are bounded by timeouts; a failed run
 terminates and rebuilds the Worker runtime. The browser scheduler reads the
@@ -652,10 +664,20 @@ qs_coord_extract
 qs_coord_free
 ```
 
-The Wasm ABI version is 3. `qs_max_siqs_bits` and `qs_coord_family_budget` were
-added in that revision, and the reference glue depends on both rather than
-duplicating the values, so a version-2 module paired with current glue is
-rejected at initialization instead of faulting on a missing export.
+The Wasm ABI version is 4. Version 3 added `qs_max_siqs_bits` and
+`qs_coord_family_budget`, and version 4 adds `qs_rho`; the reference glue
+depends on all three rather than duplicating or working around them, so an older
+module paired with current glue is rejected at initialization instead of
+faulting on a missing export.
+
+`qs_rho(n_pointer, n_length, budget, first_constant, constant_count)` runs a
+bounded Pollard–Brent over the decimal composite `n` and returns a packet of
+kind 12: the factor as `PARTS * 8` little-endian bytes, or an empty payload when
+the budget was spent without a split. `first_constant` and `constant_count`
+select which polynomial constants `y^2 + c` the call walks, so a pool of workers
+given disjoint ranges runs that many independent walks over one modulus and the
+first collision wins. There is no cancellation protocol: the call runs to its
+budget and returns, and the frontend cancels by terminating the worker.
 
 Handles contain a 16-bit slot and 16-bit generation. Generation checks reject
 ordinary stale-handle reuse; a slot can alias an ancient handle after 65,535

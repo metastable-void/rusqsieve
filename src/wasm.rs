@@ -8,7 +8,12 @@ use std::cell::RefCell;
 // — it reads the sieve range and the family budget from them instead of hard-coding either — so a
 // v2 module paired with current glue would fault on a missing export rather than degrade. The
 // version guard has to reject that pairing.
-const ABI_VERSION: u32 = 3;
+//
+// 4 adds `qs_rho`. The frontend's rho workers depend on it rather than falling back to their
+// BigInt implementation when it is absent, for the same reason: a silent eightfold slowdown in the
+// one stage that decides whether a wide multi-factor composite finishes is not a degradation worth
+// shipping quietly.
+const ABI_VERSION: u32 = 4;
 const MAX_PACKET: usize = 16 * 1024 * 1024;
 type WasmNatural = Natural;
 struct Slot<T> {
@@ -294,4 +299,60 @@ pub extern "C" fn qs_coord_extract(session: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn qs_coord_free(session: u32) {
     COORDS.with(|r| r.borrow_mut().remove(session))
+}
+
+// ---------------------------------------------------------------------------
+// Deep Pollard-Brent for the browser's rho workers.
+//
+// The frontend peels cheap factors on the main thread with BigInt, which is fine for an
+// opportunistic peel and hopeless for a real search: measured under Node, BigInt runs this loop at
+// about an eighth of the rate the same algorithm reaches here over Montgomery-encoded limbs. A
+// composite the sieve cannot help with — one above `qs_max_siqs_bits`, or a cofactor an earlier
+// split already proved unbalanced — needs tens of millions of iterations, and that difference is
+// what decides whether a 48-bit factor is found or the number is handed to a sieve that will not
+// finish.
+//
+// Cancellation is the worker's `terminate()`, so nothing here polls: the call runs to its budget
+// and returns. That is also why the budget is a parameter rather than a policy baked in here — the
+// glue sizes it per width, exactly as `engine::rho_budget` does natively.
+// ---------------------------------------------------------------------------
+
+/// Search for a factor of the decimal composite `n` with a bounded Pollard-Brent.
+///
+/// `first_constant` and `constant_count` select the polynomial constants `y^2 + c` this call walks,
+/// so a pool of workers given disjoint ranges runs that many independent walks over the same
+/// modulus and the first collision wins. `budget` is the total iterations across those walks.
+///
+/// Returns a packet (kind 12) whose payload is the factor as `PARTS * 8` little-endian bytes, or a
+/// packet with an empty payload when the budget was spent without a split. Returns 0 only for an
+/// unusable request: an unparseable modulus, or one below 3.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qs_rho(
+    n_pointer: u32,
+    n_length: u32,
+    budget: u32,
+    first_constant: u32,
+    constant_count: u32,
+) -> u32 {
+    let Some(n) = parse_decimal(n_pointer, n_length) else {
+        return 0;
+    };
+    // Below 3 there is nothing to split, and a modulus of 0 or 1 has no Montgomery form.
+    if n < WasmNatural::from_u64(3) {
+        return 0;
+    }
+    let first = (first_constant.max(1)) as u64;
+    // The cap keeps `first + count` from wrapping and matches what a pool could plausibly use;
+    // beyond a handful of constants the budget per walk is what limits reach anyway.
+    let count = constant_count.clamp(1, 64) as u64;
+    let last = first.saturating_add(count - 1);
+    let found = engine::pollard_brent_natural(&n, (budget as u64).max(1), first..=last, || true);
+    let mut payload = Vec::new();
+    if let Ok(Some(factor)) = found {
+        payload.reserve(PARTS * 8);
+        for limb in factor.as_parts() {
+            payload.extend_from_slice(&limb.to_le_bytes());
+        }
+    }
+    packet(12, &payload)
 }

@@ -54,6 +54,27 @@
   773 KiB to 893 KiB. 64-byte alignment was measured and is no better for 38%
   more size. The flag is probed, not assumed, since `-C llvm-args` rejects an
   unknown option outright; wasm is excluded deliberately.
+- Exposed Pollard–Brent through the Wasm ABI as `qs_rho` and moved the browser's
+  deep search onto it, across a pool of rho workers. The frontend previously ran
+  that search on the main thread in `BigInt`, which is both the slowest available
+  implementation and the one that blocks painting, so its budget had to stay
+  small enough to slice — 2^23 iterations, a reach of about 2^45. A 478-bit
+  product of ten 48-bit primes therefore peeled one factor by luck (48-bit
+  factors cost ~20M iterations, and ten of them give a √10 birthday speedup) and
+  then exhausted its budget, handing a 430-bit composite to a sieve that cannot
+  finish it. Each worker now walks a disjoint range of polynomial constants over
+  the same modulus, so `T` workers run `T` independent walks for a √T speedup,
+  and the budget is bounded by patience rather than by frame time: 2^25
+  iterations per worker up to 512 bits. Measured under Node against the scalar
+  module, wasm runs the loop at 654k iterations/s at 512 bits and 183k/s at 1024
+  against `BigInt`'s 288k/s and 115k/s. The same 478-bit input now peels five
+  48-bit factors in 34.1 s total — 5 to 8 s per factor, off the main thread —
+  and hands a 239-bit remainder to a sieve that is the right tool for it. A
+  runtime without a compiled module or without `Worker` falls back to the sliced
+  main-thread search.
+- Raised the Wasm ABI to version 4 for `qs_rho`. The rho workers depend on the
+  export rather than silently falling back to `BigInt`, so an older module paired
+  with current glue is rejected at initialization; the native C ABI is unchanged.
 - Applied the same policy to the browser. The frontend refused a composite above
   the sieve limit after a 2^15-iteration peel — a reach of about 2^29, which could
   not even guarantee a 32-bit factor — and now spends a deep budget first: 2^23
