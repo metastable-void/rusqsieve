@@ -347,35 +347,36 @@ const DEEP_RHO_MIN_BITS: usize = 257;
 
 /// Pollard-Brent iteration budget for a composite the sieve will refuse.
 ///
-/// Above [`MAX_SIQS_BITS`] rho stops being a cheap peel in front of SIQS and becomes the entire
-/// factoring attempt: there is no sieve run for the budget to be a fraction of, and the alternative
-/// to spending more here is [`EngineError::SiqsInputTooLarge`] on an input whose smallest factor was
-/// findable. So this arm is a wall-clock decision rather than a proportion.
+/// Above [`MAX_SIQS_BITS`] rho is not a cheap peel in front of SIQS, because there is no SIQS: it is
+/// the first of two stages that are the whole attempt, and the second is the elliptic curve method.
+/// The budget is therefore a *handover* decision — how far rho should get before ECM is the cheaper
+/// way to look for the next factor — rather than the wall-clock decision it was when rho was alone.
 ///
-/// Per-iteration cost grows with the square of the limb count, so a flat iteration count would cost
-/// three times as much wall clock at the top of the supported range as at the bottom. Measured
-/// single-thread rates (release, x86-64 Xeon 8259CL, `profile_wide_rho_throughput`): 4.84 M/s at 512
-/// bits, 2.20 M/s at 768, 1.34 M/s at 1024. These tiers therefore spend a comparable amount of time
-/// at every width instead — 26 s, 33 s and 36 s.
+/// Brent finds `p` in about `1.2·sqrt(p)` iterations, which is exponential in the factor's bit
+/// length, while ECM's cost is subexponential. Measured on 512-bit composites with one factor of
+/// each size (`profile_ecm_crossover` against the 4.84 M/s rate from
+/// `profile_wide_rho_throughput`), ECM versus rho projected:
 ///
-/// Brent finds `p` in about `1.2·sqrt(p)` iterations, so that buys a smallest factor of roughly 2^53
-/// at 512 bits, 2^51.7 at 768 and 2^50.5 at 1024. The sieve-derived budget this replaces was 6.29 M
-/// iterations at every width above the ceiling — reach 2^44.6 — which refused a 512-bit input
-/// carrying a 48-bit factor after 2.7 s of work that was nearly deep enough.
+/// | factor | 2^40 | 2^45 | 2^48 | 2^50 | 2^53 | 2^56 |
+/// |---|---|---|---|---|---|---|
+/// | ECM | 0.64 s | 0.89 s | 7.29 s | 3.46 s | 4.46 s | 2.95 s |
+/// | rho | 0.26 s | 1.47 s | 4.16 s | 8.32 s | 23.5 s | 66.6 s |
 ///
-/// The budgets are stated in iterations, not seconds, so the arithmetic work that made the stage 1.8×
-/// to 5.2× faster bought back wall clock rather than reach: the same tiers cost half to two-thirds of
-/// what they did when they were chosen. Reach is where the default stops, because each additional factor bit
-/// doubles the cost: 2^56 is minutes and 2^64 is tens of minutes across this width range. That is a
-/// real search, not a default one, and callers who want it ask with `RUSQSIEVE_RHO_ITERATIONS`.
-const fn wide_rho_budget(bits: usize) -> u64 {
-    if bits <= 512 {
-        128_000_000
-    } else if bits <= 768 {
-        72_000_000
-    } else {
-        48_000_000
-    }
+/// Rho wins below about 2^44 and loses decisively above 2^50, by a margin that doubles with every
+/// further bit; ECM's own numbers wander with curve luck but not with the trend. 12 M iterations
+/// puts the handover at roughly 2^46, costing 2.5 s at 512 bits and 9 s at 1024, and still covers a
+/// 32-bit factor by two orders of magnitude — the guarantee this budget carried before ECM existed.
+///
+/// This replaces 128 M/72 M/48 M iterations, which was sized when rho had no successor and reached
+/// 2^53 for 26 to 36 s. Nearly all of that range is now ECM's, and cheaper; keeping it would have
+/// spent half a minute per composite re-deriving what the next stage does in seconds. Callers who
+/// want a deep rho specifically can still ask with `RUSQSIEVE_RHO_ITERATIONS`.
+///
+/// The count is flat across widths because the crossover is a property of the factor, not the
+/// modulus: rho and ECM are both dominated by Montgomery multiplication, so widening the input slows
+/// them both by the same factor and moves the handover very little.
+const fn wide_rho_budget(_bits: usize) -> u64 {
+    12_000_000
 }
 
 /// Which dispatch arm produced each split, so tests can assert that a stage ran rather than merely
@@ -854,7 +855,7 @@ fn factor_node(
         }
         return Ok(());
     }
-    let mut split_by_rho = false;
+    let mut split_by_search = false;
     let d = match pollard_brent_natural(
         &n,
         rho_budget(n.bit_len(), tuning, unbalanced),
@@ -872,7 +873,7 @@ fn factor_node(
         Some(factor) => {
             #[cfg(test)]
             stage_counts::bump(&stage_counts::RHO);
-            split_by_rho = true;
+            split_by_search = true;
             if tuning.profile {
                 eprintln!(
                     "PROFILE rho input_bits={} factor_bits={} siqs=false",
@@ -900,11 +901,25 @@ fn factor_node(
             //
             // The caller's opt-in therefore governs only what is left: composites inside the
             // sieve's range with no evidence either way, which is where a balanced semiprime lives.
+            // Whether ECM is the stage this composite is counting on, which sizes the run.
+            //
+            // Slipping under the ceiling must not by itself downgrade the search: a 399-bit
+            // cofactor of a wide multi-factor composite needs the same curves as the number it came
+            // from, because the sieve waiting for it there still charges by the size of the input.
+            // The floor is the same one the deep rho budget uses and for the same reason — below it
+            // a sieve run costs seconds, so committing minutes of curves to save it would be the
+            // trade backwards.
+            //
+            // This sizes the run; it does not decide whether one happens. An unbalanced composite
+            // below the floor still gets curves, just the cheap schedule, because they cost
+            // milliseconds there and can still peel a factor before the sieve starts.
+            let committed =
+                n.bit_len() > MAX_SIQS_BITS || (unbalanced && n.bit_len() >= DEEP_RHO_MIN_BITS);
             let mut split = None;
             if ecm || unbalanced || n.bit_len() > MAX_SIQS_BITS {
                 #[cfg(test)]
                 stage_counts::bump(&stage_counts::ECM);
-                let params = crate::ecm::EcmParams::for_composite(n.bit_len());
+                let params = crate::ecm::EcmParams::for_composite(n.bit_len(), committed);
                 if tuning.profile {
                     eprintln!(
                         "PROFILE ecm input_bits={} b1={} b2={} curves={}",
@@ -914,7 +929,7 @@ fn factor_node(
                         params.curves
                     );
                 }
-                split = crate::ecm::factor(&n, params, 0x9e37_79b9, || {
+                split = crate::ecm::factor_threaded(&n, params, 0x9e37_79b9, threads, || {
                     progress(EngineProgress {
                         phase: EnginePhase::Preprocessing,
                         polynomials: 0,
@@ -925,7 +940,10 @@ fn factor_node(
                 })?;
             }
             match split {
-                Some(factor) => factor,
+                Some(factor) => {
+                    split_by_search = true;
+                    factor
+                }
                 None => find_factor(n.clone(), threads, tuning, progress)?,
             }
         }
@@ -933,10 +951,14 @@ fn factor_node(
     if d.is_one() || d == n {
         return Err(EngineError::NoFactor);
     }
-    // A split under rho is what proves this composite unbalanced, so it is what the children
-    // inherit. A split under SIQS proves nothing about factor sizes and only passes along whatever
-    // this node already knew.
-    let children_unbalanced = unbalanced || split_by_rho;
+    // A split by rho or by ECM is what proves this composite unbalanced, and it is what the
+    // children inherit. Both searches cost by the size of the factor they find, so succeeding means
+    // one was small enough to find — which is exactly the evidence the next node needs, and losing
+    // it is how a wide multi-factor composite used to peel down to just under the ceiling and then
+    // hand what was left to a sieve that would not finish. A split under SIQS proves nothing about
+    // factor sizes, since it splits balanced semiprimes too, and only passes along what was already
+    // known.
+    let children_unbalanced = unbalanced || split_by_search;
     let q = n.div_rem(&d).unwrap().0;
     factor_node(
         d,
@@ -2686,25 +2708,24 @@ mod tests {
                 budget >= 100 * brent_cost(32),
                 "{bits}-bit budget {budget} is not a comfortable 32-bit reach"
             );
-            // And the reach the wall-clock target was chosen to buy.
+            // The handover point: rho is still the cheaper way to a factor of this size.
             assert!(
-                budget >= 2 * brent_cost(48),
-                "{bits}-bit budget {budget} does not reach a 48-bit factor"
+                budget >= brent_cost(45),
+                "{bits}-bit budget {budget} gives up before rho stops being the cheaper stage"
             );
-            // Sanity in the other direction: this arm is not a licence to run for hours.
+            // And the other side of it. Past roughly 2^50 ECM finds a factor in a fraction of what
+            // rho would spend, so a budget reaching there is work handed to the wrong stage.
             assert!(
-                budget <= brent_cost(56),
-                "{bits}-bit budget {budget} is past the documented one-minute target"
+                budget <= brent_cost(50),
+                "{bits}-bit budget {budget} runs rho into the range ECM does better"
             );
         }
         // Nothing at or below the ceiling changed: SIQS runs there, so a deep rho would be pure
         // overhead on every balanced input.
-        assert!(
-            rho_budget(MAX_SIQS_BITS, &tuning, false) < wide_rho_budget(MAX_SIQS_BITS + 1) / 10
-        );
-        // Wider inputs cost more per iteration, so the iteration count comes down to hold the
-        // wall clock roughly flat.
-        assert!(wide_rho_budget(512) > wide_rho_budget(1024));
+        assert!(rho_budget(MAX_SIQS_BITS, &tuning, false) < wide_rho_budget(MAX_SIQS_BITS + 1));
+        // The crossover is a property of the factor rather than the modulus, so unlike the tiers
+        // this replaced, the count does not vary with width.
+        assert_eq!(wide_rho_budget(512), wide_rho_budget(1024));
     }
 
     /// Balanced semiprimes at or below the sieve ceiling are what this engine is for, and rho
@@ -2746,7 +2767,7 @@ mod tests {
             let fresh = rho_budget(bits, &tuning, false);
             let after = rho_budget(bits, &tuning, true);
             assert!(
-                after >= wide_rho_budget(bits) && after > fresh * 10,
+                after >= wide_rho_budget(bits) && after > fresh,
                 "{bits}-bit cofactor was not deepened after a split: {fresh} -> {after}"
             );
         }

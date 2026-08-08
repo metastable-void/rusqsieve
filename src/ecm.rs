@@ -60,28 +60,33 @@ pub(crate) struct EcmParams {
 impl EcmParams {
     /// Bounds for a composite of `bits` bits.
     ///
-    /// The schedule is deliberately asymmetric around the sieve's ceiling, because what ECM is
-    /// competing against changes completely there.
+    /// `committed` says whether ECM is the stage this composite is counting on, which is what
+    /// decides the budget — width only picks the level within that choice. It is true whenever the
+    /// engine reached ECM on its own: the composite is wider than the sieve accepts, or it is known
+    /// not to be a balanced semiprime. Both mean the same thing here. In the first case there is no
+    /// sieve to fall back on; in the second there is, but it charges by the size of the input while
+    /// the factor that is actually there may be small enough for a curve to find in seconds. The
+    /// width alone must not decide this: a 399-bit cofactor of a wide multi-factor composite needs
+    /// the same curves as the 466-bit number it came from, and giving it the cheap schedule because
+    /// it slipped under the ceiling hands it to a sieve that will not finish.
     ///
-    /// At or below it, SIQS is going to run and finish, so curves are optional extra work on top of
-    /// a solution that already exists. They are budgeted to seconds: enough to catch an unbalanced
-    /// input cheaply, never enough to delay the sieve meaningfully. This range is opt-in.
-    ///
-    /// Above it there is no sieve — the alternative to a curve is refusing the number. The budget
-    /// there is minutes and the run is unconditional, because a bounded wait beats an answer of
-    /// "too large" on a composite whose factor is 25 or 30 digits.
+    /// `committed` is false only for the opt-in case — a composite inside the sieve's range with no
+    /// evidence against it being balanced — where SIQS is going to run and finish, so curves are
+    /// optional extra work on top of a solution that already exists.
     ///
     /// Bounds follow the standard `B1`/curve-count levels — 2k for 15 digits, 11k for 20, 50k for
     /// 25, 250k for 30 — with `B2 = 100·B1`.
-    pub(crate) fn for_composite(bits: usize) -> Self {
-        let (b1, curves) = if bits <= 256 {
-            // The sieve handles these in seconds; a handful of cheap curves only has to beat the
-            // chance that the input is unbalanced.
-            (2_000, 16)
-        } else if bits <= crate::engine::MAX_SIQS_BITS {
-            (11_000, 48)
+    pub(crate) fn for_composite(bits: usize, committed: bool) -> Self {
+        let (b1, curves) = if !committed {
+            // Optional work in front of a sieve that will finish anyway: a cheap lottery ticket on
+            // the input being unbalanced, never enough to delay the sieve meaningfully.
+            if bits <= 256 {
+                (2_000, 16)
+            } else {
+                (11_000, 48)
+            }
         } else if bits <= 512 {
-            // Past the ceiling: no fallback, so this is the level that reaches 25-digit factors.
+            // The level that reaches 25-digit factors.
             (50_000, 300)
         } else {
             (250_000, 500)
@@ -106,59 +111,190 @@ pub(crate) fn factor(
     n: &Natural,
     params: EcmParams,
     seed: u64,
+    keep_going: impl FnMut() -> bool,
+) -> Result<Option<Natural>, crate::engine::EngineError> {
+    let Some(setup) = Setup::new(n, params) else {
+        return Ok(if n.is_even() {
+            Some(Natural::from_u64(2))
+        } else {
+            None
+        });
+    };
+    setup.run_curves(n, params, seed, 0..params.curves, keep_going)
+}
+
+/// Everything a curve needs that does not depend on the curve: the Montgomery context for `n` and
+/// the two prime tables.
+///
+/// Split out from [`factor`] so a threaded driver can build it once and lend it to every worker.
+/// Stage 2's bitmap covers `(B1, B2]` — 25 M bits at the widest schedule — and sieving it per thread
+/// would cost more memory than the search itself.
+struct Setup {
+    montgomery: MontgomeryContext<PARTS>,
+    /// Stage 1 walks every prime power up to `B1`.
+    stage1_primes: Vec<u32>,
+    /// Stage 2 needs the primes in `(B1, B2]`.
+    stage2_primes: PrimeBitmap,
+}
+
+impl Setup {
+    /// Returns `None` when `n` admits no Montgomery context — it is even, or otherwise outside what
+    /// the arithmetic accepts — in which case there is nothing for a curve to do.
+    fn new(n: &Natural, params: EcmParams) -> Option<Self> {
+        if n.is_even() {
+            return None;
+        }
+        Some(Self {
+            montgomery: MontgomeryContext::new(n)?,
+            stage1_primes: crate::smallfactor::sieve_primes(
+                params.b1.min(u64::from(u32::MAX)) as u32
+            ),
+            stage2_primes: prime_bitmap(params.b1, params.b2),
+        })
+    }
+
+    /// Runs the given curve indices, both stages each, and stops at the first factor.
+    ///
+    /// `seed` and the curve index together pick `σ`, so disjoint index sets are disjoint curves and
+    /// the set of curves tried does not depend on how the work was divided.
+    fn run_curves(
+        &self,
+        n: &Natural,
+        params: EcmParams,
+        seed: u64,
+        curves: impl Iterator<Item = u32>,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Option<Natural>, crate::engine::EngineError> {
+        for curve in curves {
+            if !keep_going() {
+                return Err(crate::engine::EngineError::Cancelled);
+            }
+            // Suyama's σ must avoid 0, 1, 2, 3 and 5, which give degenerate curves. Curves are drawn
+            // from a counter rather than an entropy source so a run is reproducible.
+            let sigma = 6 + seed
+                .wrapping_add(u64::from(curve))
+                .wrapping_mul(2_654_435_761)
+                % 1_000_000;
+            let (mut point, a24) = match build_curve(&self.montgomery, n, sigma) {
+                CurveSetup::Ready(ready) => (ready.0, ready.1),
+                // The inverse did not exist, which means the denominator shared a factor with `n`.
+                CurveSetup::Factor(factor) => return Ok(Some(factor)),
+                CurveSetup::Degenerate => continue,
+            };
+
+            if let Some(factor) = stage_one(
+                &self.montgomery,
+                n,
+                &a24,
+                &mut point,
+                &self.stage1_primes,
+                params.b1,
+                &mut keep_going,
+            )? {
+                return Ok(Some(factor));
+            }
+            if let Some(factor) = stage_two(
+                &self.montgomery,
+                n,
+                &a24,
+                &point,
+                &self.stage2_primes,
+                params,
+                &mut keep_going,
+            )? {
+                return Ok(Some(factor));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Searches for a nontrivial factor of `n`, running curves on `threads` threads.
+///
+/// Curves are independent trials of the same lottery, which is the cleanest parallelism in this
+/// crate: no shared state past the read-only tables, no communication, and the same expected number
+/// of curves to a hit however they are distributed. The engine reaches ECM only on the deep path —
+/// above the sieve's ceiling, or on a composite already known to be unbalanced — where nothing else
+/// is using the cores.
+///
+/// Curves are dealt out round robin rather than in contiguous blocks, which matters for the case
+/// that is not exhaustion: when a factor exists, some curve near the front of the sequence usually
+/// finds it, and a block split would leave that curve queued behind its predecessors on one thread
+/// while the others worked through curves nobody needed. Round robin puts the first `T` curves on
+/// `T` threads at once, so time-to-find falls with the thread count the same way exhaustion does.
+#[cfg(any(unix, windows))]
+pub(crate) fn factor_threaded(
+    n: &Natural,
+    params: EcmParams,
+    seed: u64,
+    threads: usize,
     mut keep_going: impl FnMut() -> bool,
 ) -> Result<Option<Natural>, crate::engine::EngineError> {
-    if n.is_even() {
-        return Ok(Some(Natural::from_u64(2)));
+    let threads = threads.max(1).min(params.curves.max(1) as usize);
+    if threads == 1 {
+        return factor(n, params, seed, keep_going);
     }
-    let Some(montgomery) = MontgomeryContext::new(n) else {
-        return Ok(None);
+    let Some(setup) = Setup::new(n, params) else {
+        return Ok(if n.is_even() {
+            Some(Natural::from_u64(2))
+        } else {
+            None
+        });
     };
-    // Stage 1 walks every prime power up to B1; stage 2 needs the primes in (B1, B2].
-    let stage1_primes = crate::smallfactor::sieve_primes(params.b1.min(u64::from(u32::MAX)) as u32);
-    let stage2_primes = prime_bitmap(params.b1, params.b2);
-
-    for curve in 0..params.curves {
-        if !keep_going() {
-            return Err(crate::engine::EngineError::Cancelled);
+    // A worker that finds a factor, and a caller that cancels, both have to stop the others.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let stride = threads;
+    let mut found: Option<Natural> = None;
+    let mut cancelled = false;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads - 1);
+        for worker in 1..threads {
+            let (setup, stop, params) = (&setup, &stop, params);
+            let mine = (worker as u32..params.curves).step_by(stride);
+            handles.push(scope.spawn(move || {
+                let result = setup.run_curves(n, params, seed, mine, || {
+                    !stop.load(std::sync::atomic::Ordering::Relaxed)
+                });
+                // Raising the flag here rather than at the join is the whole point of running
+                // curves in parallel: everyone else is working through curves this answer has
+                // just made unnecessary.
+                if matches!(result, Ok(Some(_))) {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                result
+            }));
         }
-        // Suyama's σ must avoid 0, 1, 2, 3 and 5, which give degenerate curves. Curves are drawn
-        // from a counter rather than an entropy source so a run is reproducible.
-        let sigma = 6 + seed
-            .wrapping_add(u64::from(curve))
-            .wrapping_mul(2_654_435_761)
-            % 1_000_000;
-        let (mut point, a24) = match build_curve(&montgomery, n, sigma) {
-            CurveSetup::Ready(ready) => (ready.0, ready.1),
-            // The inverse did not exist, which means the denominator shared a factor with `n`.
-            CurveSetup::Factor(factor) => return Ok(Some(factor)),
-            CurveSetup::Degenerate => continue,
-        };
-
-        if let Some(factor) = stage_one(
-            &montgomery,
-            n,
-            &a24,
-            &mut point,
-            &stage1_primes,
-            params.b1,
-            &mut keep_going,
-        )? {
-            return Ok(Some(factor));
+        // The caller's progress callback is neither `Send` nor re-entrant, so it stays on this
+        // thread; the workers see only the flag it sets.
+        let mine = setup.run_curves(n, params, seed, (0..params.curves).step_by(stride), || {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            if keep_going() {
+                return true;
+            }
+            cancelled = true;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        });
+        if let Ok(Some(factor)) = &mine {
+            found = Some(factor.clone());
         }
-        if let Some(factor) = stage_two(
-            &montgomery,
-            n,
-            &a24,
-            &point,
-            &stage2_primes,
-            params,
-            &mut keep_going,
-        )? {
-            return Ok(Some(factor));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for handle in handles {
+            // A worker only ever stops early because this flag told it to, so its `Cancelled` is
+            // this thread's answer to report, not an error of its own.
+            if let Ok(Ok(Some(factor))) = handle.join()
+                && found.is_none()
+            {
+                found = Some(factor);
+            }
         }
+    });
+    if found.is_none() && cancelled {
+        return Err(crate::engine::EngineError::Cancelled);
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Outcome of building a curve from a `σ`.
@@ -690,5 +826,85 @@ mod tests {
             started.elapsed().as_secs_f64()
         );
         assert_eq!(found.to_string(), "61218436624818344687");
+    }
+
+    /// What threading curves is worth, separated from the rest of the ladder: the same composite,
+    /// the same schedule, one thread against several.
+    #[test]
+    #[ignore = "manual thread-scaling measurement: cargo test --profile release-test"]
+    fn profile_ecm_threads() {
+        // 512-bit, 56-bit factor: found part-way into the curve list, which is the case threading
+        // is supposed to help. The second is the same width with no factor a curve can reach, so
+        // the whole list runs — the exhaustion case.
+        let cases: [(&str, &str); 2] = [
+            (
+                "56-bit factor",
+                "12520653901285439896785662335406158042267118294497722164155285095014259215604536975970501806596235777062580778663894798784169636410299447575447913433618819",
+            ),
+            (
+                "balanced",
+                "7099963316560806252204922969347930942942266205625838081486734164654665731522481720296851671211071409732822768982138574980293579603508055954145908691102631",
+            ),
+        ];
+        for (label, decimal) in cases {
+            let n = Natural::from_decimal(decimal).unwrap();
+            let params = EcmParams::for_composite(n.bit_len(), true);
+            for threads in [1usize, 2, 4, 8, 16, 32] {
+                let started = std::time::Instant::now();
+                let found = factor_threaded(&n, params, 0x9e37_79b9, threads, || true).unwrap();
+                eprintln!(
+                    "BENCH ecm_threads {label} threads={threads} elapsed={:.2}s found={}",
+                    started.elapsed().as_secs_f64(),
+                    found.is_some()
+                );
+            }
+        }
+    }
+
+    /// Where ECM overtakes Pollard-Brent, which is what decides how much rho is worth running
+    /// above the sieve's ceiling now that curves follow it.
+    #[test]
+    #[ignore = "manual rho/ECM crossover measurement"]
+    fn profile_ecm_crossover() {
+        // 512-bit composites, one per factor size.
+        let cases: [(u32, &str); 6] = [
+            (
+                40,
+                "10965524856473187433527343030021608542042825529320237781006977551738018684194857755319070985668667555894351857792525229510014941700872771304393582395122433",
+            ),
+            (
+                45,
+                "12116169120988654923992538218336215335485730447724692249858441134797395210384242658921083361139434869730555529522496576736029625581486524176331959202425643",
+            ),
+            (
+                48,
+                "10366661018985907137874422052424636308880210264003589347848247333858005046500695470900633790771137195154801579801215173087496650727353387175480727754809689",
+            ),
+            (
+                50,
+                "10810551700461927506097069635896303548617196015290963982218265843246520711629945610837532696353838275925501774995283416957117051757623622423415234591437443",
+            ),
+            (
+                53,
+                "10174597225655958980374790573998505898232615372034473461321216936370548861037335711015596446512692045919971503470980704710817273290556363047424001101239499",
+            ),
+            (
+                56,
+                "11610021563964542285143861053004047938948270269412338721353387703854026036462604100949837211381611078559195027373595836475241078440616423906606809193229213",
+            ),
+        ];
+        for (bits, decimal) in cases {
+            let n = Natural::from_decimal(decimal).unwrap();
+            let params = EcmParams::for_composite(n.bit_len(), true);
+            let started = std::time::Instant::now();
+            let found = factor(&n, params, 7, || true).unwrap();
+            let elapsed = started.elapsed().as_secs_f64();
+            // Brent needs about 1.2*sqrt(p) iterations; the rate is the measured 512-bit one.
+            let rho = 1.2 * (2f64.powi(bits as i32)).sqrt() / 4_840_000.0;
+            eprintln!(
+                "BENCH crossover factor_bits={bits} ecm={elapsed:.2}s rho_projected={rho:.2}s found={}",
+                found.is_some()
+            );
+        }
     }
 }

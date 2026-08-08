@@ -220,14 +220,14 @@ fn wide_composites_are_split_by_rho_rather_than_refused() {
     );
 }
 
-/// The tier the raised budget was actually bought for. A 48-bit factor costs about 20 M iterations,
-/// three times the 6.29 M the sieve-derived budget allowed at every width above the ceiling, so
-/// before this change the 512-bit input below was refused after 2.7 s of work that was nearly deep
-/// enough; it now splits in 30 s. Unoptimized builds run rho at roughly a fifteenth of release
-/// speed, hence the profile.
+/// The handover band. A 40-bit factor is rho's — about 1.3 M iterations, well inside its 12 M
+/// budget — and a 48-bit one is ECM's, needing some 20 M iterations of rho against a few curves.
+/// The point of the pair is that the ladder returns both without the caller knowing or caring
+/// which stage did it. Unoptimized builds run this arithmetic at a fraction of release speed,
+/// hence the profile.
 #[test]
-#[ignore = "40- and 48-bit factors cost seconds to minutes of rho: cargo test --profile release-test"]
-fn wide_composites_split_40_and_48_bit_factors_with_the_default_budget() {
+#[ignore = "seconds of rho and curves: cargo test --profile release-test"]
+fn wide_composites_split_40_and_48_bit_factors() {
     for (decimal, small) in [
         (
             "1015936249400950287360808203240867131305086909045547514124726594384293137\
@@ -301,32 +301,20 @@ fn wide_products_of_many_middling_primes_do_not_stall_in_the_sieve() {
     );
 }
 
-/// What the default budget deliberately does not pay for. Each factor bit doubles Brent's cost, so
-/// 56 bits is minutes and 64 bits is tens of minutes to hours — a real search rather than a stage
-/// in a ladder. It is reachable, and this pins the mechanism that reaches it: the same override the
-/// CLI exposes as `RUSQSIEVE_RHO_ITERATIONS`.
+/// Factor sizes that used to be a deliberate non-goal.
 ///
-/// Measured single-threaded on an x86-64 Xeon 8259CL, `--profile release-test`: the two cases
-/// together took 1,452 s. Run with `--nocapture` for the per-case split.
+/// Each factor bit doubles Brent's cost, so before ECM these two needed `RUSQSIEVE_RHO_ITERATIONS`
+/// raised to 4 G and took 1,452 s together, single-threaded, on an x86-64 Xeon 8259CL. They are now
+/// ordinary work for the default ladder — rho gives up early and curves take over — at about 10 s
+/// each on the same host. That is the whole argument for handing the range to ECM rather than
+/// spending rho iterations on it.
+///
+/// The override still exists and still works; it is simply no longer how anyone should reach 56- or
+/// 64-bit factors, so this runs without it.
 #[test]
-#[ignore = "tens of minutes of Pollard-Brent by design: cargo test --profile release-test"]
-fn raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling() {
-    // 4 G iterations is about three times Brent's expected cost for a 64-bit factor, which covers
-    // the spread around the expectation rather than only its centre.
-    let deep = FactorConfig::default()
-        .with_parallelism(Parallelism::threads(1).unwrap())
-        .with_tuning_overrides(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(4_000_000_000),
-            false,
-        );
+#[ignore = "about twenty seconds of curves: cargo test --profile release-test"]
+fn default_ladder_reaches_56_and_64_bit_factors_above_the_ceiling() {
+    let deep = FactorConfig::default().with_parallelism(Parallelism::threads(1).unwrap());
     for (decimal, bits, small) in [
         (
             "1252065390128543989678566233540615804226711829449772216415528509501425921\
@@ -348,7 +336,7 @@ fn raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling() {
             factor_with_progress(input.clone(), deep.clone(), |_| ProgressAction::Continue)
                 .unwrap();
         eprintln!(
-            "BENCH deep_rho input_bits={bits} factor_bits={} elapsed={:.1}s",
+            "BENCH wide_ecm input_bits={bits} factor_bits={} elapsed={:.1}s",
             64 - small.leading_zeros(),
             started.elapsed().as_secs_f64()
         );
@@ -365,13 +353,13 @@ fn raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling() {
 }
 
 /// Above the sieve's ceiling the elliptic curve method runs whether or not the caller asked for it,
-/// because there is nothing else left: rho gives up around a 2^53 factor and the sieve refuses the
+/// because there is nothing else left: rho hands over around a 2^46 factor and the sieve refuses the
 /// composite outright, so the alternative to curves is reporting "too large" about a number whose
 /// factor is findable.
 ///
 /// This input is a 20-digit prime times a 400-bit prime. Before ECM it returned
-/// `SiqsCompositeTooLarge`; it now factors in about half a minute on this host, most of which is
-/// the deep rho that has to fail first.
+/// `SiqsCompositeTooLarge`. It now factors in seconds, and in how many depends on the thread count,
+/// because curves are what find this factor and they run on every thread the caller allows.
 #[test]
 #[ignore = "a deep rho and then curves: cargo test --profile release-test"]
 fn wide_composites_reach_ecm_without_opting_in() {

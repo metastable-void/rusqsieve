@@ -205,11 +205,12 @@ pub enum FactorError {
     /// Pollard–Brent never reaches the sieve and never produces this error. The payload is the
     /// bit length of the composite that did.
     ///
-    /// Because such a composite has nowhere else to go, Pollard–Brent runs a far deeper budget
-    /// above the sieve's range than below it — about a minute of iterations, reaching a smallest
-    /// factor near 2^53 at 512 bits and 2^50 at 1024 — before this is returned. Callers who want
-    /// the minutes-to-hours search that larger factors cost raise the budget with
-    /// `RUSQSIEVE_RHO_ITERATIONS`.
+    /// Because such a composite has nowhere else to go, two searches run before this is
+    /// returned: a deeper Pollard–Brent budget than the sieve's range gets, reaching a smallest
+    /// factor near 2^46 at every width, and then a committed run of the elliptic curve method,
+    /// which reaches 25-digit factors and costs by the size of the factor rather than of the
+    /// input. The error therefore means the smallest factor outran both, not that the input was
+    /// too wide to attempt. `RUSQSIEVE_RHO_ITERATIONS` overrides the rho budget.
     SiqsCompositeTooLarge(usize),
     /// A configured internal resource limit was exceeded.
     ResourceLimit(ResourceLimitKind),

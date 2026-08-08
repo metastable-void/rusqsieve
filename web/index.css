@@ -270,7 +270,7 @@ button:disabled {
   border-radius: 8px;
   color: var(--muted);
   font-size: 0.85rem;
-  word-break: break-all;
+  word-break: break-word;
   user-select: all;
 }
 footer {
@@ -291,4 +291,12 @@ footer {
 }
 .exp {
   font-size: 0;
+}
+.sep {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+}
+.sep > :nth-child(2) {
+  font-size: 0.72rem;
 }

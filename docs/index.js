@@ -485,23 +485,29 @@ function siqsParallel(decimal, bits, report) {
 const DEEP_RHO_WORKERS = Math.max(1, Math.min(8, nWorkers));
 const DEEP_RHO_CONSTANTS_PER_WORKER = 4;
 
-// Per-worker iteration budget for a deep search, by composite width. Measured under Node against
-// the scalar wasm module on prime moduli, which is the honest way to time a full budget: 1.08M
-// iterations/s at 512 bits and 315k/s at 1024. These spend 31 to 53 s per attempt across the range,
-// and with eight workers racing they reach a smallest factor of roughly 2^52 at 512 bits and 2^50
-// at 1024 — parity with what the native CLI reaches, and against 2^29 for the 2^15 opening peel,
-// which cannot even guarantee a 32-bit factor.
-const deepRhoBudget = (bits) => (bits <= 512 ? 32 << 20 : bits <= 768 ? 24 << 20 : 16 << 20);
+// Per-worker iteration budget for a deep search. Flat, and much smaller than it was, because ECM
+// runs after rho now and is cheaper than rho for every factor size past the handover: `T` racing
+// walks collide in about `1.2*sqrt(p)/sqrt(T)` iterations each, so eight workers at this budget
+// reach a smallest factor near 2^46 — the same place `engine::wide_rho_budget` stops — and
+// everything beyond it belongs to curves.
+//
+// Measured under Node against the scalar wasm module on a 512-bit modulus: 1.086M iterations/s, so
+// this is 3.9 s per worker, against 0.88 s for one curve at B1=50,000. The old 2^25 budget cost
+// 30.9 s per worker and reached 2^52.5 — and the same wall time buys 35 curves per worker, which
+// is most of a schedule that reaches 25-digit factors. Rho stays because it is the cheaper stage
+// below the handover, not because a deeper rho was ever going to reach further than curves do.
+const DEEP_RHO_BUDGET = 4 << 20;
 
 // The fallback budget, for a runtime with no wasm module or no Workers. It runs on the main thread
-// and so has to stay small enough to stay sliceable: about half a minute of BigInt work.
+// and so has to stay small enough to stay sliceable, and it is one walk rather than eight, so it
+// keeps a larger iteration count than the pool does for a shallower reach.
 const mainThreadRhoBudget = (bits) => (bits <= 512 ? 8 << 20 : 4 << 20);
 
 // Deep Pollard-Brent in wasm across a pool of workers, racing disjoint polynomial constants.
 // Resolves to a factor or null; cancellation is termination, which is why nothing here polls.
 async function deepPollard(c, bits, report) {
   if (!wasmModule) return deepPollardOnMainThread(c, bits, report);
-  const budget = deepRhoBudget(bits);
+  const budget = DEEP_RHO_BUDGET;
   let pool;
   try {
     pool = Array.from(
@@ -570,7 +576,7 @@ const ECM_CURVES_PER_WORKER = 64;
 
 // The elliptic curve method across a pool of workers, for a composite nothing else can take.
 // Resolves to a factor or null; cancellation is termination.
-async function ecmSearch(c, bits, report) {
+async function ecmSearch(c, committed, report) {
   if (!wasmModule) return null;
   let pool;
   try {
@@ -609,6 +615,7 @@ async function ecmSearch(c, bits, report) {
               b1: 0,
               b2: 0,
               curves: ECM_CURVES_PER_WORKER,
+              committed,
               // Disjoint σ stretches, so no two workers walk the same curve.
               seed: 1 + index * ECM_CURVES_PER_WORKER,
             });
@@ -696,27 +703,37 @@ async function factorize(N, report) {
     // natively; the numbers differ because BigInt runs rho at roughly an eighth of the native rate,
     // not because the policy does.
     const refused = compositeBits > maxSiqsBits;
+    const unbalanced = refused || afterSplit;
     if (refused || (afterSplit && compositeBits >= DEEP_RHO_MIN_BITS)) {
       const deep = await deepPollard(c, compositeBits, report);
       if (deep && deep > 1n && deep < c) {
         stack.push([deep, true], [c / deep, true]);
         continue;
       }
-      if (refused) {
-        // Nothing else is left. Rho gives up at a factor size ECM starts at, and the coordinator
-        // will not take this composite at all, so curves run here regardless of anything the user
-        // selected: the alternative is refusing a number whose factor is findable.
-        const curved = await ecmSearch(c, compositeBits, report);
-        if (curved && curved > 1n && curved < c) {
-          stack.push([curved, true], [c / curved, true]);
-          continue;
-        }
-        throw new Error(
-          `this number needs the quadratic sieve on a ${compositeBits}-bit composite, ` +
-            `above the ${maxSiqsBits}-bit limit — numbers of any size still factor when ` +
-            `their factors are small`,
-        );
+    }
+    // Curves run wherever the balanced premise has already been disproved, which is the same rule
+    // `engine::factor_node` applies: above the ceiling there is no sieve to fall through to, and a
+    // composite that split earlier has a small factor and may well have a medium one — which is
+    // ECM's range and something the sieve would grind through by the size of `c` instead. A
+    // balanced semiprime inside the sieve's range reaches neither branch, so it never pays.
+    //
+    // `committed` sizes the run rather than deciding it: full curve schedule where ECM is what the
+    // composite is counting on, the cheap one where a sieve run is going to happen anyway and
+    // finish in seconds.
+    if (unbalanced) {
+      const committed = refused || compositeBits >= DEEP_RHO_MIN_BITS;
+      const curved = await ecmSearch(c, committed, report);
+      if (curved && curved > 1n && curved < c) {
+        stack.push([curved, true], [c / curved, true]);
+        continue;
       }
+    }
+    if (refused) {
+      throw new Error(
+        `this number needs the quadratic sieve on a ${compositeBits}-bit composite, ` +
+          `above the ${maxSiqsBits}-bit limit — numbers of any size still factor when ` +
+          `their factors are small`,
+      );
     }
     const factor = await siqsParallel(c.toString(), compositeBits, report);
     if (factor <= 1n || factor >= c || c % factor !== 0n) {
@@ -788,7 +805,11 @@ function render(grouped, original, seconds) {
       if (i) {
         const sep = document.createElement("span");
         sep.className = "sep";
-        sep.textContent = "·";
+        const sepDot = document.createElement('span');
+        sepDot.textContent = "·";
+        const sepSpace = document.createElement('span');
+        sepSpace.textContent = "\u00a0";
+        sep.append(sepDot, sepSpace);
         big.append(sep);
       }
       const factor = document.createElement("span");

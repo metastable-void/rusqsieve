@@ -332,7 +332,11 @@ pub extern "C" fn qs_coord_free(session: u32) {
 ///
 /// `b1`/`b2` are the stage bounds and `curves` the number of curves to try; `seed` selects the
 /// `σ` sequence, so the same arguments reproduce the same run. Zero bounds take the defaults for
-/// the composite's width.
+/// the composite's width and `committed`, which says whether ECM is the stage this composite is
+/// counting on — true above the sieve's ceiling, where there is nothing else, and false for the
+/// cheap schedule in front of a sieve run that is going to happen anyway. It is the same
+/// distinction the engine makes natively, kept here so the glue does not carry a second copy of
+/// the schedule.
 ///
 /// Returns a packet (kind 13) whose payload is the factor as `PARTS * 8` little-endian bytes, or a
 /// packet with an empty payload when every curve was exhausted. Returns 0 only for a modulus that
@@ -345,6 +349,7 @@ pub unsafe extern "C" fn qs_ecm(
     b2: u32,
     curves: u32,
     seed: u32,
+    committed: u32,
 ) -> u32 {
     let Some(n) = parse_decimal(n_pointer, n_length) else {
         return 0;
@@ -352,7 +357,7 @@ pub unsafe extern "C" fn qs_ecm(
     if n < WasmNatural::from_u64(3) {
         return 0;
     }
-    let defaults = crate::ecm::EcmParams::for_composite(n.bit_len());
+    let defaults = crate::ecm::EcmParams::for_composite(n.bit_len(), committed != 0);
     let params = crate::ecm::EcmParams {
         b1: if b1 == 0 { defaults.b1 } else { u64::from(b1) },
         b2: if b2 == 0 { defaults.b2 } else { u64::from(b2) },
@@ -370,16 +375,18 @@ pub unsafe extern "C" fn qs_ecm(
 }
 
 /// Report the default ECM bounds for a composite of `bits` bits, so the glue can size a run and
-/// report it without duplicating the schedule.
+/// report it without duplicating the schedule. `committed` selects between the two schedules, as
+/// for [`qs_ecm`].
 #[unsafe(no_mangle)]
-pub extern "C" fn qs_ecm_default_b1(bits: u32) -> u32 {
-    u32::try_from(crate::ecm::EcmParams::for_composite(bits as usize).b1).unwrap_or(u32::MAX)
+pub extern "C" fn qs_ecm_default_b1(bits: u32, committed: u32) -> u32 {
+    u32::try_from(crate::ecm::EcmParams::for_composite(bits as usize, committed != 0).b1)
+        .unwrap_or(u32::MAX)
 }
 
 /// Companion to [`qs_ecm_default_b1`].
 #[unsafe(no_mangle)]
-pub extern "C" fn qs_ecm_default_curves(bits: u32) -> u32 {
-    crate::ecm::EcmParams::for_composite(bits as usize).curves
+pub extern "C" fn qs_ecm_default_curves(bits: u32, committed: u32) -> u32 {
+    crate::ecm::EcmParams::for_composite(bits as usize, committed != 0).curves
 }
 
 /// Search for a factor of the decimal composite `n` with a bounded Pollard-Brent.

@@ -270,35 +270,43 @@ run. Iteration rates, release build, single-threaded, x86-64 Xeon 8259CL — rep
 
 | composite bits | iterations/s | budget | wall | smallest factor reached (`1.2·√p`) |
 |---:|---:|---:|---:|---:|
-| 400 | 6,881,194 | 6,291,456 (sieve-derived) | 0.9 s | 2^44.6 |
-| 512 | 4,842,288 | 128,000,000 | 26 s | 2^53.0 |
-| 768 | 2,203,329 | 72,000,000 | 33 s | 2^51.7 |
-| 1024 | 1,338,216 | 48,000,000 | 36 s | 2^50.5 |
+| 400 | 6,881,194 | 12,000,000 | 1.7 s | 2^46.5 |
+| 512 | 4,842,288 | 12,000,000 | 2.5 s | 2^46.5 |
+| 768 | 2,203,329 | 12,000,000 | 5.4 s | 2^46.5 |
+| 1024 | 1,338,216 | 12,000,000 | 9.0 s | 2^46.5 |
 
-End to end through the release CLI, on inputs built as one small prime times one wide prime. The
-old-budget column is the same binary run with `RUSQSIEVE_RHO_ITERATIONS=6291456`, which is exactly
-what 0.4.2 spent at every width above the ceiling, so both columns are the same inputs on the same
-host. The last row is the cost side of the decision: a hopeless composite is now refused only after
-the budget is spent.
+End to end through the release CLI, on inputs built as one small prime times one wide prime. Both
+columns are the same inputs on the same host on the same day, against a 0.4.2 binary built from
+commit `9bf03b8` in a worktree. Above 40 bits the work belongs to ECM rather than rho, so those rows
+are given by thread count as well; the last row is the cost side of the decision, where nothing is
+there to find and the whole schedule is spent before the composite is refused.
 
-| input | smallest factor | 6.29M budget (0.4.2) | default (0.4.3) |
-|---|---:|---:|---:|
-| 401-bit | 16-bit | 0.11 s | 0.11 s |
-| 512-bit | 32-bit | 0.11 s | 0.11 s |
-| 1024-bit | 32-bit | 0.21 s | 0.21 s |
-| 512-bit | 40-bit | 1.51 s | 1.51 s |
-| 512-bit | 48-bit | refused, 2.71 s | 30.35 s |
-| 512-bit balanced semiprime | — | refused, 2.71 s | refused, 61.99 s |
+| input | smallest factor | 0.4.2 | 0.4.3, 1 thread | 8 threads | 32 threads |
+|---|---:|---:|---:|---:|---:|
+| 401-bit | 16-bit | 0.00 s | 0.00 s | 0.00 s | 0.00 s |
+| 512-bit | 32-bit | 0.07 s | 0.04 s | 0.04 s | 0.04 s |
+| 1024-bit | 32-bit | 0.14 s | 0.10 s | 0.10 s | 0.10 s |
+| 512-bit | 40-bit | 1.44 s | 0.74 s | 0.74 s | 0.74 s |
+| 512-bit | 48-bit | refused, 2.63 s | 12.04 s | 4.15 s | 3.03 s |
+| 512-bit | 56-bit | refused, 2.67 s | 9.84 s | 3.60 s | 2.89 s |
+| 401-bit | 64-bit | refused, 1.96 s | 11.34 s | 3.19 s | 2.32 s |
+| 512-bit balanced semiprime | — | refused, 2.58 s | refused, 71.2 s | 14.7 s | 5.9 s |
 
-A cofactor that split under rho keeps the deep budget from 257 bits up, which is what lets a wide
-product of middling primes finish at all. Measured through the release CLI with 96 workers:
+0.4.2 refused every input from 48 bits up, after 2 to 3 s of rho that could not have reached the
+factor. The rows that are flat across thread counts are rho's, which is single-threaded; the rows
+that scale are ECM's.
+
+A cofactor that split under either search keeps the deep budget from 257 bits up, which is what lets
+a wide product of middling primes finish at all. Measured through the release CLI with 96 workers,
+median of three:
 
 | input | before | after |
 |---|---:|---:|
-| 498-bit, ten 50-bit primes | two factors peeled, then a 399-bit sieve wanting 206,403 relations at ~2/s | 65.3 s, all ten primes verified |
+| 498-bit, ten 50-bit primes | two factors peeled, then a 399-bit sieve wanting 206,403 relations at ~2/s | 9.3 s, all ten primes verified |
 
-The run peels five factors in rho (498 → 448 → 399 → 349 → 299 bits) and hands the 250-bit
-remainder to a sieve that builds its factor base in 0.03 s and collects in 2.9 s.
+The run peels factors until a 250-bit remainder is left and hands that to a sieve that builds its
+factor base in 0.03 s. This is the noisiest case in the file — 5.6 s to 14.6 s across runs — because
+which stage peels which factor moves between runs.
 
 Nothing at or below the ceiling changed. The budget there is still the sieve-derived one, pinned
 value-for-value by `budgets_at_and_below_the_ceiling_are_unchanged`, because rho finds nothing on a
@@ -308,27 +316,22 @@ after a warm-up, `--threads 8` (32 for the last two rows):
 
 | input | 0.4.2 | 0.4.3 | delta |
 |---|---:|---:|---:|
-| 128-bit balanced | 0.032 s | 0.031 s | −3.1% |
-| 192-bit balanced | 0.378 s | 0.371 s | −1.8% |
-| 216-bit balanced | 1.498 s | 1.473 s | −1.7% |
-| 224-bit balanced | 2.925 s | 2.892 s | −1.1% |
-| 300-bit, 32-bit factor | 0.038 s | 0.038 s | +0.7% |
-| 384-bit, 40-bit factor | 0.574 s | 0.565 s | −1.6% |
-| 256-bit balanced | 6.766 s | 6.548 s | −3.2% |
-| 272-bit balanced | 16.033 s | 15.720 s | −1.9% |
+| 128-bit balanced | 0.02 s | 0.02 s | 0.0% |
+| 192-bit balanced | 0.42 s | 0.42 s | 0.0% |
+| 216-bit balanced | 1.59 s | 1.56 s | −1.9% |
+| 224-bit balanced | 3.17 s | 3.12 s | −1.6% |
+| 256-bit balanced | 8.29 s | 7.94 s | −4.2% |
+| 272-bit balanced | 16.31 s | 15.93 s | −2.3% |
 
 Every delta is host noise around an identical code path: below the ceiling the two binaries execute
-the same budget through the same loop.
+the same budget through the same loop, and neither runs a curve.
 
-Deeper searches are the caller's decision, because each factor bit doubles Brent's cost:
-
-```sh
-RUSQSIEVE_RHO_ITERATIONS=4000000000 qs-factor < composite.txt
-```
-
-`raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling` is the same search as a test: a
-56-bit factor out of a 512-bit input plus a 64-bit factor out of a 401-bit input, single-threaded,
-1,452 s for the pair on this host. Run it with `--nocapture` for the per-case split.
+`RUSQSIEVE_RHO_ITERATIONS` still overrides the rho budget, but it is no longer how anyone should
+reach a large factor — that range is ECM's now, and far cheaper.
+`default_ladder_reaches_56_and_64_bit_factors_above_the_ceiling` is the case as a test: a 56-bit
+factor out of a 512-bit input and a 64-bit factor out of a 401-bit input, single-threaded, at 10.4 s
+and 12.5 s. The same pair took 1,452 s together when the only stage that could reach them was rho at
+`RUSQSIEVE_RHO_ITERATIONS=4000000000`, which is what that test used to do.
 
 The browser runs the same loop in wasm across a pool of rho workers (`qs_rho`), each walking a
 disjoint range of polynomial constants. Iteration rates measured under Node 24.15 on prime moduli:
@@ -338,22 +341,32 @@ disjoint range of polynomial constants. Iteration rates measured under Node 24.1
 | 512 | 4,842,288/s | 1,075,000/s | 288,000/s |
 | 1024 | 1,338,216/s | 315,000/s | 115,000/s |
 
-Per-worker budget is 2^25 iterations up to 512 bits, 24M through 768, 16M above. `T` independent
-walks collide in about `1.2·sqrt(p)/sqrt(T)` iterations, so eight workers reach a smallest factor of
-roughly 2^52 at 512 bits and 2^50 at 1024 — parity with the native CLI — in 31 to 53 s of worker
-time, with the main thread free throughout.
+Per-worker budget is a flat 2^22 iterations. `T` independent walks collide in about
+`1.2·sqrt(p)/sqrt(T)` iterations, so eight workers reach a smallest factor near 2^46 — the same
+place the native budget stops, and for the same reason: past it, curves are cheaper. The measured
+handover, through the shipped wasm exports on a 512-bit modulus, is 1.086 M iterations/s against
+0.88 s for one curve at `B1 = 50,000`, so this budget is 3.9 s per worker while the old 2^25 one was
+30.9 s — and that 30.9 s buys 35 curves per worker, most of a schedule that reaches 25-digit
+factors.
 
-End to end on a 478-bit product of ten 48-bit primes, driving the real worker protocol on Node
+End to end on a 478-bit product of ten 48-bit primes, driving the real worker protocols on Node
 worker threads with eight workers:
 
 | ladder | result |
 |---|---|
 | `BigInt`, main thread, 2^23 budget | one factor in 12.1 s, then 33.2 s exhausted at 430 bits → sieve/refusal |
 | `BigInt`, main thread, 2^26 budget | five factors, 140 s of blocked main thread |
-| wasm pool, 2^25 per worker | five factors in **34.1 s** (5–8 s each), main thread free, 239-bit remainder to the sieve |
+| wasm rho pool, 2^25 per worker | five factors in 34.1 s (5–8 s each), main thread free, 239-bit remainder to the sieve |
+| wasm rho pool at 2^22 plus curves | **all ten primes in 19.3 s**, no sieve run at all |
+
+The last row is the whole ladder rather than one stage: rho splits the 478-bit input in 7.4 s, then
+each of the next four composites exhausts its (much smaller) rho budget in about 2 s and is split by
+curves in under a second. Below 257 bits the composite is still known to be unbalanced, so curves
+keep running on the cheap schedule, and they peel the remaining 48-bit factors in 0.1 to 0.2 s each.
 
 A runtime with no module or no `Worker` falls back to the main thread's sliced `BigInt` search,
-which keeps the smaller 2^23/2^22 budget because it has to stay sliceable into ~50 ms macrotasks.
+which keeps the larger 2^23/2^22 budget because it is one walk rather than eight, and has to stay
+sliceable into ~50 ms macrotasks.
 
 ## Montgomery arithmetic and the rho inner loop
 
@@ -468,19 +481,48 @@ Single-threaded on an x86-64 Xeon 8259CL:
 | 10 digits (2^32) | 161-bit | `B1 = 2,000`, 64 curves | 0.11 s (debug build) |
 | 20 digits (2^66) | 260-bit | `B1 = 50,000`, 300 curves | 8.9 s |
 
-End to end through the release CLI, on a 466-bit composite that is a 20-digit prime times a 400-bit
+End to end through the release CLI, on a 465-bit composite that is a 20-digit prime times a 400-bit
 prime — the shape that has no other stage:
 
-| | before | after |
-|---|---|---|
-| 466-bit, 20-digit factor | `SiqsCompositeTooLarge` | 29.8 s |
-
-Most of that 29.8 s is the deep rho that has to fail first; rho's budget at this width reaches about
-2^53 and the factor is 2^66.
+| 465-bit, 20-digit factor | wall |
+|---|---:|
+| 0.4.2 | `SiqsCompositeTooLarge` |
+| 1 thread | 44.7 s |
+| 8 threads | 7.9 s |
+| 32 threads | 5.0 s |
+| 96 threads | 3.4 s |
 
 For scale against the neighbours: Pollard–Brent needs roughly `1.2·sqrt(p)` iterations, so a 2^66
 factor is about 10^10 iterations — hours at the measured 4.8 M/s — and the sieve does not accept a
-466-bit composite at all.
+465-bit composite at all.
+
+### Threading curves
+
+Curves are independent trials of the same lottery, which makes them the cleanest parallelism in this
+crate: nothing is shared past the read-only prime tables, and the expected number of curves to a hit
+does not depend on how they were divided. Work is dealt out round robin — worker `w` of `T` takes
+curve indices `w`, `w + T`, `w + 2T` — and the first factor found stops the rest.
+
+Round robin rather than contiguous blocks is what makes *finding* scale as well as *exhausting*: the
+curve that succeeds is usually near the front of the list, and a block split leaves it queued behind
+its predecessors on one thread while the other threads work through curves nobody needed. Reproduce
+with `cargo test --profile release-test --lib -- --ignored profile_ecm_threads --nocapture`:
+
+| threads | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| 512-bit, 56-bit factor | 7.93 s | 4.07 | 2.05 | 0.97 | 0.41 | 0.33 |
+| 512-bit balanced, 300 curves exhausted | 75.68 s | 38.24 | 19.58 | 10.37 | 5.24 | 3.06 |
+
+Both scale about linearly to 32 threads — 24× and 25×. An intermediate version that raised the stop
+flag only when the *calling* thread finished its own share measured 19.70 s on the first row at four
+threads, slower than exhausting the entire list, because workers kept running curves after the
+answer was already known.
+
+The per-thread cost is deliberately small: one `Setup` — the Montgomery context, the stage 1 prime
+list, and the stage 2 bitmap, which is 625 KB at `B1 = 50,000` and 3 MB at 250,000 — is built once
+and lent to every thread. What a thread owns privately is the current point and a 24-entry baby-step
+table, about 7 KB, so thread count does not multiply the cache footprint. wasm has no threads in this
+artifact; the browser divides curves across workers instead, one `qs_ecm` call each.
 
 The browser runs the same stage through `qs_ecm` across a pool of workers. `tools/ecm-check.mjs`
 splits a 161-bit composite in about 60 ms under Node 24.15.
@@ -499,6 +541,22 @@ balanced semiprime, 32 threads, median of three:
 The difference is noise: at that width the schedule is `B1 = 2,000` over 16 curves against a
 6.7-second sieve run. The reason to keep it off by default is that no curve can succeed on a
 balanced semiprime, not that the curves are expensive.
+
+What the policy does cost is visible on a composite that is unbalanced only by a small factor, where
+curves run unasked and cannot succeed either. Both rows are 7 times a balanced semiprime, 32 threads,
+against the same 0.4.2 binary:
+
+| input | cofactor after trial division | 0.4.2 | 0.4.3 |
+|---|---|---:|---:|
+| 259-bit | 256-bit, cheap schedule | 7.44 s | 7.37 s |
+| 275-bit | 272-bit, committed schedule | 16.62 s | 18.97 s |
+
+The first is free — 16 curves at `B1 = 2,000`. The second is the deliberate trade at the 257-bit
+floor: about 3 s of curves in front of a 16 s sieve run, 18% for the chance of a medium factor on a
+composite that has already shown it has a small one. The fraction only improves above the floor,
+because the sieve's cost grows with the input while the curve schedule does not — at 399 bits the
+sieve wants weeks and the same curves still take seconds. Below the floor the cheap schedule applies
+for exactly this reason.
 
 ## The batched gcd
 

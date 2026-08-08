@@ -40,9 +40,17 @@ self.onmessage = async ({ data }) => {
       const input = putString(ex, decimal);
       let handle;
       try {
-        // Zero bounds take the module's own schedule for this width, so the glue does not
-        // duplicate a table that lives in the engine.
-        handle = ex.qs_ecm(input.ptr, input.len, data.b1 >>> 0, data.b2 >>> 0, data.curves, data.seed >>> 0);
+        // Zero bounds take the module's own schedule for this width and commitment, so the glue
+        // does not duplicate a table that lives in the engine.
+        handle = ex.qs_ecm(
+          input.ptr,
+          input.len,
+          data.b1 >>> 0,
+          data.b2 >>> 0,
+          data.curves,
+          data.seed >>> 0,
+          data.committed ? 1 : 0,
+        );
       } finally {
         ex.qs_dealloc(input.ptr, input.len, 1);
       }

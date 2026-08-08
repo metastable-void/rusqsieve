@@ -121,21 +121,25 @@ returns `FactorError::SiqsCompositeTooLarge`, carrying the composite's bit
 length rather than the caller's. Arithmetic operators on `Natural` wrap at
 capacity, while `checked_*` methods report overflow.
 
-Because that composite has nowhere else to go, Pollard–Brent runs a much deeper
-budget above the ceiling than below it — 26 to 36 s of iterations, which
-reaches a smallest factor near 2^53 at 512 bits and 2^50 at 1024, and covers
-factors up to 32 bits with orders of magnitude to spare. A wide input carrying a
-findable factor is therefore split rather than refused. Set
-`RUSQSIEVE_RHO_ITERATIONS` for the minutes-to-hours search that 56- and 64-bit
-factors cost.
+Because that composite has nowhere else to go, two searches run above the
+ceiling that a composite inside the sieve's range does not pay for. Pollard–
+Brent gets a deeper budget — 12 M iterations, 1.7 s at 400 bits to 9 s at 1024,
+which reaches a smallest factor near 2^46 and covers 32-bit factors with orders
+of magnitude to spare. Everything past that is the elliptic curve method's,
+which costs by the size of the factor rather than of the input: 25-digit factors
+are routine, and 56- and 64-bit ones take about ten seconds single-threaded
+where the equivalent rho search took twenty minutes. Curves are independent
+trials, so they run on every thread the caller allows and the search scales
+about linearly with them. A wide input carrying a findable factor is therefore
+split rather than refused.
 
-A cofactor that reached the recursion by splitting under rho keeps that deep
-budget down to 257 bits, because splitting proves it is not the balanced
-semiprime the cheap budget is sized for. This is what lets a wide product of
-many middling primes finish: a 498-bit product of ten 50-bit primes peels five
-factors in rho and hands a 250-bit remainder to the sieve, 65 s in total, where
-it previously stalled on a 399-bit sieve for weeks. Balanced semiprimes never
-reach that branch — rho does not split them.
+A cofactor that reached the recursion by splitting under either search keeps
+both deep budgets down to 257 bits, because splitting proves it is not the
+balanced semiprime the cheap budgets are sized for. This is what lets a wide
+product of many middling primes finish: a 498-bit product of ten 50-bit primes
+peels factors until a 250-bit remainder is left for the sieve, about 9 s in
+total, where it previously stalled on a 399-bit sieve for weeks. Balanced
+semiprimes never reach that branch — neither search splits them.
 
 All supported public items are covered by rustdoc, enforced with
 `deny(missing_docs)`. The complete 0.4 contract and implementation architecture
@@ -297,8 +301,13 @@ balanced semiprimes.
 along PRAC addition chains, and a standard-continuation stage 2 over a 210-wheel,
 with one gcd per stage. Its cost is governed by the size of the *factor* rather
 than of the input, which is what makes it the right tool where the other two are
-wrong: it recovered a 20-digit factor of a 466-bit composite in 30 s, an input
-that previously returned `SiqsCompositeTooLarge`.
+wrong: it recovered a 20-digit factor of a 465-bit composite in 3.4 s on 96
+threads and 44.7 s on one, an input that previously returned
+`SiqsCompositeTooLarge` outright. Curves are independent trials of the same
+lottery, so they are distributed round robin across the caller's threads and
+both finding a factor and exhausting the curve list scale about linearly: an
+exhaustive 300-curve run at `B1 = 50,000` on a 512-bit composite took 75.7 s on
+one thread and 3.1 s on 32.
 
 Balanced semiprimes still never pay for it. Curves run without being asked only
 where the balanced premise has already been disproved — a composite wider than

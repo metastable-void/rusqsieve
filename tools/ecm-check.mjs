@@ -13,8 +13,14 @@ const module = await WebAssembly.compile(await readFile(WASM));
 const exports = (await WebAssembly.instantiate(module, {})).exports;
 assert.equal(exports.qs_abi_version(), 5, "the ecm worker requires wasm ABI 5");
 assert.equal(typeof exports.qs_ecm, "function", "wasm module exports no qs_ecm");
-assert.ok(exports.qs_ecm_default_b1(512) > 0, "no default B1 for a 512-bit composite");
-assert.ok(exports.qs_ecm_default_curves(512) > 0, "no default curve count");
+assert.ok(exports.qs_ecm_default_b1(512, 1) > 0, "no default B1 for a 512-bit composite");
+assert.ok(exports.qs_ecm_default_curves(512, 1) > 0, "no default curve count");
+// The two schedules must actually differ: the cheap one runs in front of a sieve that will finish
+// anyway, and sizing it like the committed one would delay that sieve for a lottery ticket.
+assert.ok(
+  exports.qs_ecm_default_b1(384, 0) < exports.qs_ecm_default_b1(384, 1),
+  "the uncommitted schedule is not cheaper than the committed one",
+);
 
 function search(request) {
   return new Promise((resolve, reject) => {

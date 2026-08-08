@@ -320,26 +320,33 @@ and its cost is pure overhead. Above the ceiling that reasoning does not apply:
 the sieve refuses the composite, so rho is the entire attempt and the
 alternative to spending more is `SiqsCompositeTooLarge` on an input whose
 smallest factor was findable. The budget there is a wall-clock decision instead
-— 26 to 36 s per attempt across the supported widths, tiered by width because
+— a flat 12 M iterations, 1.7 s at 400 bits rising to 9 s at 1024 as the
 per-iteration cost grows with the square of the limb count. Since Brent finds
-`p` in roughly `1.2·sqrt(p)` iterations, that reaches a smallest factor of
-about 2^53 at 512 bits, 2^51.7 at 768, and 2^50.5 at 1024; factors up to 32
-bits are covered by more than two orders of magnitude of margin at every width.
-`RUSQSIEVE_RHO_ITERATIONS` overrides the budget for callers who want the
-minutes-to-hours search that 56- and 64-bit factors cost.
+`p` in roughly `1.2·sqrt(p)` iterations, that reaches a smallest factor of about
+2^46 at every width, covering 32-bit factors by more than four orders of
+magnitude of margin.
+
+Where the budget stops is a handover rather than a limit, because ECM follows it
+(§6.1) and is cheaper than rho for everything past roughly 2^46: doubling the
+factor size doubles Brent's cost, while a curve's cost grows subexponentially.
+Paying rho past the crossover buys nothing a curve would not have found sooner,
+which is why the budget is flat rather than tiered upward with width.
+`RUSQSIEVE_RHO_ITERATIONS` still overrides it for callers who want a specific
+depth of rho.
 
 The sieve-fraction sizing rests on one premise — that the node is a balanced
 semiprime the sieve will finish cheaply — and a cofactor that reached the
-recursion by *splitting under rho* disproves it: such a value has at least three
-prime factors and at least one was small enough for rho to find. From 257 bits
-upward, where a sieve run stops costing seconds, those cofactors therefore keep
-the deep budget. Balanced semiprimes never reach that branch, because rho does
-not split them and nothing below them inherits the mark. Without this rule a
-wide product of middling primes peeled factors only while it was above the
-ceiling: a 498-bit product of ten 50-bit primes crossed 400 bits after two
-splits, and its 399-bit remainder went to a sieve that wanted 206,403 relations
-at roughly two per second. It now peels five factors in rho and hands a 250-bit
-remainder to a sieve that returns it in under three seconds.
+recursion by *splitting under a search* disproves it: such a value has at least
+three prime factors and at least one was small enough for rho or a curve to
+find. From 257 bits upward, where a sieve run stops costing seconds, those
+cofactors therefore keep the deep budget, and for the same reason they keep the
+committed ECM schedule. Balanced semiprimes never reach that branch, because
+neither search splits them and nothing below them inherits the mark. Without
+this rule a wide product of middling primes peeled factors only while it was
+above the ceiling: a 498-bit product of ten 50-bit primes crossed 400 bits after
+two splits, and its 399-bit remainder went to a sieve that wanted 206,403
+relations at roughly two per second. It now peels factors until a 250-bit
+remainder is left and finishes in about 9 s.
 
 ## 6. Native factorization pipeline
 
@@ -359,10 +366,11 @@ The optimized blocking engine performs:
 ### 6.1 Elliptic curve method
 
 ECM occupies the gap between the other two stages. Pollard–Brent costs
-`O(sqrt p)` in the smallest factor and stops paying around 2^53; SIQS charges by
-the size of `N` and refuses it past 400 bits. ECM's cost is governed by the size
-of the factor rather than of the input, which makes a 20- to 30-digit factor of
-a wide composite ordinary work and impossible for either neighbour.
+`O(sqrt p)` in the smallest factor and stops being the cheaper of the two around
+2^46; SIQS charges by the size of `N` and refuses it past 400 bits. ECM's cost
+is governed by the size of the factor rather than of the input, which makes a
+20- to 30-digit factor of a wide composite ordinary work and impossible for
+either neighbour.
 
 The implementation uses Montgomery curves in `(X : Z)` coordinates with Suyama's
 `σ` parameterization, which forces the group order divisible by 12. Stage 1
@@ -389,7 +397,18 @@ last of them:
 A balanced semiprime inside the sieve's range satisfies none of them and must
 never run a curve by default: it is the workload the crate's performance claim
 rests on, and no curve can succeed on it. `qs_ecm` exposes the same stage to the
-browser, which uses it for case 1.
+browser, which applies the same conditions 1 and 2.
+
+Curves are independent trials, so a run is divided across the caller's threads:
+worker `w` of `T` takes curve indices `w`, `w + T`, `w + 2T`, and so on, and the
+first factor found stops the rest. Round robin rather than contiguous blocks is
+what makes finding a factor scale as well as exhausting the list — the curve that
+succeeds is usually near the front, and a block split would leave it queued
+behind its predecessors on one thread. Measured on a 512-bit composite with a
+56-bit factor, 7.9 s on one thread and 0.33 s on 32; exhausting 300 curves at
+`B1 = 50,000` on a balanced 512-bit semiprime, 75.7 s and 3.1 s. Wasm has no
+threads in this artifact, so the browser divides curves across workers instead,
+one `qs_ecm` call each.
 
 The high-level API accepts any `Natural<P>` that fits the engine's fixed
 optimized width and converts it without changing the value; a value beyond that
@@ -400,9 +419,10 @@ Step 7 is the only width-limited stage. A composite wider than 400 bits reaching
 it returns `FactorError::SiqsCompositeTooLarge(bits)`, where `bits` is the
 composite's width, not the caller's input. Steps 1–5 run regardless of input
 width, so a wide input with small factors completes through them — and a
-composite past the ceiling gets the deep Pollard–Brent budget described in §5
-before step 7 is asked at all, so the error means the smallest factor outran a
-minute of rho, not that the input was too wide to try.
+composite past the ceiling gets both the deep Pollard–Brent budget described in
+§5 and a committed ECM run before step 7 is asked at all, so the error means the
+smallest factor outran seconds of rho and hundreds of curves, not that the input
+was too wide to try.
 
 Sieving that spends its whole polynomial-family budget without reaching the
 relation target returns `FactorError::InsufficientRelations`. The budget scales
@@ -674,10 +694,21 @@ range of polynomial constants, so the pool runs that many independent walks and
 the first collision wins — about a `sqrt(T)` speedup for `T` workers. Measured
 under Node against the scalar module, wasm runs the loop at 1.08M iterations/s
 on a 512-bit modulus and 315k/s at 1024, against 288k/s and 115k/s for the main
-thread's `BigInt` implementation. With eight workers and a per-worker budget of
-2^25 iterations up to 512 bits, the frontend reaches a smallest factor of roughly
-2^52 there and 2^50 at 1024 — parity with the native CLI, against 2^29 for the
-opening peel, which cannot even guarantee a 32-bit factor.
+thread's `BigInt` implementation. The per-worker budget is a flat 2^22
+iterations, so eight workers reach a smallest factor near 2^46 — the same place
+the native budget stops, against 2^29 for the opening peel, which cannot even
+guarantee a 32-bit factor.
+
+The budget stops there because curves follow it (`qs_ecm`), on the same rule the
+engine applies natively: a composite above the sieve's ceiling, or one an earlier
+split proved unbalanced, runs curves whether or not rho found anything, and
+`committed` sizes that run rather than deciding it. Measured through the shipped
+exports on a 512-bit modulus, one curve at `B1 = 50,000` costs 0.88 s while the
+former 2^25 rho budget cost 30.9 s per worker — which is 35 curves of the same
+wall time, most of a schedule that reaches 25-digit factors. On a 478-bit product
+of ten 48-bit primes the frontend now returns all ten primes in 19.3 s without a
+sieve run, where the same ladder with the deeper rho budget and no curves peeled
+five and handed a 239-bit remainder to the coordinator after 34.1 s.
 
 A runtime with no compiled module or no `Worker` falls back to the main thread's
 sliced `BigInt` search, which yields to the event loop about every 50 ms and
@@ -734,6 +765,16 @@ select which polynomial constants `y^2 + c` the call walks, so a pool of workers
 given disjoint ranges runs that many independent walks over one modulus and the
 first collision wins. There is no cancellation protocol: the call runs to its
 budget and returns, and the frontend cancels by terminating the worker.
+
+`qs_ecm(n_pointer, n_length, b1, b2, curves, seed, committed)` runs that many
+curves over `n` and returns a packet of kind 13, empty when every curve was spent
+without a split. Zero bounds take the engine's own schedule for the composite's
+width and `committed`, which is the same true/false distinction §6.1 describes —
+so the glue selects a schedule rather than carrying a copy of one.
+`qs_ecm_default_b1(bits, committed)` and `qs_ecm_default_curves(bits, committed)`
+report what those defaults would be, for sizing and progress text. `seed` selects
+the `σ` stretch, so a pool given disjoint stretches covers that many curves at
+once; cancellation is termination, as for `qs_rho`.
 
 Handles contain a 16-bit slot and 16-bit generation. Generation checks reject
 ordinary stale-handle reuse; a slot can alias an ancient handle after 65,535
@@ -932,7 +973,6 @@ same-browser competitor protocol described there.
 The 0.4 release is optimized for balanced semiprimes. Its principal known gaps
 are:
 
-- no ECM for medium factors in unbalanced composites;
 - ~~a world-class, completely opt-in ECM for non-RSA numbers~~ — **implemented**
   in 0.4.3; see §6.1. What remains of the original item is stage 2's
   asymptotics: this is a standard continuation, where GMP-ECM evaluates a
