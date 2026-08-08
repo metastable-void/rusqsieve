@@ -422,10 +422,13 @@ pub mod parameters {
             // performance-qualified SIQS tier the way RSA-100 and RSA-110 are.
             369..=400 => (6_000_000, 524_288, -23, 145, true, 1_214),
             // No sieve is ever built from this arm — the engine rejects composites above
-            // `MAX_SIQS_BITS` before parameters reach a factor base. It is still live: Pollard-
-            // Brent sizes its iteration budget from `engine_params`, and rho is deliberately
-            // *not* gated by width, so a 600-bit input with a small factor still gets a real
-            // attempt to peel it before the sieve is consulted.
+            // `MAX_SIQS_BITS` before parameters reach a factor base — and no caller reaches it any
+            // more either: Pollard-Brent used to size its budget from `engine_params` at every
+            // width, but above the ceiling there is no sieve run to take a fraction of, so
+            // `engine::wide_rho_budget` sizes that range from measured iteration rates instead.
+            // The arm stays because the match must be total, and it stays at the top tier's values
+            // so that anything reintroduced here starts from the widest parameters this table has
+            // rather than from the 0..=100 default.
             _ => (6_000_000, 524_288, -23, 145, true, 1_214),
         };
         EngineParams {

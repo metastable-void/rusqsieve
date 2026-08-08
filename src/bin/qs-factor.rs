@@ -77,13 +77,25 @@ fn run() -> Result<(), String> {
             env_parse("RUSQSIEVE_HALFW"),
             env_parse("RUSQSIEVE_LP_MULT"),
             env_parse("RUSQSIEVE_DLP_BOUND"),
+            env_parse("RUSQSIEVE_RHO_ITERATIONS"),
             std::env::var_os("RUSQSIEVE_PROFILE").is_some(),
         );
+    // Preprocessing reports no counter that moves, and above the sieve's range its Pollard-Brent
+    // stage can now run for about a minute, so one line per progress interval would be several
+    // hundred identical lines. One line per elapsed second is still visibly alive.
+    let mut last_preprocessing_second = u64::MAX;
     let factors = factor_with_progress(natural.clone(), config, |snapshot| {
         if show_progress {
             let amount = snapshot.amount();
             match snapshot.phase() {
-                ProgressPhase::Preprocessing => eprint!("\npreprocessing"),
+                ProgressPhase::Preprocessing => {
+                    let seconds = started.elapsed().as_secs();
+                    if seconds == last_preprocessing_second {
+                        return ProgressAction::Continue;
+                    }
+                    last_preprocessing_second = seconds;
+                    eprint!("\npreprocessing ({seconds}s)");
+                }
                 ProgressPhase::BuildingFactorBase => eprint!("\nbuilding factor base"),
                 ProgressPhase::Sieving => match amount.total() {
                     rusqsieve::ProgressTotal::Exact(total)

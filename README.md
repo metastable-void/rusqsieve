@@ -47,13 +47,13 @@ must not be used where operand-dependent timing reveals a secret.
 Add the Rust library:
 
 ```sh
-cargo add rusqsieve@0.4.2
+cargo add rusqsieve@0.4.3
 ```
 
 Install the native CLI:
 
 ```sh
-cargo install rusqsieve --version 0.4.2
+cargo install rusqsieve --version 0.4.3
 ```
 
 Or build the optimized native library and CLI from source:
@@ -107,6 +107,14 @@ overtakes SIQS by margins no sieve tuning recovers. A composite above that
 returns `FactorError::SiqsCompositeTooLarge`, carrying the composite's bit
 length rather than the caller's. Arithmetic operators on `Natural` wrap at
 capacity, while `checked_*` methods report overflow.
+
+Because that composite has nowhere else to go, Pollard–Brent runs a much deeper
+budget above the ceiling than below it — about a minute of iterations, which
+reaches a smallest factor near 2^53 at 512 bits and 2^50 at 1024, and covers
+factors up to 32 bits with orders of magnitude to spare. A wide input carrying a
+findable factor is therefore split rather than refused. Set
+`RUSQSIEVE_RHO_ITERATIONS` for the minutes-to-hours search that 56- and 64-bit
+factors cost.
 
 All supported public items are covered by rustdoc, enforced with
 `deny(missing_docs)`. The complete 0.4 contract and implementation architecture
@@ -202,8 +210,10 @@ hidden does not count as a stall. An extraction that finds only trivial
 dependencies retains its relations and requests a surplus before retrying. The
 browser peels small factors on the main thread and applies the same 400-bit
 sieve limit as native entry points to the composite it hands the coordinator;
-the scheduler reads its family budget from the session rather than assuming a
-constant, so it cannot stop a large run before the engine would.
+above that limit it spends a deep rho budget of its own first, sliced so the page
+keeps painting and reports progress against the budget. The scheduler reads its
+family budget from the session rather than assuming a constant, so it cannot stop
+a large run before the engine would.
 
 Notable performance work includes:
 

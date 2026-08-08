@@ -261,6 +261,69 @@ not cross-project records. Scaling the 256-bit case to 16, 32, and 48 workers me
 14.71 s, and 13.96 s. The browser caps the pool at 48 because 96 workers regressed on the reference
 host from startup, memory traffic, and relation overshoot.
 
+## Pollard–Brent reach above the sieve ceiling
+
+A composite wider than `engine::MAX_SIQS_BITS` (400) never reaches the sieve, so rho is the whole
+factoring attempt there and its budget is a wall-clock decision rather than a fraction of a sieve
+run. Iteration rates, release build, single-threaded, x86-64 Xeon 8259CL — reproduce with
+`cargo test --profile release-test --lib -- --ignored profile_wide_rho_throughput --nocapture`:
+
+| composite bits | iterations/s | budget | wall | smallest factor reached (`1.2·√p`) |
+|---:|---:|---:|---:|---:|
+| 400 | 2,864,749 | 6,291,456 (sieve-derived) | 2.2 s | 2^44.6 |
+| 512 | 2,245,151 | 128,000,000 | 57 s | 2^53.0 |
+| 768 | 1,207,160 | 72,000,000 | 60 s | 2^51.7 |
+| 1024 | 783,282 | 48,000,000 | 61 s | 2^50.5 |
+
+End to end through the release CLI, on inputs built as one small prime times one wide prime. The
+old-budget column is the same binary run with `RUSQSIEVE_RHO_ITERATIONS=6291456`, which is exactly
+what 0.4.2 spent at every width above the ceiling, so both columns are the same inputs on the same
+host. The last row is the cost side of the decision: a hopeless composite is now refused only after
+the budget is spent.
+
+| input | smallest factor | 6.29M budget (0.4.2) | default (0.4.3) |
+|---|---:|---:|---:|
+| 401-bit | 16-bit | 0.11 s | 0.11 s |
+| 512-bit | 32-bit | 0.11 s | 0.11 s |
+| 1024-bit | 32-bit | 0.21 s | 0.21 s |
+| 512-bit | 40-bit | 1.51 s | 1.51 s |
+| 512-bit | 48-bit | refused, 2.71 s | 30.35 s |
+| 512-bit balanced semiprime | — | refused, 2.71 s | refused, 61.99 s |
+
+Nothing at or below the ceiling changed. The budget there is still the sieve-derived one, pinned
+value-for-value by `budgets_at_and_below_the_ceiling_are_unchanged`, because rho finds nothing on a
+balanced semiprime and every iteration it spends is overhead on the main workload. Confirmed against
+a 0.4.2 binary built from the previous commit, interleaved with alternating order, median of three
+after a warm-up, `--threads 8` (32 for the last two rows):
+
+| input | 0.4.2 | 0.4.3 | delta |
+|---|---:|---:|---:|
+| 128-bit balanced | 0.032 s | 0.031 s | −3.1% |
+| 192-bit balanced | 0.378 s | 0.371 s | −1.8% |
+| 216-bit balanced | 1.498 s | 1.473 s | −1.7% |
+| 224-bit balanced | 2.925 s | 2.892 s | −1.1% |
+| 300-bit, 32-bit factor | 0.038 s | 0.038 s | +0.7% |
+| 384-bit, 40-bit factor | 0.574 s | 0.565 s | −1.6% |
+| 256-bit balanced | 6.766 s | 6.548 s | −3.2% |
+| 272-bit balanced | 16.033 s | 15.720 s | −1.9% |
+
+Every delta is host noise around an identical code path: below the ceiling the two binaries execute
+the same budget through the same loop.
+
+Deeper searches are the caller's decision, because each factor bit doubles Brent's cost:
+
+```sh
+RUSQSIEVE_RHO_ITERATIONS=4000000000 qs-factor < composite.txt
+```
+
+`raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling` is the same search as a test: a
+56-bit factor out of a 512-bit input plus a 64-bit factor out of a 401-bit input, single-threaded,
+1,452 s for the pair on this host. Run it with `--nocapture` for the per-case split.
+
+The browser runs the same loop on `BigInt` at roughly an eighth of the native rate — 288k
+iterations/s at 512 bits and 115k/s at 1024 measured under Node 24.15 — and spends 2^23 iterations
+up to 512 bits and 2^22 above, about half a minute at either end, sliced into ~50 ms macrotasks.
+
 ## What a “fastest general browser factorizer” claim requires
 
 A balanced-semiprime corpus measures the SIQS worst case well, but it is not a representative

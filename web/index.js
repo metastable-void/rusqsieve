@@ -2,7 +2,7 @@
 // hands hard composites to a pool of wasm Web Workers running the quadratic sieve,
 // with the pool sized to navigator.hardwareConcurrency.
 import { loadModule, bytesToBigInt } from "./abi.js";
-import { trialDivide, isPrime, perfectPower, pollardBrent, groupFactors, rsaNumber, bitLength } from "./numtheory.js";
+import { trialDivide, isPrime, perfectPower, pollardBrent, pollardBrentSliced, groupFactors, rsaNumber, bitLength } from "./numtheory.js";
 
 const SIMD_WASM_URL = new URL("./rusqsieve-simd.wasm", import.meta.url);
 const SCALAR_WASM_URL = new URL("./rusqsieve.wasm", import.meta.url);
@@ -473,6 +473,27 @@ function siqsParallel(decimal, bits, report) {
   });
 }
 
+// Pollard-Brent budget for a composite the sieve has refused, in iterations. Measured in node
+// (BigInt, single-threaded) on prime moduli, which is the honest way to time a full budget: 288 k
+// iterations/s at 512 bits, 115 k/s at 1024. Brent finds `p` in about 1.2·sqrt(p) iterations, so
+// these spend roughly half a minute at either end of the range and reach a smallest factor of about
+// 2^45 at 512 bits and 2^43 at 1024 — against 2^29 for the 2^15 opening peel, which could not even
+// guarantee a 32-bit factor. Beyond this the browser is the wrong place for the search: each factor
+// bit doubles the cost, and the native CLI runs the same loop eight times faster.
+const wideRhoBudget = (bits) => (bits <= 512 ? 8 << 20 : 4 << 20);
+
+async function deepPollard(c, bits, report) {
+  const budget = wideRhoBudget(bits);
+  const run = pollardBrentSliced(c, budget);
+  let step = run.next();
+  while (!step.done) {
+    report({ phase: "deepPollard", n: c, steps: step.value, budget });
+    await tick();
+    step = run.next();
+  }
+  return step.value;
+}
+
 async function factorize(N, report) {
   const primes = [];
   const stack = [N];
@@ -512,6 +533,16 @@ async function factorize(N, report) {
     // all ran without one, so a wide number built from small factors never reaches here.
     const compositeBits = bitLength(c);
     if (compositeBits > maxSiqsBits) {
+      // The sieve will refuse this composite, so the cheap peel above was not an opening move —
+      // it was the whole attempt, and it stopped at a budget sized for a sieve run that is never
+      // going to happen. Spend a real one before giving up. `engine::wide_rho_budget` makes the
+      // same call natively; the numbers differ because BigInt runs rho at roughly an eighth of
+      // the native rate, not because the policy does.
+      const deep = await deepPollard(c, compositeBits, report);
+      if (deep && deep > 1n && deep < c) {
+        stack.push(deep, c / deep);
+        continue;
+      }
       throw new Error(
         `this number needs the quadratic sieve on a ${compositeBits}-bit composite, ` +
           `above the ${maxSiqsBits}-bit limit — numbers of any size still factor when ` +
@@ -535,6 +566,9 @@ const PHASE_TEXT = {
   trial: (s) => `Trial division on a ${digits(s.n)}-digit number…`,
   primality: (s) => `Miller–Rabin primality test (${digits(s.n)} digits)…`,
   pollard: (s) => `Pollard's rho on a ${digits(s.n)}-digit number…`,
+  deepPollard: (s) =>
+    `Too wide for the sieve — deep Pollard's rho on a ${digits(s.n)}-digit composite: ` +
+    `${Math.round((100 * s.steps) / s.budget)}% of the iteration budget…`,
   sieving: (s) => {
     const progress =
       `Quadratic sieve: ${s.relations}/${s.target} relations across ${nWorkers} workers…`;

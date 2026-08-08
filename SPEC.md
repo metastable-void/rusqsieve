@@ -294,6 +294,20 @@ division. The iteration budget is unchanged from the division-based version,
 so this optimization reduces failed-rho overhead rather than deepening the
 search on balanced semiprimes.
 
+At and below the sieve's 400-bit ceiling the budget stays a small fraction of
+the SIQS run it precedes, because on a balanced input rho contributes nothing
+and its cost is pure overhead. Above the ceiling that reasoning does not apply:
+the sieve refuses the composite, so rho is the entire attempt and the
+alternative to spending more is `SiqsCompositeTooLarge` on an input whose
+smallest factor was findable. The budget there is a wall-clock decision instead
+— about a minute per attempt at every supported width, tiered by width because
+per-iteration cost grows with the square of the limb count. Since Brent finds
+`p` in roughly `1.2·sqrt(p)` iterations, that reaches a smallest factor of
+about 2^53 at 512 bits, 2^51.7 at 768, and 2^50.5 at 1024; factors up to 32
+bits are covered by more than two orders of magnitude of margin at every width.
+`RUSQSIEVE_RHO_ITERATIONS` overrides the budget for callers who want the
+minutes-to-hours search that 56- and 64-bit factors cost.
+
 ## 6. Native factorization pipeline
 
 The optimized blocking engine performs:
@@ -316,7 +330,10 @@ fallback.
 Step 6 is the only width-limited stage. A composite wider than 400 bits reaching
 it returns `FactorError::SiqsCompositeTooLarge(bits)`, where `bits` is the
 composite's width, not the caller's input. Steps 1–5 run regardless of input
-width, so a wide input with small factors completes through them.
+width, so a wide input with small factors completes through them — and a
+composite past the ceiling gets the deep Pollard–Brent budget described in §5
+before step 6 is asked at all, so the error means the smallest factor outran a
+minute of rho, not that the input was too wide to try.
 
 Sieving that spends its whole polynomial-family budget without reaching the
 relation target returns `FactorError::InsufficientRelations`. The budget scales
@@ -574,7 +591,16 @@ composites are sent to the Wasm SIQS coordinator.
 
 The reference frontend applies the engine's 400-bit sieve limit to the composite
 it sends the coordinator, not to the number the user typed, and reads that limit
-from the runtime (`qs_max_siqs_bits`) rather than duplicating it. Per-run
+from the runtime (`qs_max_siqs_bits`) rather than duplicating it. A composite
+above that limit is not refused until a deep Pollard–Brent budget has been spent
+on it, mirroring the native policy: the opening peel is sized for a sieve run
+that is about to happen, and above the ceiling no sieve run is. That search is
+sliced — it yields to the event loop about every 50 ms of BigInt work — so the
+page keeps painting and reports progress against the budget. The budgets differ
+from native because `BigInt` runs the same loop at roughly an eighth of the
+native rate: about half a minute of work at either end of the range, reaching a
+smallest factor of about 2^45 at 512 bits and 2^43 at 1024, against 2^29 for the
+opening peel, which could not even guarantee a 32-bit factor. Per-run
 messages, including errors, are generation-scoped. Worker initialization,
 individual sieve jobs, and complete runs are bounded by timeouts; a failed run
 terminates and rebuilds the Worker runtime. The browser scheduler reads the
@@ -816,6 +842,13 @@ The 0.4 release is optimized for balanced semiprimes. Its principal known gaps
 are:
 
 - no ECM for medium factors in unbalanced composites;
+- above the sieve's 400-bit ceiling the only tool is Pollard–Brent, and its cost
+  is `O(sqrt p)` in the smallest factor. The default budget reaches roughly 2^53
+  at 512 bits and 2^50 at 1024; `RUSQSIEVE_RHO_ITERATIONS` buys 56- and 64-bit
+  factors for minutes to hours, and the stage is single-threaded, so the idle
+  worker pool contributes nothing to it. ECM is the right answer in that range,
+  and racing independent walks across the pool would give roughly a `sqrt(T)`
+  speedup in the meantime;
 - high-digit SIQS tiers still need multi-input wall-time sweeps on representative
   native hosts;
 - the 369..=400-bit tier is a single-input yield measurement, not a qualified

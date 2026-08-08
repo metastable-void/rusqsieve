@@ -39,6 +39,11 @@ pub(crate) struct FactorTuning {
     pub(crate) sieve_half_width: Option<u32>,
     pub(crate) large_prime_multiplier: Option<u32>,
     pub(crate) double_large_prime_bound: Option<u64>,
+    /// Overrides the computed Pollard-Brent iteration budget at every width. Its reason to exist is
+    /// the range above the sieve ceiling, where rho is the whole attempt and the default stops at
+    /// about a minute: a caller who wants a 56- or 64-bit factor out of a 500-bit input spends the
+    /// minutes or hours here deliberately.
+    pub(crate) rho_iterations: Option<u64>,
     pub(crate) profile: bool,
 }
 
@@ -113,6 +118,7 @@ impl FactorConfig {
         sieve_half_width: Option<u32>,
         large_prime_multiplier: Option<u32>,
         double_large_prime_bound: Option<u64>,
+        rho_iterations: Option<u64>,
         profile: bool,
     ) -> Self {
         self.tuning = FactorTuning {
@@ -124,6 +130,7 @@ impl FactorConfig {
             sieve_half_width,
             large_prime_multiplier,
             double_large_prime_bound,
+            rho_iterations,
             profile,
         };
         self
@@ -165,6 +172,12 @@ pub enum FactorError {
     /// factors are small enough to peel off by trial division, perfect-power detection, or
     /// Pollard–Brent never reaches the sieve and never produces this error. The payload is the
     /// bit length of the composite that did.
+    ///
+    /// Because such a composite has nowhere else to go, Pollard–Brent runs a far deeper budget
+    /// above the sieve's range than below it — about a minute of iterations, reaching a smallest
+    /// factor near 2^53 at 512 bits and 2^50 at 1024 — before this is returned. Callers who want
+    /// the minutes-to-hours search that larger factors cost raise the budget with
+    /// `RUSQSIEVE_RHO_ITERATIONS`.
     SiqsCompositeTooLarge(usize),
     /// A configured internal resource limit was exceeded.
     ResourceLimit(ResourceLimitKind),

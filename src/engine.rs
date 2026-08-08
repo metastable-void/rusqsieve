@@ -293,9 +293,49 @@ pub(crate) fn validate_worker_packet(bytes: &[u8]) -> bool {
 /// 2^26 at 192 bits and 2^34 at 256 — above the 10^4 trial-division bound and below the 2^64 point
 /// where the whole input would have taken the machine-word path. Raising it further buys a narrow
 /// band of larger factors for a quadratically larger cost.
-fn rho_budget(bits: usize) -> u64 {
+///
+/// Above [`MAX_SIQS_BITS`] none of that reasoning holds, and [`wide_rho_budget`] takes over.
+/// `tuning.rho_iterations` overrides both arms outright.
+fn rho_budget(bits: usize, tuning: &FactorTuning) -> u64 {
+    if let Some(iterations) = tuning.rho_iterations {
+        return iterations.max(1);
+    }
+    if bits > MAX_SIQS_BITS {
+        return wide_rho_budget(bits);
+    }
     let p = crate::qs::parameters::engine_params(bits);
     (p.factor_base_bound as u64 * p.sieve_half_width as u64 / 500_000).max(1_024)
+}
+
+/// Pollard-Brent iteration budget for a composite the sieve will refuse.
+///
+/// Above [`MAX_SIQS_BITS`] rho stops being a cheap peel in front of SIQS and becomes the entire
+/// factoring attempt: there is no sieve run for the budget to be a fraction of, and the alternative
+/// to spending more here is [`EngineError::SiqsInputTooLarge`] on an input whose smallest factor was
+/// findable. So this arm is a wall-clock decision rather than a proportion.
+///
+/// Per-iteration cost grows with the square of the limb count, so a flat iteration count would cost
+/// three times as much wall clock at the top of the supported range as at the bottom. Measured
+/// single-thread rates (release, x86-64 Xeon 8259CL, `profile_wide_rho_throughput`): 2.25 M/s at 512
+/// bits, 1.21 M/s at 768, 0.78 M/s at 1024. These tiers therefore spend about a minute per attempt
+/// at every width instead.
+///
+/// Brent finds `p` in about `1.2·sqrt(p)` iterations, so a minute buys a smallest factor of roughly
+/// 2^53 at 512 bits, 2^51.7 at 768 and 2^50.5 at 1024. The sieve-derived budget this replaces was
+/// 6.29 M iterations at every width above the ceiling — reach 2^44.6 — which refused a 512-bit input
+/// carrying a 48-bit factor after 2.7 s of work that was nearly deep enough.
+///
+/// A minute is where the default stops, because each additional factor bit doubles the cost: 2^56 is
+/// 2.5 to 7 minutes and 2^64 is 38 minutes to 1.8 hours across this width range. That is a real
+/// search, not a default one, and callers who want it ask for it with `RUSQSIEVE_RHO_ITERATIONS`.
+const fn wide_rho_budget(bits: usize) -> u64 {
+    if bits <= 512 {
+        128_000_000
+    } else if bits <= 768 {
+        72_000_000
+    } else {
+        48_000_000
+    }
 }
 
 /// Which dispatch arm produced each split, so tests can assert that a stage ran rather than merely
@@ -753,7 +793,7 @@ fn factor_node(
         }
         return Ok(());
     }
-    let d = match pollard_brent_natural(&n, rho_budget(n.bit_len()), || {
+    let d = match pollard_brent_natural(&n, rho_budget(n.bit_len(), tuning), || {
         progress(EngineProgress {
             phase: EnginePhase::Preprocessing,
             polynomials: 0,
@@ -2472,9 +2512,87 @@ mod tests {
     /// nonzero — for widths the sieve itself refuses.
     #[test]
     fn rho_budget_is_defined_above_the_siqs_ceiling() {
+        let tuning = FactorTuning::default();
         for bits in [MAX_SIQS_BITS + 1, 512, 1024] {
-            assert!(rho_budget(bits) >= 1_024, "{bits}-bit rho budget");
+            assert!(rho_budget(bits, &tuning) >= 1_024, "{bits}-bit rho budget");
         }
+    }
+
+    /// Above the ceiling the budget is the whole factoring attempt rather than a fraction of a
+    /// sieve run, so it has to be enough to reach the factors the stage is being asked to find.
+    /// `1.2·sqrt(p)` is Brent's expected cost; the assertions below are in those terms, with margin
+    /// for the spread around the expectation.
+    #[test]
+    fn wide_rho_budget_reaches_the_factor_sizes_it_claims() {
+        let tuning = FactorTuning::default();
+        let brent_cost = |factor_bits: u32| (1.2 * 2f64.powi(factor_bits as i32).sqrt()) as u64;
+        for bits in [MAX_SIQS_BITS + 1, 512, 513, 768, 769, 1024] {
+            let budget = rho_budget(bits, &tuning);
+            // The contract this release commits to: any factor up to 32 bits, with the whole
+            // budget being hundreds of times the expected cost of finding one.
+            assert!(
+                budget >= 100 * brent_cost(32),
+                "{bits}-bit budget {budget} is not a comfortable 32-bit reach"
+            );
+            // And the reach the wall-clock target was chosen to buy.
+            assert!(
+                budget >= 2 * brent_cost(48),
+                "{bits}-bit budget {budget} does not reach a 48-bit factor"
+            );
+            // Sanity in the other direction: this arm is not a licence to run for hours.
+            assert!(
+                budget <= brent_cost(56),
+                "{bits}-bit budget {budget} is past the documented one-minute target"
+            );
+        }
+        // Nothing at or below the ceiling changed: SIQS runs there, so a deep rho would be pure
+        // overhead on every balanced input.
+        assert!(rho_budget(MAX_SIQS_BITS, &tuning) < wide_rho_budget(MAX_SIQS_BITS + 1) / 10);
+        // Wider inputs cost more per iteration, so the iteration count comes down to hold the
+        // wall clock roughly flat.
+        assert!(wide_rho_budget(512) > wide_rho_budget(1024));
+    }
+
+    /// Balanced semiprimes at or below the sieve ceiling are what this engine is for, and rho
+    /// contributes nothing to them: it runs to its budget, finds nothing, and hands the input to
+    /// SIQS, so every iteration it spends there is overhead on the main workload. Raising the budget
+    /// above the ceiling must therefore leave this range byte-for-byte alone. These are the 0.4.2
+    /// values, pinned so that a future change to the wide arm cannot leak downward unnoticed.
+    #[test]
+    fn budgets_at_and_below_the_ceiling_are_unchanged() {
+        let tuning = FactorTuning::default();
+        for (bits, expected) in [
+            (64, 1_024),
+            (128, 1_024),
+            (192, 18_022),
+            (224, 45_875),
+            (256, 176_947),
+            (288, 734_003),
+            (320, 2_703_360),
+            (364, 1_572_864),
+            (MAX_SIQS_BITS, 6_291_456),
+        ] {
+            assert_eq!(rho_budget(bits, &tuning), expected, "{bits}-bit rho budget");
+        }
+    }
+
+    /// The override exists so that a 56- or 64-bit factor above the ceiling is reachable without a
+    /// rebuild. It has to win at every width, including the ones with a computed budget.
+    #[test]
+    fn rho_iteration_override_replaces_both_budget_arms() {
+        let tuning = FactorTuning {
+            rho_iterations: Some(4_000_000_000),
+            ..FactorTuning::default()
+        };
+        for bits in [128, MAX_SIQS_BITS, MAX_SIQS_BITS + 1, 1024] {
+            assert_eq!(rho_budget(bits, &tuning), 4_000_000_000);
+        }
+        // Zero would disable the stage silently; the floor keeps it a budget rather than a switch.
+        let zero = FactorTuning {
+            rho_iterations: Some(0),
+            ..FactorTuning::default()
+        };
+        assert_eq!(rho_budget(512, &zero), 1);
     }
 
     /// The family budget exists to stop a run that cannot finish, not to truncate one that can.
@@ -2849,6 +2967,40 @@ mod tests {
         let mut square_roots = collector.columns[0].extra_sqrt.clone();
         square_roots.sort_unstable();
         assert_eq!(square_roots, [101, 103, 107]);
+    }
+
+    /// Iteration throughput of the big-integer rho stage at and above the sieve ceiling. This is
+    /// what [`rho_budget`]'s above-ceiling arm is sized from: the budget there is a wall-clock
+    /// decision, so it has to be stated in seconds, and seconds come from this measurement.
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[ignore = "manual wide-rho throughput measurement"]
+    fn profile_wide_rho_throughput() {
+        for bits in [400usize, 512, 768, 1024] {
+            // A prime of the right width: every iteration costs what it costs on a composite of
+            // the same size, and no split can cut the run short, so the whole budget is spent and
+            // the timing is the loop's rather than luck's.
+            let mut bytes = vec![0xa5u8; bits.div_ceil(8)];
+            bytes[0] |= 1;
+            let top = bytes.len() - 1;
+            bytes[top] |= 0x80;
+            let mut n = Natural::from_le_bytes(&bytes).expect("width fits the engine capacity");
+            let two = Natural::from_u64(2);
+            while !is_probable_prime(&n, &PrimalityConfig::default()) {
+                n = n.checked_add(&two).expect("prime search stays in width");
+            }
+            assert_eq!(n.bit_len(), bits);
+            const ITERATIONS: u64 = 200_000;
+            let started = std::time::Instant::now();
+            let split = pollard_brent_natural(&n, ITERATIONS, || true).unwrap();
+            let elapsed = started.elapsed().as_secs_f64();
+            eprintln!(
+                "BENCH wide_rho bits={bits} iterations={ITERATIONS} elapsed={elapsed:.3}s \
+                 rate={:.0}/s split={}",
+                ITERATIONS as f64 / elapsed,
+                split.is_some()
+            );
+        }
     }
 
     #[test]

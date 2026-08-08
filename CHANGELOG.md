@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.3 — 2026-08-08
+
+- Raised the Pollard–Brent budget for composites the sieve refuses. Above
+  `MAX_SIQS_BITS` rho is not a cheap peel in front of SIQS — it is the entire
+  factoring attempt — but its budget was still sized as a fraction of a sieve run
+  that never happens: 6.29M iterations at every width, reaching a smallest factor
+  of about 2^44.6. A 512-bit input carrying a 48-bit factor was therefore refused
+  with `SiqsCompositeTooLarge` after 2.7 s of work that was nearly deep enough.
+  The range above the ceiling now gets a wall-clock budget instead — 128M
+  iterations to 512 bits, 72M to 768, 48M beyond — tiered because per-iteration
+  cost grows with the square of the limb count. Measured single-thread rates
+  (release, x86-64 Xeon 8259CL) are 2.25M/s at 512 bits, 1.21M/s at 768 and
+  0.78M/s at 1024, so every width spends about a minute and reaches roughly 2^53,
+  2^51.7 and 2^50.5 respectively. Factors up to 32 bits are covered by more than
+  two orders of magnitude of margin at every supported width. Nothing at or below
+  the ceiling changed: SIQS runs there, and a deeper rho would be pure overhead on
+  every balanced input. Those budgets are now pinned value-for-value by
+  `budgets_at_and_below_the_ceiling_are_unchanged`, and an interleaved A/B against
+  a 0.4.2 binary measured 128- through 272-bit balanced inputs, plus sub-ceiling
+  unbalanced ones, within host noise (−3.2% to +0.7%).
+- Added `RUSQSIEVE_RHO_ITERATIONS` (`FactorConfig::with_tuning_overrides`) to
+  override the budget outright. Each additional factor bit doubles Brent's cost,
+  so 56-bit factors are 2.5 to 7 minutes and 64-bit factors 38 minutes to 1.8
+  hours across the supported width range: reachable, but a search a caller asks
+  for rather than one a default takes. Confirmed with the override at 4G
+  iterations, single-threaded: a 56-bit factor out of a 512-bit input and a
+  64-bit factor out of a 401-bit input, 1,452 s for the pair
+  (`raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling`).
+- Applied the same policy to the browser. The frontend refused a composite above
+  the sieve limit after a 2^15-iteration peel — a reach of about 2^29, which could
+  not even guarantee a 32-bit factor — and now spends a deep budget first: 2^23
+  iterations to 512 bits and 2^22 beyond, about half a minute of `BigInt` work at
+  either end (288k iterations/s at 512 bits, 115k/s at 1024 measured in node),
+  reaching about 2^45 and 2^43. `pollardBrentSliced` yields every 2^14 inner
+  iterations, roughly 50 ms of work, so the page keeps painting and reports
+  progress against the budget; `pollardBrent` is now a wrapper around it and its
+  behavior below the ceiling is unchanged.
+
 ## 0.4.2 — 2026-08-01
 
 - Fixed exhausted sieving being reported as a memory limit. The native

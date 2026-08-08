@@ -148,10 +148,180 @@ fn wide_inputs_with_rho_reachable_factors_factor_completely() {
     assert_eq!(factors.multiplicity(&odd).unwrap().get(), 1);
 }
 
+/// Above the sieve's ceiling Pollard-Brent is not an opportunistic peel in front of SIQS — it is
+/// the entire factoring attempt, because the sieve refuses the composite outright. Every input
+/// here is a small prime times a wide prime, which is exactly the shape that used to be rejected
+/// with `SiqsCompositeTooLarge` whenever the small prime outran a budget sized as a fraction of a
+/// sieve run that never happens.
+///
+/// These three are the guaranteed tier: factors up to 32 bits, at the bottom, middle and top of the
+/// supported width range. The budget above the ceiling is hundreds of times Brent's expected
+/// `1.2·sqrt(p)` cost for a 32-bit factor at every one of those widths.
+#[test]
+fn wide_composites_are_split_by_rho_rather_than_refused() {
+    // 401 bits — one over the sieve ceiling — carrying a 16-bit factor, which is above the 10^4
+    // trial-division bound and so genuinely reaches rho.
+    let input = Natural::<16>::from_decimal(
+        "3902936505210420261021964138186048598645757055007853121964024023082987217643\
+         286159953866070270752263666313381145517080159",
+    )
+    .unwrap();
+    assert_eq!(input.bit_len(), 401);
+    let factors = factor(input.clone()).unwrap();
+    assert!(factors.verify_product(&input));
+    assert_eq!(factors.total_len(), 2);
+    assert_eq!(
+        factors
+            .multiplicity(&Natural::from_u64(56_857))
+            .unwrap()
+            .get(),
+        1
+    );
+
+    // 512 bits with a 32-bit factor: the width a caller is most likely to hand a library capped at
+    // 400 bits of sieve.
+    let input = Natural::<16>::from_decimal(
+        "9501012405705509564680437712617447440170980081112656222237073910419870316392\
+         859702111963091481439276805995800801743430916377894473378632368751322056628119",
+    )
+    .unwrap();
+    assert_eq!(input.bit_len(), 512);
+    let factors = factor(input.clone()).unwrap();
+    assert!(factors.verify_product(&input));
+    assert_eq!(factors.total_len(), 2);
+    assert_eq!(
+        factors
+            .multiplicity(&Natural::from_u64(3_667_435_003))
+            .unwrap()
+            .get(),
+        1
+    );
+
+    // 1024 bits, the engine's capacity, with the same 32-bit factor class. Per-iteration cost is
+    // roughly three times the 512-bit case, which is why the budget tiers by width: the guarantee
+    // is stated in factor bits and has to hold at the expensive end too.
+    let input = Natural::<16>::from_decimal(
+        "1401022297307954297991679230211882827730660578524007095304227670281026951677\
+         4811096642399661825372091824156874528352425797533201535316521537410076121003\
+         4074640519308908102560817045658913006325713539052727661523689985681266686274\
+         209226917233091828080256346478868845059891172761884504662361609922427332741249613",
+    )
+    .unwrap();
+    assert_eq!(input.bit_len(), 1024);
+    let factors = factor(input.clone()).unwrap();
+    assert!(factors.verify_product(&input));
+    assert_eq!(factors.total_len(), 2);
+    assert_eq!(
+        factors
+            .multiplicity(&Natural::from_u64(3_479_286_313))
+            .unwrap()
+            .get(),
+        1
+    );
+}
+
+/// The tier the raised budget was actually bought for. A 48-bit factor costs about 20 M iterations,
+/// three times the 6.29 M the sieve-derived budget allowed at every width above the ceiling, so
+/// before this change the 512-bit input below was refused after 2.7 s of work that was nearly deep
+/// enough; it now splits in 30 s. Unoptimized builds run rho at roughly a fifteenth of release
+/// speed, hence the profile.
+#[test]
+#[ignore = "40- and 48-bit factors cost seconds to minutes of rho: cargo test --profile release-test"]
+fn wide_composites_split_40_and_48_bit_factors_with_the_default_budget() {
+    for (decimal, small) in [
+        (
+            "1015936249400950287360808203240867131305086909045547514124726594384293137\
+             1677588336226503124482280315907519033170704907241245468573613367599493866551320501",
+            971_259_191_779u64,
+        ),
+        (
+            "1012682424890306230360672028802799323297238247563131601312546154540901930\
+             5100244454696718048789411013895449112084116270765951273303169020877632325189728337",
+            263_495_738_435_519,
+        ),
+    ] {
+        let input = Natural::<16>::from_decimal(decimal).unwrap();
+        assert_eq!(input.bit_len(), 512);
+        let factors = factor(input.clone()).unwrap();
+        assert!(factors.verify_product(&input));
+        assert_eq!(factors.total_len(), 2);
+        assert_eq!(
+            factors
+                .multiplicity(&Natural::from_u64(small))
+                .unwrap()
+                .get(),
+            1
+        );
+    }
+}
+
+/// What the default budget deliberately does not pay for. Each factor bit doubles Brent's cost, so
+/// 56 bits is minutes and 64 bits is tens of minutes to hours — a real search rather than a stage
+/// in a ladder. It is reachable, and this pins the mechanism that reaches it: the same override the
+/// CLI exposes as `RUSQSIEVE_RHO_ITERATIONS`.
+///
+/// Measured single-threaded on an x86-64 Xeon 8259CL, `--profile release-test`: the two cases
+/// together took 1,452 s. Run with `--nocapture` for the per-case split.
+#[test]
+#[ignore = "tens of minutes of Pollard-Brent by design: cargo test --profile release-test"]
+fn raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling() {
+    // 4 G iterations is about three times Brent's expected cost for a 64-bit factor, which covers
+    // the spread around the expectation rather than only its centre.
+    let deep = FactorConfig::default()
+        .with_parallelism(Parallelism::threads(1).unwrap())
+        .with_tuning_overrides(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(4_000_000_000),
+            false,
+        );
+    for (decimal, bits, small) in [
+        (
+            "1252065390128543989678566233540615804226711829449772216415528509501425921\
+             5604536975970501806596235777062580778663894798784169636410299447575447913433618819",
+            512,
+            67_876_963_450_791_707u64,
+        ),
+        (
+            "3669910812722365764460471742391282485897850073502478531673082844008509335\
+             074097393459666891883936817708908023289961021419",
+            401,
+            15_590_429_627_348_277_103,
+        ),
+    ] {
+        let input = Natural::<16>::from_decimal(decimal).unwrap();
+        assert_eq!(input.bit_len(), bits);
+        let started = std::time::Instant::now();
+        let factors =
+            factor_with_progress(input.clone(), deep.clone(), |_| ProgressAction::Continue)
+                .unwrap();
+        eprintln!(
+            "BENCH deep_rho input_bits={bits} factor_bits={} elapsed={:.1}s",
+            64 - small.leading_zeros(),
+            started.elapsed().as_secs_f64()
+        );
+        assert!(factors.verify_product(&input));
+        assert_eq!(factors.total_len(), 2);
+        assert_eq!(
+            factors
+                .multiplicity(&Natural::from_u64(small))
+                .unwrap()
+                .get(),
+            1
+        );
+    }
+}
+
 /// The other half of the contract: a composite that genuinely needs the sieve and is too wide for
 /// it is refused with an error naming the composite, not the input.
 #[test]
-#[ignore = "burns a full Pollard-Brent budget on a 416-bit semiprime before the sieve is asked"]
+#[ignore = "burns a full Pollard-Brent budget — about a minute above the ceiling — on a 416-bit semiprime before the sieve is asked"]
 fn oversized_hard_composites_are_refused_by_the_sieve_not_the_input_width() {
     let hard = Natural::<16>::from_decimal(
         "1265686468695484903648964277331152191512075117088221193348532259113389592\

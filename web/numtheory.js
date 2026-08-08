@@ -173,8 +173,30 @@ export function trialDivide(n, out, limit = 100000n) {
 // Bounded Pollard-Brent. Returns a nontrivial factor of the composite `n`, or null
 // if the iteration budget was exhausted (hand the number to the sieve instead).
 export function pollardBrent(n, budget = 1 << 20) {
+  const run = pollardBrentSliced(n, budget, Infinity);
+  let step = run.next();
+  while (!step.done) step = run.next();
+  return step.value;
+}
+
+// The same search, sliced. It yields the iteration count every `slice` steps so a caller on the
+// main thread can await a macrotask between slices and keep the page painting; the generator's
+// return value is the factor or null, exactly as above.
+//
+// This exists for composites the sieve refuses. Below its ceiling a budget worth slicing is wasted
+// work — the sieve is about to run and is better at those inputs — but above it rho is the whole
+// attempt, and a budget deep enough to matter is a budget too long to block on.
+// The default slice is measured, not nominal: 2^14 inner iterations is about 50 ms of BigInt work
+// on a 512-bit modulus, below the frame budget a user would notice, while leaving the macrotask
+// overhead of yielding at a few percent of the run.
+export function* pollardBrentSliced(n, budget, slice = 1 << 14) {
   if (n % 2n === 0n) return 2n;
   let steps = 0;
+  // Slicing is counted separately from the budget: Brent's cycle-advance loop is not part of
+  // `steps` and never has been, but it is the loop that grows without bound as `r` doubles, so it
+  // is exactly the one that must not be allowed to block. Counting it as budget instead would
+  // quietly halve the reach of every existing caller.
+  let sinceYield = 0;
   for (let c = 1n; c < 32n; c++) {
     let y = 2n;
     let r = 1n;
@@ -185,7 +207,13 @@ export function pollardBrent(n, budget = 1 << 20) {
     const f = (v) => (v * v + c) % n;
     while (g === 1n && steps < budget) {
       x = y;
-      for (let i = 0n; i < r; i++) y = f(y);
+      for (let i = 0n; i < r; i++) {
+        y = f(y);
+        if (++sinceYield >= slice) {
+          sinceYield = 0;
+          yield steps;
+        }
+      }
       let k = 0n;
       while (k < r && g === 1n && steps < budget) {
         ys = y;
@@ -198,6 +226,11 @@ export function pollardBrent(n, budget = 1 << 20) {
         }
         g = gcd(q, n);
         k += lim;
+        sinceYield += Number(lim);
+        if (sinceYield >= slice) {
+          sinceYield = 0;
+          yield steps;
+        }
       }
       r <<= 1n;
     }
@@ -205,6 +238,10 @@ export function pollardBrent(n, budget = 1 << 20) {
       do {
         ys = f(ys);
         g = gcd(x > ys ? x - ys : ys - x, n);
+        if (++sinceYield >= slice) {
+          sinceYield = 0;
+          yield steps;
+        }
       } while (g === 1n && steps++ < budget);
     }
     if (g > 1n && g < n) return g;
