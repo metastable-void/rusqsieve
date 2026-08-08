@@ -255,6 +255,52 @@ fn wide_composites_split_40_and_48_bit_factors_with_the_default_budget() {
     }
 }
 
+/// A wide composite made of many middling primes — the shape that has no balanced semiprime in it
+/// anywhere, and that the ladder used to abandon partway down.
+///
+/// Rho peeled factors while the cofactor was above the sieve's ceiling and had the deep budget, then
+/// the cofactor crossed 400 bits, the budget collapsed to a fraction of a sieve run, and the
+/// remainder — still six or eight 50-bit primes — went to SIQS at the 369..=400 tier, which wanted
+/// 206,403 relations at about two per second. That is weeks of sieving on a number whose every
+/// factor rho finds in seconds. A split under rho now marks the cofactor as unbalanced and keeps the
+/// deep budget down to `DEEP_RHO_MIN_BITS`, below which the sieve really is the faster tool: this
+/// input peels five factors in rho and hands a 250-bit remainder to a sieve that returns it in
+/// under three seconds.
+///
+/// Measured end to end on an x86-64 Xeon 8259CL with 96 workers: 65 s through the release CLI, 67 s
+/// as this test under `--profile release-test`.
+#[test]
+#[ignore = "a minute of rho and one 250-bit sieve: cargo test --profile release-test"]
+fn wide_products_of_many_middling_primes_do_not_stall_in_the_sieve() {
+    let input = Natural::<16>::from_decimal(
+        "6921330803157597027523689283187318825197185831714411528408744449716399940722\
+         77047941800262750998157133588227123597503809544337586905787678816852754733",
+    )
+    .unwrap();
+    assert_eq!(input.bit_len(), 498);
+    let factors = factor(input.clone()).unwrap();
+    assert!(factors.verify_product(&input));
+    assert_eq!(factors.total_len(), 10);
+    assert_eq!(
+        factors
+            .expanded()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        [
+            "846008445527897",
+            "865990488546691",
+            "871893255711629",
+            "901642578578681",
+            "923403409425967",
+            "957330526028417",
+            "1031228931434011",
+            "1087834615977859",
+            "1099924897280071",
+            "1101716055838291",
+        ]
+    );
+}
+
 /// What the default budget deliberately does not pay for. Each factor bit doubles Brent's cost, so
 /// 56 bits is minutes and 64 bits is tens of minutes to hours — a real search rather than a stage
 /// in a ladder. It is reachable, and this pins the mechanism that reaches it: the same override the

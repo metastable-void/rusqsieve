@@ -295,8 +295,22 @@ pub(crate) fn validate_worker_packet(bytes: &[u8]) -> bool {
 /// band of larger factors for a quadratically larger cost.
 ///
 /// Above [`MAX_SIQS_BITS`] none of that reasoning holds, and [`wide_rho_budget`] takes over.
-/// `tuning.rho_iterations` overrides both arms outright.
-fn rho_budget(bits: usize, tuning: &FactorTuning) -> u64 {
+///
+/// Neither does it hold for a cofactor that reached this point *by splitting under rho*, which is
+/// what `after_split` marks. The whole argument for a sieve-fraction budget is that the node is a
+/// balanced semiprime the sieve will finish cheaply; a node whose parent just split under rho is
+/// provably not that — it has at least three prime factors and at least one of them was small
+/// enough for rho to find. Such a node gets the deep budget from [`DEEP_RHO_MIN_BITS`] upward, which
+/// is where the sieve stops being cheap. Balanced semiprimes never reach that branch: rho does not
+/// split them, so nothing below them ever inherits the flag.
+///
+/// This is the difference between finishing and not. A 498-bit product of ten 50-bit primes peeled
+/// two factors while it was above the ceiling and handed the 399-bit remainder to SIQS, which wanted
+/// 206 403 relations at about two per second — weeks of sieving on a number whose every factor rho
+/// finds in seconds. Deepening the cofactor's budget instead peels them.
+///
+/// `tuning.rho_iterations` overrides every arm outright.
+fn rho_budget(bits: usize, tuning: &FactorTuning, after_split: bool) -> u64 {
     if let Some(iterations) = tuning.rho_iterations {
         return iterations.max(1);
     }
@@ -304,8 +318,23 @@ fn rho_budget(bits: usize, tuning: &FactorTuning) -> u64 {
         return wide_rho_budget(bits);
     }
     let p = crate::qs::parameters::engine_params(bits);
-    (p.factor_base_bound as u64 * p.sieve_half_width as u64 / 500_000).max(1_024)
+    let sieve_fraction =
+        (p.factor_base_bound as u64 * p.sieve_half_width as u64 / 500_000).max(1_024);
+    if after_split && bits >= DEEP_RHO_MIN_BITS {
+        return sieve_fraction.max(wide_rho_budget(bits));
+    }
+    sieve_fraction
 }
+
+/// Width from which a cofactor known to be unbalanced is worth a deep rho rather than a sieve.
+///
+/// Below this the sieve is simply the better tool whatever the input's shape: measured native SIQS
+/// wall time is 0.38 s at 192 bits, 2.9 s at 224 and 6.8 s at 256, so spending up to a minute of
+/// single-threaded rho first could only lose. From here it climbs steeply — 16 s at 272, 38 s at
+/// 288, minutes through the RSA-100 and RSA-110 tiers, and out of reach in the 369..=400 tier —
+/// while the deep rho budget stays flat at about a minute and finds a factor of the size that was
+/// just demonstrated to exist.
+const DEEP_RHO_MIN_BITS: usize = 257;
 
 /// Pollard-Brent iteration budget for a composite the sieve will refuse.
 ///
@@ -733,6 +762,7 @@ pub fn factor(
         threads.max(1),
         &primality,
         tuning,
+        false,
         &mut progress,
         &mut factors,
     )?;
@@ -740,12 +770,16 @@ pub fn factor(
     Ok(factors)
 }
 
+/// Factor one node of the recursion. `after_split` records that this value is a cofactor of a
+/// composite rho already split — the evidence that sizes its own rho budget; see [`rho_budget`].
 #[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
 fn factor_node(
     n: Natural,
     threads: usize,
     pc: &PrimalityConfig,
     tuning: &FactorTuning,
+    after_split: bool,
     progress: &mut impl FnMut(EngineProgress) -> bool,
     out: &mut Vec<Natural>,
 ) -> Result<(), EngineError> {
@@ -787,13 +821,14 @@ fn factor_node(
     }
     if let Some((root, k)) = n.perfect_power() {
         let mut fs = Vec::new();
-        factor_node(root, threads, pc, tuning, progress, &mut fs)?;
+        factor_node(root, threads, pc, tuning, after_split, progress, &mut fs)?;
         for _ in 0..k {
             out.extend(fs.iter().cloned())
         }
         return Ok(());
     }
-    let d = match pollard_brent_natural(&n, rho_budget(n.bit_len(), tuning), || {
+    let mut split_by_rho = false;
+    let d = match pollard_brent_natural(&n, rho_budget(n.bit_len(), tuning, after_split), || {
         progress(EngineProgress {
             phase: EnginePhase::Preprocessing,
             polynomials: 0,
@@ -805,6 +840,7 @@ fn factor_node(
         Some(factor) => {
             #[cfg(test)]
             stage_counts::bump(&stage_counts::RHO);
+            split_by_rho = true;
             if tuning.profile {
                 eprintln!(
                     "PROFILE rho input_bits={} factor_bits={} siqs=false",
@@ -819,9 +855,13 @@ fn factor_node(
     if d.is_one() || d == n {
         return Err(EngineError::NoFactor);
     }
+    // A split under rho is what proves this composite unbalanced, so it is what the children
+    // inherit. A split under SIQS proves nothing about factor sizes and only passes along whatever
+    // this node already knew.
+    let children_after_split = after_split || split_by_rho;
     let q = n.div_rem(&d).unwrap().0;
-    factor_node(d, threads, pc, tuning, progress, out)?;
-    factor_node(q, threads, pc, tuning, progress, out)
+    factor_node(d, threads, pc, tuning, children_after_split, progress, out)?;
+    factor_node(q, threads, pc, tuning, children_after_split, progress, out)
 }
 
 #[cfg(any(unix, windows))]
@@ -1961,6 +2001,7 @@ fn classify_cofactor(q: u64, single_limit: u64, double_limit: u64) -> Option<Lar
 /// Bounded, cancellable Pollard-Brent over `Natural`. `iteration_limit` is the total across every
 /// polynomial constant tried, not per constant, so the caller's budget is the whole cost of the
 /// stage; see [`rho_budget`].
+///
 #[cfg(any(unix, windows))]
 fn pollard_brent_natural(
     n: &Natural,
@@ -2514,7 +2555,10 @@ mod tests {
     fn rho_budget_is_defined_above_the_siqs_ceiling() {
         let tuning = FactorTuning::default();
         for bits in [MAX_SIQS_BITS + 1, 512, 1024] {
-            assert!(rho_budget(bits, &tuning) >= 1_024, "{bits}-bit rho budget");
+            assert!(
+                rho_budget(bits, &tuning, false) >= 1_024,
+                "{bits}-bit rho budget"
+            );
         }
     }
 
@@ -2527,7 +2571,7 @@ mod tests {
         let tuning = FactorTuning::default();
         let brent_cost = |factor_bits: u32| (1.2 * 2f64.powi(factor_bits as i32).sqrt()) as u64;
         for bits in [MAX_SIQS_BITS + 1, 512, 513, 768, 769, 1024] {
-            let budget = rho_budget(bits, &tuning);
+            let budget = rho_budget(bits, &tuning, false);
             // The contract this release commits to: any factor up to 32 bits, with the whole
             // budget being hundreds of times the expected cost of finding one.
             assert!(
@@ -2547,7 +2591,9 @@ mod tests {
         }
         // Nothing at or below the ceiling changed: SIQS runs there, so a deep rho would be pure
         // overhead on every balanced input.
-        assert!(rho_budget(MAX_SIQS_BITS, &tuning) < wide_rho_budget(MAX_SIQS_BITS + 1) / 10);
+        assert!(
+            rho_budget(MAX_SIQS_BITS, &tuning, false) < wide_rho_budget(MAX_SIQS_BITS + 1) / 10
+        );
         // Wider inputs cost more per iteration, so the iteration count comes down to hold the
         // wall clock roughly flat.
         assert!(wide_rho_budget(512) > wide_rho_budget(1024));
@@ -2572,8 +2618,47 @@ mod tests {
             (364, 1_572_864),
             (MAX_SIQS_BITS, 6_291_456),
         ] {
-            assert_eq!(rho_budget(bits, &tuning), expected, "{bits}-bit rho budget");
+            assert_eq!(
+                rho_budget(bits, &tuning, false),
+                expected,
+                "{bits}-bit rho budget"
+            );
         }
+    }
+
+    /// A cofactor that split under rho is not a balanced semiprime, which is the only shape the
+    /// sieve-fraction budget is sized for. From `DEEP_RHO_MIN_BITS` up it therefore gets the deep
+    /// budget — the difference between peeling a wide multi-factor composite and handing its
+    /// remainder to a sieve that would take weeks. Below that line the sieve is genuinely the better
+    /// tool, so nothing changes there.
+    #[test]
+    fn a_split_under_rho_deepens_the_budget_where_the_sieve_is_expensive() {
+        let tuning = FactorTuning::default();
+        for bits in [289, 320, 364, 399, MAX_SIQS_BITS] {
+            let fresh = rho_budget(bits, &tuning, false);
+            let after = rho_budget(bits, &tuning, true);
+            assert!(
+                after >= wide_rho_budget(bits) && after > fresh * 10,
+                "{bits}-bit cofactor was not deepened after a split: {fresh} -> {after}"
+            );
+        }
+        // The line itself, and the range below it where a sieve run costs seconds.
+        assert!(
+            rho_budget(DEEP_RHO_MIN_BITS, &tuning, true)
+                > rho_budget(DEEP_RHO_MIN_BITS, &tuning, false)
+        );
+        for bits in [128, 192, 224, 256] {
+            assert_eq!(
+                rho_budget(bits, &tuning, true),
+                rho_budget(bits, &tuning, false),
+                "{bits}-bit cofactor deepened where the sieve is cheaper"
+            );
+        }
+        // Above the ceiling the budget is already the deep one, split or no split.
+        assert_eq!(
+            rho_budget(512, &tuning, true),
+            rho_budget(512, &tuning, false)
+        );
     }
 
     /// The override exists so that a 56- or 64-bit factor above the ceiling is reachable without a
@@ -2585,14 +2670,14 @@ mod tests {
             ..FactorTuning::default()
         };
         for bits in [128, MAX_SIQS_BITS, MAX_SIQS_BITS + 1, 1024] {
-            assert_eq!(rho_budget(bits, &tuning), 4_000_000_000);
+            assert_eq!(rho_budget(bits, &tuning, false), 4_000_000_000);
         }
         // Zero would disable the stage silently; the floor keeps it a budget rather than a switch.
         let zero = FactorTuning {
             rho_iterations: Some(0),
             ..FactorTuning::default()
         };
-        assert_eq!(rho_budget(512, &zero), 1);
+        assert_eq!(rho_budget(512, &zero, false), 1);
     }
 
     /// The family budget exists to stop a run that cannot finish, not to truncate one that can.
@@ -2888,11 +2973,11 @@ mod tests {
         let n = p.checked_mul(&q).unwrap();
         let mut polls = 0usize;
         let started = std::time::Instant::now();
-        let result = pollard_brent_natural(&n, 4_096, || {
+        let poll = || {
             polls += 1;
             true
-        })
-        .unwrap();
+        };
+        let result = pollard_brent_natural(&n, 4_096, poll).unwrap();
         assert!(
             result.is_none(),
             "4096 iterations should not split a 128-bit balanced semiprime"

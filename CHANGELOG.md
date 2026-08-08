@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.3 — 2026-08-08
+## 0.4.3 — Unreleased
 
 - Raised the Pollard–Brent budget for composites the sieve refuses. Above
   `MAX_SIQS_BITS` rho is not a cheap peel in front of SIQS — it is the entire
@@ -28,6 +28,32 @@
   iterations, single-threaded: a 56-bit factor out of a 512-bit input and a
   64-bit factor out of a 401-bit input, 1,452 s for the pair
   (`raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling`).
+- Fixed wide products of many middling primes stalling in the sieve. The
+  sieve-fraction budget assumes the node is a balanced semiprime SIQS will finish
+  cheaply, and a cofactor that reached the recursion by splitting under rho
+  disproves that assumption — it has at least three prime factors, one of them
+  small enough for rho to find. A 498-bit product of ten 50-bit primes peeled two
+  factors while it was above the ceiling, then crossed 400 bits, lost the deep
+  budget, and handed its 399-bit remainder to the 369..=400 tier, which wanted
+  206,403 relations at about two relations per second: weeks of sieving on a
+  number whose every factor rho finds in seconds. Cofactors of a rho split now
+  keep the deep budget from 257 bits up, where a sieve run stops costing seconds.
+  The same input now peels five factors in rho and hands a 250-bit remainder to a
+  sieve that returns it in 2.9 s — 65 s end to end, verified against all ten
+  primes. Balanced semiprimes never take that branch: rho does not split them, so
+  nothing below them inherits the mark.
+- Baked the measured basic-block alignment flag into `make native` and
+  `build-release.sh`. Loop alignment in the fat-LTO native binary was previously
+  decided by luck that unrelated edits re-rolled — two inert lines in the CLI's
+  progress closure, in an arm that never ran, moved a 512-bit input with a 40-bit
+  factor from 1.45 s to 1.57 s while the library's own iteration rate was
+  unchanged. `-C llvm-args=-align-all-nofallthru-blocks=5` removes the luck and
+  is faster on both workloads: medians of five interleaved runs measured balanced
+  192/216/224/232/256/272-bit inputs 2.1% to 4.0% faster and Pollard-Brent
+  dominated inputs 6.3% to 8.6% faster, for a `qs-factor` binary that grows from
+  773 KiB to 893 KiB. 64-byte alignment was measured and is no better for 38%
+  more size. The flag is probed, not assumed, since `-C llvm-args` rejects an
+  unknown option outright; wasm is excluded deliberately.
 - Applied the same policy to the browser. The frontend refused a composite above
   the sieve limit after a 2^15-iteration peel — a reach of about 2^29, which could
   not even guarantee a 32-bit factor — and now spends a deep budget first: 2^23
@@ -36,7 +62,9 @@
   reaching about 2^45 and 2^43. `pollardBrentSliced` yields every 2^14 inner
   iterations, roughly 50 ms of work, so the page keeps painting and reports
   progress against the budget; `pollardBrent` is now a wrapper around it and its
-  behavior below the ceiling is unchanged.
+  behavior below the ceiling is unchanged. The browser ladder also carries the
+  split evidence on its own stack, so a cofactor of a rho split gets the deep
+  budget from 257 bits up exactly as the native ladder does.
 
 ## 0.4.2 — 2026-08-01
 

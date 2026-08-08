@@ -70,6 +70,10 @@ Environment:
   ZIG_LOCAL_CACHE_DIR
                     Zig local cache (default: under CARGO_TARGET_DIR).
   SOURCE_DATE_EPOCH Timestamp used for reproducible archives.
+  RUSQSIEVE_TUNE_RUSTFLAGS
+                    RUSTFLAGS added to every native target, defaulting to the
+                    measured basic-block alignment flag if the toolchain's LLVM
+                    accepts it. Set to the empty string to build unflagged.
 EOF
 }
 
@@ -89,6 +93,35 @@ need_command() {
 need_file() {
     [ -f "$1" ] || die "expected build artifact is missing: $1"
 }
+
+# Basic-block alignment for every native artifact, matching the Makefile's `native` target; see the
+# comment there for the measurement. Short version: without it the alignment of the hot Pollard-
+# Brent and sieve loops is a lottery unrelated edits re-roll, and forcing 32-byte alignment on
+# non-fallthrough blocks measured 2.1-4.0% faster on balanced SIQS inputs from 192 to 272 bits and
+# 6.3-8.6% faster on Pollard-Brent dominated ones, for a binary that grows by about 15%.
+#
+# Probed against the host toolchain because `-C llvm-args` rejects an unknown option outright: an
+# LLVM that has dropped it falls back to an unflagged build. Cross-compiled targets are built by
+# `cross` inside a container with its own toolchain, so the probe is indicative rather than
+# authoritative there; set RUSQSIEVE_TUNE_RUSTFLAGS='' to opt out if that ever bites. Wasm is
+# deliberately excluded: block alignment means nothing in a stack machine, and artifact size is a
+# shipping gate there.
+probe_tune_rustflags() {
+    tune='-C llvm-args=-align-all-nofallthru-blocks=5'
+    probe_dir=$(mktemp -d) || return 0
+    printf 'pub fn p() {}\n' >"$probe_dir/p.rs"
+    # The flag is two arguments, so the split is the point.
+    # shellcheck disable=SC2086
+    if RUSTFLAGS='' rustc --crate-type lib --emit=obj $tune \
+        -o "$probe_dir/p.o" "$probe_dir/p.rs" >/dev/null 2>&1
+    then
+        printf '%s' "$tune"
+    fi
+    rm -rf "$probe_dir"
+}
+
+NATIVE_TUNE_RUSTFLAGS=${RUSQSIEVE_TUNE_RUSTFLAGS-$(probe_tune_rustflags)}
+readonly NATIVE_TUNE_RUSTFLAGS
 
 run_with_rustflags() (
     release_rustflags=$1
@@ -270,7 +303,7 @@ build_target() {
     printf '\nBuilding %s\n' "$target"
     case "$target" in
         x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | x86_64-unknown-freebsd)
-            run_with_rustflags "" \
+            run_with_rustflags "$NATIVE_TUNE_RUSTFLAGS" \
                 cross build --locked --release --target "$target" --target-dir "$BUILD_DIR"
             case "$target" in
                 *-freebsd) package_posix "$target" so yes ;;
@@ -278,14 +311,14 @@ build_target() {
             esac
             ;;
         x86_64-unknown-linux-musl | aarch64-unknown-linux-musl)
-            run_with_rustflags "" \
+            run_with_rustflags "$NATIVE_TUNE_RUSTFLAGS" \
                 cross build --locked --release --target "$target" --target-dir "$BUILD_DIR"
             package_posix "$target" so no
             ;;
         x86_64-pc-windows-msvc)
             XWIN_CACHE_DIR="${XWIN_CACHE_DIR:-$BUILD_DIR/xwin-cache}"
             export XWIN_CACHE_DIR
-            run_with_rustflags "-C target-feature=+crt-static" \
+            run_with_rustflags "-C target-feature=+crt-static $NATIVE_TUNE_RUSTFLAGS" \
                 cargo xwin build \
                     --locked \
                     --release \
@@ -298,7 +331,7 @@ build_target() {
             ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$BUILD_DIR/zig-global-cache}"
             ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$BUILD_DIR/zig-local-cache}"
             export CARGO_ZIGBUILD_CACHE_DIR ZIG_GLOBAL_CACHE_DIR ZIG_LOCAL_CACHE_DIR
-            run_with_rustflags "" \
+            run_with_rustflags "$NATIVE_TUNE_RUSTFLAGS" \
                 cargo zigbuild --locked --release --target "$target" --target-dir "$BUILD_DIR"
             package_posix "$target" dylib yes
             ;;

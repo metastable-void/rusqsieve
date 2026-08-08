@@ -32,6 +32,7 @@ jobs:
       - run: make wasm
       - run: node tools/browser-arch-check.mjs
       - run: node tools/browser-glue-failure-check.mjs
+      - run: node tools/wide-rho-check.mjs
       - run: ./build-release.sh wasm32-unknown-unknown
 
   slow-factorization:

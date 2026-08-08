@@ -290,6 +290,16 @@ the budget is spent.
 | 512-bit | 48-bit | refused, 2.71 s | 30.35 s |
 | 512-bit balanced semiprime | — | refused, 2.71 s | refused, 61.99 s |
 
+A cofactor that split under rho keeps the deep budget from 257 bits up, which is what lets a wide
+product of middling primes finish at all. Measured through the release CLI with 96 workers:
+
+| input | before | after |
+|---|---:|---:|
+| 498-bit, ten 50-bit primes | two factors peeled, then a 399-bit sieve wanting 206,403 relations at ~2/s | 65.3 s, all ten primes verified |
+
+The run peels five factors in rho (498 → 448 → 399 → 349 → 299 bits) and hands the 250-bit
+remainder to a sieve that builds its factor base in 0.03 s and collects in 2.9 s.
+
 Nothing at or below the ceiling changed. The budget there is still the sieve-derived one, pinned
 value-for-value by `budgets_at_and_below_the_ceiling_are_unchanged`, because rho finds nothing on a
 balanced semiprime and every iteration it spends is overhead on the main workload. Confirmed against
@@ -323,6 +333,35 @@ RUSQSIEVE_RHO_ITERATIONS=4000000000 qs-factor < composite.txt
 The browser runs the same loop on `BigInt` at roughly an eighth of the native rate — 288k
 iterations/s at 512 bits and 115k/s at 1024 measured under Node 24.15 — and spends 2^23 iterations
 up to 512 bits and 2^22 above, about half a minute at either end, sliced into ~50 ms macrotasks.
+
+## Basic-block alignment in native builds
+
+Timings of this crate's hot loops are sensitive to code alignment under `lto = "fat"` and
+`codegen-units = 1`. Two inert lines added to the CLI's progress closure — in a match arm that never
+executed, because progress was disabled — moved a 512-bit input with a 40-bit factor from 1.45 s to
+1.57 s, while the same tree's library iteration rate, measured by `profile_wide_rho_throughput`
+under `--profile release-test` (thin LTO, 16 codegen units), was unchanged at 2.18–2.80 M/s. Any A/B
+of unrelated changes on this codebase can pick up several percent of that noise.
+
+`make native` and `build-release.sh` therefore build with
+`-C llvm-args=-align-all-nofallthru-blocks=5`. Medians of five interleaved runs against the same
+tree built without it, x86-64 Xeon 8259CL:
+
+| input | default | 32-byte alignment | delta |
+|---|---:|---:|---:|
+| 192-bit balanced | 0.210 s | 0.202 s | −4.0% |
+| 216-bit balanced | 0.675 s | 0.658 s | −2.6% |
+| 224-bit balanced | 1.163 s | 1.127 s | −3.1% |
+| 232-bit balanced | 1.972 s | 1.931 s | −2.1% |
+| 256-bit balanced | 6.089 s | 5.973 s | −1.9% |
+| 272-bit balanced | 15.398 s | 15.049 s | −2.3% |
+| 512-bit, 40-bit factor | 1.566 s | 1.431 s | −8.6% |
+| 384-bit, 40-bit factor | 0.607 s | 0.569 s | −6.3% |
+
+`qs-factor` grows from 773 KiB to 893 KiB. 64-byte alignment (`=6`) was measured at the same speed
+for 38% more size and was rejected. A first, non-interleaved sweep of the same comparison reported
+the 224-bit case 14% *slower* under alignment; interleaving with alternating order removed that
+entirely, which is the reason the protocol above insists on it.
 
 ## What a “fastest general browser factorizer” claim requires
 

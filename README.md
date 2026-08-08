@@ -65,6 +65,19 @@ make
 The library is emitted as an `rlib`, static library, and platform shared
 library.
 
+`make` and `build-release.sh` add one measured tuning flag to native builds,
+`-C llvm-args=-align-all-nofallthru-blocks=5`. Without it the alignment of the
+hot sieve and Pollard–Brent loops is decided by luck that unrelated edits
+re-roll — two inert lines in the CLI's progress closure moved a rho-dominated
+input by 8% — and forcing 32-byte alignment measured 2.1–4.0% faster on balanced
+192–272-bit inputs and 6.3–8.6% faster on Pollard–Brent-dominated ones, for a
+binary about 15% larger. The build probes for it, so a toolchain whose LLVM does
+not accept the option falls back to an unflagged build rather than failing;
+`make NATIVE_TUNE_RUSTFLAGS=` or `RUSQSIEVE_TUNE_RUSTFLAGS=` opts out. A plain
+`cargo build --release` is unflagged and correspondingly unpredictable at the
+few-percent level. Wasm is deliberately excluded: block alignment means nothing
+in a stack machine, and artifact size is a shipping gate there.
+
 ## Rust API
 
 The blocking factorization functions are available on Unix and Windows:
@@ -115,6 +128,14 @@ factors up to 32 bits with orders of magnitude to spare. A wide input carrying a
 findable factor is therefore split rather than refused. Set
 `RUSQSIEVE_RHO_ITERATIONS` for the minutes-to-hours search that 56- and 64-bit
 factors cost.
+
+A cofactor that reached the recursion by splitting under rho keeps that deep
+budget down to 257 bits, because splitting proves it is not the balanced
+semiprime the cheap budget is sized for. This is what lets a wide product of
+many middling primes finish: a 498-bit product of ten 50-bit primes peels five
+factors in rho and hands a 250-bit remainder to the sieve, 65 s in total, where
+it previously stalled on a 399-bit sieve for weeks. Balanced semiprimes never
+reach that branch — rho does not split them.
 
 All supported public items are covered by rustdoc, enforced with
 `deny(missing_docs)`. The complete 0.4 contract and implementation architecture
@@ -268,6 +289,19 @@ The current pipeline combines trial division, Pollard–Brent rho, primality and
 perfect-power checks, and SIQS. It is strongest on balanced semiprimes.
 Unbalanced 192–256-bit composites with medium-size factors remain the main
 general-factorization gap because ECM is absent.
+
+The roadmap answer to that gap is a **world-class, completely opt-in ECM for
+non-RSA numbers**: a stage-1/stage-2 elliptic-curve method built to compete with
+GMP-ECM and YAFU on the factor sizes rho cannot reach — roughly 2^50 upward,
+where Pollard–Brent's `O(sqrt p)` cost stops being payable and the sieve charges
+by the size of `N` instead. It is for composites with medium-size factors:
+multi-factor numbers, unbalanced ones, and anything past the sieve's 400-bit
+ceiling. Opt-in is a hard requirement rather than a preference. ECM must sit
+behind a non-default feature and ship as a separate general-purpose Wasm
+artifact; the balanced-RSA artifact must contain no ECM code and no ECM
+initialization, and the fixed 192/224/256-bit corpus stays an A/B gate for
+runtime, download size, compilation, startup, and code-cache footprint. Balanced
+semiprimes — RSA challenge work — must not pay a byte or a cycle for it.
 
 Below 272 bits, linear algebra uses structured sparse elimination followed by
 compact scalar/M4RI row-echelon solving. At 272 bits and above, native and Wasm

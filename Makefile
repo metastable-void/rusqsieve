@@ -1,5 +1,6 @@
 # Native build/install and browser demo packaging.
 CARGO       ?= cargo
+RUSTC       ?= rustc
 CC          ?= cc
 INSTALL     ?= install
 PREFIX      ?= /usr/local
@@ -8,6 +9,30 @@ BINDIR      ?= $(PREFIX)/bin
 LIBDIR      ?= $(PREFIX)/lib
 INCLUDEDIR  ?= $(PREFIX)/include
 PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
+
+# Basic-block alignment for native release builds.
+#
+# Without it the alignment of the hot Pollard-Brent and sieve loops is a lottery that unrelated
+# edits re-roll: two inert lines added to the CLI's progress closure — in an arm that never ran,
+# because progress was disabled — moved a 512-bit input with a 40-bit factor from 1.45 s to 1.57 s,
+# while the library's own measured iteration rate was unchanged. Forcing 32-byte alignment on
+# non-fallthrough blocks removes the luck and is faster on both workloads.
+#
+# Measured on an x86-64 Xeon 8259CL, medians of five interleaved runs against the same tree built
+# without the flag: balanced SIQS inputs 192/216/224/232/256/272-bit are 2.1% to 4.0% faster, and
+# Pollard-Brent dominated inputs 6.3% to 8.6% faster. The qs-factor binary grows from 773 KiB to
+# 893 KiB. 64-byte alignment was measured too and is no better for 38% more size.
+#
+# Probed rather than assumed: `-C llvm-args` rejects an unknown option outright, so a toolchain
+# whose LLVM has dropped this one falls back to an unflagged build instead of failing. Setting
+# `NATIVE_TUNE_RUSTFLAGS=` on the command line opts out. Note that this makes `make native` and a
+# bare `cargo build --release` different builds, so alternating between them rebuilds the crate.
+# Wasm is deliberately excluded: block alignment means nothing in a stack machine, and artifact
+# size is a shipping gate there.
+ALIGN_RUSTFLAG := -C llvm-args=-align-all-nofallthru-blocks=5
+NATIVE_TUNE_RUSTFLAGS ?= $(shell probe=$$(mktemp -d) && printf 'pub fn p() {}\n' > "$$probe/p.rs" && \
+	if $(RUSTC) --crate-type lib --emit=obj $(ALIGN_RUSTFLAG) -o "$$probe/p.o" "$$probe/p.rs" \
+		>/dev/null 2>&1; then printf '%s' '$(ALIGN_RUSTFLAG)'; fi; rm -rf "$$probe")
 
 HOST_OS      := $(shell uname -s)
 SHARED_EXT   ?= $(if $(filter Darwin,$(HOST_OS)),dylib,so)
@@ -35,7 +60,7 @@ DOCS_FILES  := $(addprefix $(DOCS)/,$(ASSETS)) $(DOCS)/rusqsieve.wasm \
 .PHONY: native install docs docs-verify wasm serve test c-api-smoke clean
 
 native:
-	$(CARGO) build --release
+	RUSTFLAGS="$(RUSTFLAGS) $(NATIVE_TUNE_RUSTFLAGS)" $(CARGO) build --release
 
 install: native
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" \

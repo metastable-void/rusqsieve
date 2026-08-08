@@ -494,11 +494,18 @@ async function deepPollard(c, bits, report) {
   return step.value;
 }
 
+// Width from which a cofactor already known to be unbalanced is worth a deep rho rather than a
+// sieve, matching `engine::DEEP_RHO_MIN_BITS`. Below it the sieve returns in seconds whatever the
+// input's shape, so a long rho could only lose.
+const DEEP_RHO_MIN_BITS = 257;
+
+// Stack entries carry whether the value is a cofactor of a composite rho already split. That is the
+// evidence that it is not a balanced semiprime — the one shape the cheap opening peel is sized for.
 async function factorize(N, report) {
   const primes = [];
-  const stack = [N];
+  const stack = [[N, false]];
   while (stack.length) {
-    let c = stack.pop();
+    let [c, afterSplit] = stack.pop();
     report({ phase: "trial", n: c });
     await tick();
     c = trialDivide(c, primes);
@@ -511,7 +518,7 @@ async function factorize(N, report) {
     }
     const pp = perfectPower(c);
     if (pp) {
-      for (let i = 0; i < pp.k; i++) stack.push(pp.base);
+      for (let i = 0; i < pp.k; i++) stack.push([pp.base, afterSplit]);
       continue;
     }
     // Pollard-Brent is a cheap opportunistic peel, not the primary tool at any size: it costs
@@ -525,35 +532,40 @@ async function factorize(N, report) {
     await tick();
     const d = pollardBrent(c, 1 << 15);
     if (d && d > 1n && d < c) {
-      stack.push(d, c / d);
+      stack.push([d, true], [c / d, true]);
       continue;
     }
     // Everything cheap has been tried and `c` is a hard composite. This is the only place a width
     // limit applies: trial division, the primality test, perfect powers, and Pollard-Brent above
     // all ran without one, so a wide number built from small factors never reaches here.
     const compositeBits = bitLength(c);
-    if (compositeBits > maxSiqsBits) {
-      // The sieve will refuse this composite, so the cheap peel above was not an opening move —
-      // it was the whole attempt, and it stopped at a budget sized for a sieve run that is never
-      // going to happen. Spend a real one before giving up. `engine::wide_rho_budget` makes the
-      // same call natively; the numbers differ because BigInt runs rho at roughly an eighth of
-      // the native rate, not because the policy does.
+    // Two cases make the cheap peel above the wrong thing to have stopped at. Either the sieve will
+    // refuse this composite outright, so that peel was not an opening move but the whole attempt;
+    // or `c` split under rho on the way here, which proves it is not the balanced semiprime the
+    // peel is sized for — a wide product of middling primes otherwise peels down to just under the
+    // sieve's ceiling and then stalls there for weeks. `engine::rho_budget` makes both calls
+    // natively; the numbers differ because BigInt runs rho at roughly an eighth of the native rate,
+    // not because the policy does.
+    const refused = compositeBits > maxSiqsBits;
+    if (refused || (afterSplit && compositeBits >= DEEP_RHO_MIN_BITS)) {
       const deep = await deepPollard(c, compositeBits, report);
       if (deep && deep > 1n && deep < c) {
-        stack.push(deep, c / deep);
+        stack.push([deep, true], [c / deep, true]);
         continue;
       }
-      throw new Error(
-        `this number needs the quadratic sieve on a ${compositeBits}-bit composite, ` +
-          `above the ${maxSiqsBits}-bit limit — numbers of any size still factor when ` +
-          `their factors are small`,
-      );
+      if (refused) {
+        throw new Error(
+          `this number needs the quadratic sieve on a ${compositeBits}-bit composite, ` +
+            `above the ${maxSiqsBits}-bit limit — numbers of any size still factor when ` +
+            `their factors are small`,
+        );
+      }
     }
     const factor = await siqsParallel(c.toString(), compositeBits, report);
     if (factor <= 1n || factor >= c || c % factor !== 0n) {
       throw new Error("quadratic sieve returned an invalid factor");
     }
-    stack.push(factor, c / factor);
+    stack.push([factor, afterSplit], [c / factor, afterSplit]);
   }
   return groupFactors(primes);
 }

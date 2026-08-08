@@ -308,6 +308,19 @@ bits are covered by more than two orders of magnitude of margin at every width.
 `RUSQSIEVE_RHO_ITERATIONS` overrides the budget for callers who want the
 minutes-to-hours search that 56- and 64-bit factors cost.
 
+The sieve-fraction sizing rests on one premise — that the node is a balanced
+semiprime the sieve will finish cheaply — and a cofactor that reached the
+recursion by *splitting under rho* disproves it: such a value has at least three
+prime factors and at least one was small enough for rho to find. From 257 bits
+upward, where a sieve run stops costing seconds, those cofactors therefore keep
+the deep budget. Balanced semiprimes never reach that branch, because rho does
+not split them and nothing below them inherits the mark. Without this rule a
+wide product of middling primes peeled factors only while it was above the
+ceiling: a 498-bit product of ten 50-bit primes crossed 400 bits after two
+splits, and its 399-bit remainder went to a sieve that wanted 206,403 relations
+at roughly two per second. It now peels five factors in rho and hands a 250-bit
+remainder to a sieve that returns it in under three seconds.
+
 ## 6. Native factorization pipeline
 
 The optimized blocking engine performs:
@@ -842,13 +855,26 @@ The 0.4 release is optimized for balanced semiprimes. Its principal known gaps
 are:
 
 - no ECM for medium factors in unbalanced composites;
-- above the sieve's 400-bit ceiling the only tool is Pollard–Brent, and its cost
-  is `O(sqrt p)` in the smallest factor. The default budget reaches roughly 2^53
-  at 512 bits and 2^50 at 1024; `RUSQSIEVE_RHO_ITERATIONS` buys 56- and 64-bit
-  factors for minutes to hours, and the stage is single-threaded, so the idle
-  worker pool contributes nothing to it. ECM is the right answer in that range,
-  and racing independent walks across the pool would give roughly a `sqrt(T)`
-  speedup in the meantime;
+- **a world-class, completely opt-in ECM for non-RSA numbers** is the roadmap
+  answer to every gap above. Pollard–Brent costs `O(sqrt p)` in the smallest
+  factor, so the deep budget above the sieve's ceiling reaches roughly 2^53 at
+  512 bits and 2^50 at 1024 and then stops being payable, while the sieve charges
+  by the size of `N`. Stage-1/stage-2 ECM is what covers that range, and the
+  target is parity with GMP-ECM and YAFU rather than a token implementation. Its
+  users are composites the balanced-semiprime path is wrong for: multi-factor
+  numbers, unbalanced ones, and anything past 400 bits. Opt-in is a hard
+  requirement, not a preference — a non-default feature and a separate
+  general-purpose Wasm artifact, with no ECM code or initialization in the
+  balanced-RSA artifact, and the fixed 192/224/256-bit corpus retained as an A/B
+  gate for runtime, download size, compilation, startup, and code-cache
+  footprint. RSA challenge work must not pay a byte or a cycle for it;
+- the big-integer rho stage is single-threaded, so the worker pool idles through
+  it. Racing independent walks across `T` workers would give roughly a `sqrt(T)`
+  speedup, which is the cheap interim answer for 56- and 64-bit factors that
+  `RUSQSIEVE_RHO_ITERATIONS` currently buys in minutes to hours;
+- a failed factorization discards the factors already peeled. A wide composite
+  whose remaining cofactor is hard returns `SiqsCompositeTooLarge` with nothing
+  else, even though rho may have split several primes off it first;
 - high-digit SIQS tiers still need multi-input wall-time sweeps on representative
   native hosts;
 - the 369..=400-bit tier is a single-input yield measurement, not a qualified
