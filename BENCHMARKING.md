@@ -270,10 +270,10 @@ run. Iteration rates, release build, single-threaded, x86-64 Xeon 8259CL — rep
 
 | composite bits | iterations/s | budget | wall | smallest factor reached (`1.2·√p`) |
 |---:|---:|---:|---:|---:|
-| 400 | 2,864,749 | 6,291,456 (sieve-derived) | 2.2 s | 2^44.6 |
-| 512 | 2,245,151 | 128,000,000 | 57 s | 2^53.0 |
-| 768 | 1,207,160 | 72,000,000 | 60 s | 2^51.7 |
-| 1024 | 783,282 | 48,000,000 | 61 s | 2^50.5 |
+| 400 | 5,102,618 | 6,291,456 (sieve-derived) | 1.2 s | 2^44.6 |
+| 512 | 3,729,081 | 128,000,000 | 34 s | 2^53.0 |
+| 768 | 1,875,651 | 72,000,000 | 38 s | 2^51.7 |
+| 1024 | 1,179,364 | 48,000,000 | 41 s | 2^50.5 |
 
 End to end through the release CLI, on inputs built as one small prime times one wide prime. The
 old-budget column is the same binary run with `RUSQSIEVE_RHO_ITERATIONS=6291456`, which is exactly
@@ -335,13 +335,13 @@ disjoint range of polynomial constants. Iteration rates measured under Node 24.1
 
 | composite bits | native | wasm (scalar) | main-thread `BigInt` |
 |---:|---:|---:|---:|
-| 512 | 2,245,151/s | 654,000/s | 288,000/s |
-| 1024 | 783,282/s | 183,000/s | 115,000/s |
+| 512 | 3,729,081/s | 992,000/s | 288,000/s |
+| 1024 | 1,179,364/s | 298,000/s | 115,000/s |
 
 Per-worker budget is 2^25 iterations up to 512 bits, 24M through 768, 16M above. `T` independent
 walks collide in about `1.2·sqrt(p)/sqrt(T)` iterations, so eight workers reach a smallest factor of
-roughly 2^52 at 512 bits and 2^50 at 1024 — parity with the native CLI — in about a minute of
-worker time, with the main thread free throughout.
+roughly 2^52 at 512 bits and 2^50 at 1024 — parity with the native CLI — in 34 to 56 s of worker
+time, with the main thread free throughout.
 
 End to end on a 478-bit product of ten 48-bit primes, driving the real worker protocol on Node
 worker threads with eight workers:
@@ -354,6 +354,80 @@ worker threads with eight workers:
 
 A runtime with no module or no `Worker` falls back to the main thread's sliced `BigInt` search,
 which keeps the smaller 2^23/2^22 budget because it has to stay sliceable into ~50 ms macrotasks.
+
+## Montgomery arithmetic and the rho inner loop
+
+Rho is two modular multiplications per iteration, so `src/natural/montgomery.rs` is where its speed
+lives. Reproduce the inner loop with
+`cargo test --profile release-test --lib -- --ignored profile_montgomery_loop --nocapture`; it runs
+one Montgomery squaring, one modular add, one modular subtract, and one Montgomery multiply per
+iteration, which is exactly what the reference below runs.
+
+The reference is the same loop over GMP 6.3.0's mpn assembly (`__gmpn_sqr`, `__gmpn_mul_n`,
+`__gmpn_addmul_1`). That is the fair opponent for a "world-class" claim: YAFU's `montybrent` runs on
+GMP through mpz, and FLINT's `flint_mpn_factor_pollard_brent_single` runs on mpn directly, so both
+inherit this assembly. x86-64 Xeon 8259CL, one million iterations each:
+
+| limbs | bits | rusqsieve | GMP mpn | ratio |
+|---:|---:|---:|---:|---:|
+| 2 | 128 | 19,337,101/s | 13,494,324/s | **1.43×** |
+| 3 | 192 | 13,901,104/s | 9,579,733/s | **1.45×** |
+| 4 | 256 | 10,276,357/s | 7,811,153/s | **1.32×** |
+| 5 | 320 | 7,264,293/s | 5,513,344/s | **1.32×** |
+| 7 | 448 | 4,073,624/s | 3,551,447/s | **1.15×** |
+| 8 | 512 | 3,361,918/s | 3,407,755/s | 0.99× |
+| 12 | 768 | 1,548,487/s | 1,663,963/s | 0.93× |
+| 16 | 1024 | 948,259/s | 1,088,155/s | 0.87× |
+
+We are ahead through seven limbs, at parity at eight, and behind by 7–13% at twelve and sixteen,
+where GMP's hand-written `mulx`/`adcx`/`adox` inner loops run two carry chains at once. A probe of
+that technique through Rust intrinsics measured 1.15–1.19× on the multiply, which would close the
+gap, but it is x86-64-only and needs `unsafe`; it is recorded here and not adopted.
+
+End to end against YAFU 3.1.9 (GMP 6.3.0, GMP-ECM 7.0.5), ten fixed 512-bit composites each with a
+40-bit factor, `rho(N)` with `-rhomax 40000` against `qs-factor --threads 1`, both verified to
+return the factor:
+
+| | median | note |
+|---|---:|---|
+| rusqsieve | 0.573 s | 0.006 s of that is process startup |
+| YAFU | 1.196 s | 0.227 s of that is process startup |
+
+That is 1.7× on the rho work itself, and rusqsieve won 9 of the 10 inputs. Repeated at 1024 bits
+with a 40-bit factor over eight inputs: 1.834 s against 3.309 s, winning 8 of 8. The walks differ
+between implementations, so single inputs are luck; the medians are the claim.
+
+Where the speed came from, measured as full-stage `profile_wide_rho_throughput` rates before and
+after `src/natural/montgomery.rs` was rewritten:
+
+| bits | before | after | |
+|---:|---:|---:|---:|
+| 128 | 5,812,766/s | 17,776,441/s | 3.06× |
+| 256 | 4,306,730/s | 9,210,792/s | 2.14× |
+| 512 | 2,194,421/s | 3,729,081/s | 1.70× |
+| 1024 | 730,330/s | 1,179,364/s | 1.61× |
+
+Three changes account for it: the arithmetic works in place over the modulus's significant limbs
+instead of copying through a zeroed 33-word scratch buffer (which is why the small widths gain
+most), the inner loops are monomorphized over the limb count and unrolled, and squaring uses the
+symmetric product. Correctness is pinned by `diff_montgomery_arithmetic`, which checks every limb
+count from 1 to 16 against division-based modular arithmetic.
+
+### Limb width on wasm
+
+wasm has `i64.mul` but no widening 64×64 multiply, so 64-bit limbs there mean every product is
+emulated. Measured through `qs_rho` on the shipped artifact under Node 24.15 — same build, same
+moduli, only the limb type differing:
+
+| bits | 320 | 400 | 512 | 640 | 768 | 896 | 1024 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 32-bit limbs | 2.004 M/s | 1.394 | 0.989 | 0.698 | 0.515 | 0.401 | 0.299 |
+| 64-bit limbs | 2.097 M/s | 1.083 | 0.826 | 0.554 | 0.373 | 0.281 | 0.219 |
+
+wasm therefore uses 32-bit limbs and every other target uses 64-bit ones. The crossover below 400
+bits costs nothing the browser's deep rho cares about, since that path exists for composites the
+sieve refuses. Both limb widths are generated from one macro and checked against each other by
+`narrow_and_wide_limbs_agree`, so the host test suite covers the wasm arithmetic.
 
 ## Basic-block alignment in native builds
 

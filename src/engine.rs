@@ -354,18 +354,20 @@ const DEEP_RHO_MIN_BITS: usize = 257;
 ///
 /// Per-iteration cost grows with the square of the limb count, so a flat iteration count would cost
 /// three times as much wall clock at the top of the supported range as at the bottom. Measured
-/// single-thread rates (release, x86-64 Xeon 8259CL, `profile_wide_rho_throughput`): 2.25 M/s at 512
-/// bits, 1.21 M/s at 768, 0.78 M/s at 1024. These tiers therefore spend about a minute per attempt
-/// at every width instead.
+/// single-thread rates (release, x86-64 Xeon 8259CL, `profile_wide_rho_throughput`): 3.73 M/s at 512
+/// bits, 1.88 M/s at 768, 1.18 M/s at 1024. These tiers therefore spend a comparable amount of time
+/// at every width instead — 34 s, 38 s and 41 s.
 ///
-/// Brent finds `p` in about `1.2·sqrt(p)` iterations, so a minute buys a smallest factor of roughly
-/// 2^53 at 512 bits, 2^51.7 at 768 and 2^50.5 at 1024. The sieve-derived budget this replaces was
-/// 6.29 M iterations at every width above the ceiling — reach 2^44.6 — which refused a 512-bit input
+/// Brent finds `p` in about `1.2·sqrt(p)` iterations, so that buys a smallest factor of roughly 2^53
+/// at 512 bits, 2^51.7 at 768 and 2^50.5 at 1024. The sieve-derived budget this replaces was 6.29 M
+/// iterations at every width above the ceiling — reach 2^44.6 — which refused a 512-bit input
 /// carrying a 48-bit factor after 2.7 s of work that was nearly deep enough.
 ///
-/// A minute is where the default stops, because each additional factor bit doubles the cost: 2^56 is
-/// 2.5 to 7 minutes and 2^64 is 38 minutes to 1.8 hours across this width range. That is a real
-/// search, not a default one, and callers who want it ask for it with `RUSQSIEVE_RHO_ITERATIONS`.
+/// The budgets are stated in iterations, not seconds, so the Montgomery rewrite that made the stage
+/// 1.7× faster bought back wall clock rather than reach: the same tiers cost about 40% less than
+/// when they were chosen. Reach is where the default stops, because each additional factor bit
+/// doubles the cost: 2^56 is minutes and 2^64 is tens of minutes across this width range. That is a
+/// real search, not a default one, and callers who want it ask with `RUSQSIEVE_RHO_ITERATIONS`.
 const fn wide_rho_budget(bits: usize) -> u64 {
     if bits <= 512 {
         128_000_000
@@ -2041,16 +2043,24 @@ pub(crate) fn pollard_brent_natural(
         if !keep_going() {
             return Err(EngineError::Cancelled);
         }
-        let c = montgomery.encode(&Natural::from_u64(c_value));
-        let mut y = montgomery.encode(&Natural::from_u64(2));
+        // The whole walk runs in raw limb buffers rather than `Natural`s. Every one of these starts
+        // zeroed and nothing below writes above the modulus width, so the operations never touch —
+        // or have to clear — the capacity the modulus does not use. At a 128-bit modulus that is 14
+        // of 16 limbs.
+        let mut c = [0 as crate::natural::Limb; crate::natural::LIMB_CAP];
+        let mut y = [0 as crate::natural::Limb; crate::natural::LIMB_CAP];
+        let mut x = [0 as crate::natural::Limb; crate::natural::LIMB_CAP];
+        let mut ys = [0 as crate::natural::Limb; crate::natural::LIMB_CAP];
+        let mut q = [0 as crate::natural::Limb; crate::natural::LIMB_CAP];
+        let mut difference = [0 as crate::natural::Limb; crate::natural::LIMB_CAP];
+        montgomery.load(&montgomery.encode(&Natural::from_u64(c_value)), &mut c);
+        montgomery.load(&montgomery.encode(&Natural::from_u64(2)), &mut y);
         let mut r = 1u64;
         let mut g = Natural::ONE;
-        let mut x = Natural::ZERO;
-        let mut ys = Natural::ZERO;
         while g.is_one() && iterations < iteration_limit {
-            x = y.clone();
+            x.copy_from_slice(&y);
             for _ in 0..r {
-                y = montgomery.add(&montgomery.square(&y), &c);
+                montgomery.sqr_add_assign(&mut y, &c);
                 iterations += 1;
                 if iterations >= iteration_limit {
                     break;
@@ -2061,25 +2071,21 @@ pub(crate) fn pollard_brent_natural(
                 if !keep_going() {
                     return Err(EngineError::Cancelled);
                 }
-                ys = y.clone();
-                let mut q = montgomery.one();
+                ys.copy_from_slice(&y);
+                montgomery.load(&montgomery.one(), &mut q);
                 let batch = (r - k).min(128);
                 for _ in 0..batch {
-                    y = montgomery.add(&montgomery.square(&y), &c);
-                    let difference = if x >= y {
-                        x.wrapping_sub(&y)
-                    } else {
-                        y.wrapping_sub(&x)
-                    };
-                    if !difference.is_zero() {
-                        q = montgomery.multiply(&q, &difference);
+                    montgomery.sqr_add_assign(&mut y, &c);
+                    montgomery.sub_raw(&x, &y, &mut difference);
+                    if !montgomery.is_zero_raw(&difference) {
+                        montgomery.mul_assign(&mut q, &difference);
                     }
                     iterations += 1;
                     if iterations >= iteration_limit {
                         break;
                     }
                 }
-                g = q.gcd(n);
+                g = montgomery.store(&q).gcd(n);
                 k += batch;
             }
             r = r.saturating_mul(2);
@@ -2089,13 +2095,9 @@ pub(crate) fn pollard_brent_natural(
                 if !keep_going() {
                     return Err(EngineError::Cancelled);
                 }
-                ys = montgomery.add(&montgomery.square(&ys), &c);
-                let difference = if x >= ys {
-                    x.wrapping_sub(&ys)
-                } else {
-                    ys.wrapping_sub(&x)
-                };
-                g = difference.gcd(n);
+                montgomery.sqr_add_assign(&mut ys, &c);
+                montgomery.sub_raw(&x, &ys, &mut difference);
+                g = montgomery.store(&difference).gcd(n);
                 iterations += 1;
                 if !g.is_one() || iterations >= iteration_limit {
                     break;
@@ -3079,7 +3081,7 @@ mod tests {
     #[test]
     #[ignore = "manual wide-rho throughput measurement"]
     fn profile_wide_rho_throughput() {
-        for bits in [400usize, 512, 768, 1024] {
+        for bits in [128usize, 192, 256, 320, 400, 512, 768, 1024] {
             // A prime of the right width: every iteration costs what it costs on a composite of
             // the same size, and no split can cut the run short, so the whole budget is spent and
             // the timing is the loop's rather than luck's.

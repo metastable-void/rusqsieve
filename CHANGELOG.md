@@ -2,6 +2,38 @@
 
 ## 0.4.3 — Unreleased
 
+- Rewrote the Montgomery arithmetic the rho stage runs on, in
+  `src/natural/montgomery.rs`. The old implementation multiplied into a
+  double-width product, copied it into a 33-word scratch array that was zeroed on
+  entry, reduced, and copied out — hundreds of bytes of memory traffic per
+  multiply whatever the modulus, which at a 128-bit modulus was most of the cost.
+  It now uses coarsely integrated operand scanning with no materialized product,
+  symmetric squaring, inner loops monomorphized over the modulus limb count, and
+  raw limb buffers the rho loop holds across iterations so nothing is copied or
+  cleared per operation. Full-stage rates on an x86-64 Xeon 8259CL: 128-bit
+  5,812,766 → 17,776,441 iterations/s (3.06×), 256-bit 4,306,730 → 9,210,792
+  (2.14×), 512-bit 2,194,421 → 3,729,081 (1.70×), 1024-bit 730,330 → 1,179,364
+  (1.61×). `diff_montgomery_arithmetic` checks every limb count from 1 to 16
+  against division-based modular arithmetic.
+- Chose the limb width per target. wasm has `i64.mul` but no widening 64×64
+  multiply, so 64-bit limbs there mean every product is emulated out of 32-bit
+  pieces; 32-bit limbs keep each product inside one instruction. Measured through
+  `qs_rho` on the shipped artifact, same build and moduli: 400 bits 1.40 against
+  1.08 M iterations/s, 512 bits 0.99 against 0.83, 768 bits 0.51 against 0.37,
+  1024 bits 0.30 against 0.22 — 20% to 41% from 400 bits up, which is where the
+  browser's deep rho runs. Both widths are generated from one macro and pinned
+  against each other by `narrow_and_wide_limbs_agree`, so the host test suite
+  covers the wasm path.
+- Measured the result against the implementations this is compared to. On the
+  same inner loop — one Montgomery squaring, one modular add, one modular
+  subtract, one Montgomery multiply — against GMP 6.3.0's mpn assembly, which is
+  what YAFU reaches through mpz and FLINT through mpn: ahead by 1.15× to 1.45×
+  from two through seven limbs, at parity at eight, behind by 7% to 13% at twelve
+  and sixteen where GMP runs two carry chains through hand-written
+  `mulx`/`adcx`/`adox`. End to end against YAFU 3.1.9 on ten fixed 512-bit
+  composites with a 40-bit factor, both verified to return it: 0.573 s against
+  1.196 s median, winning 9 of 10; at 1024 bits over eight inputs, 1.834 s
+  against 3.309 s, winning 8 of 8.
 - Raised the Pollard–Brent budget for composites the sieve refuses. Above
   `MAX_SIQS_BITS` rho is not a cheap peel in front of SIQS — it is the entire
   factoring attempt — but its budget was still sized as a fraction of a sieve run

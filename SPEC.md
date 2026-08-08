@@ -110,6 +110,7 @@ src/
 ├── f2/mod.rs           sparse filtering and dependency solving
 ├── f2/block_lanczos.rs portable 64-way Montgomery block Lanczos
 ├── natural/mod.rs      fixed-capacity unsigned arithmetic
+├── natural/montgomery.rs  Montgomery arithmetic for the rho stage
 ├── smallfactor.rs      cached small primes and u64 Pollard–Brent
 ├── u64math.rs          shared machine-word primality/factoring kernels
 ├── primality.rs        probable-prime testing
@@ -287,12 +288,27 @@ division, binary GCD, and modular helpers. Mathematical code must use checked,
 widening, or modular operations wherever wrapping would invalidate an
 invariant.
 
-Native big-integer Pollard–Brent constructs one real Montgomery context for its
-odd modulus. Polynomial values and batched products remain encoded throughout
-the stage; REDC uses limb multiplication and carry propagation rather than
-division. The iteration budget is unchanged from the division-based version,
-so this optimization reduces failed-rho overhead rather than deepening the
-search on balanced semiprimes.
+Big-integer Pollard–Brent constructs one Montgomery context for its odd modulus
+and runs the whole walk in raw limb buffers. Polynomial values and batched
+products remain encoded throughout the stage; reduction uses limb multiplication
+and carry propagation rather than division.
+
+`natural/montgomery.rs` is written for that loop specifically. Multiplication is
+coarsely integrated operand scanning, so no double-width product is materialized;
+squaring uses the symmetric product, which removes about a quarter of the
+word-multiplies; the inner loops are monomorphized over the modulus limb count
+and unrolled; and every routine reads and writes only the significant limbs of
+buffers the caller holds across iterations, so nothing is copied or cleared per
+operation. Limb width is chosen per target: 64 bits where a widening 64×64
+multiply exists, 32 bits on wasm where it does not and every 128-bit product
+would otherwise be emulated. Both widths are generated from one macro and checked
+against each other, so the host test suite covers the wasm arithmetic, and both
+are checked against division-based modular arithmetic at every limb count.
+
+The iteration budgets are stated in iterations rather than seconds, so this work
+reduced the wall clock of a given budget rather than deepening the search: the
+stage is 1.6× to 3.1× faster depending on width, and `BENCHMARKING.md` records
+the comparison against GMP's mpn assembly, which is what YAFU and FLINT run on.
 
 At and below the sieve's 400-bit ceiling the budget stays a small fraction of
 the SIQS run it precedes, because on a balanced input rho contributes nothing
@@ -300,7 +316,7 @@ and its cost is pure overhead. Above the ceiling that reasoning does not apply:
 the sieve refuses the composite, so rho is the entire attempt and the
 alternative to spending more is `SiqsCompositeTooLarge` on an input whose
 smallest factor was findable. The budget there is a wall-clock decision instead
-— about a minute per attempt at every supported width, tiered by width because
+— 34 to 41 s per attempt across the supported widths, tiered by width because
 per-iteration cost grows with the square of the limb count. Since Brent finds
 `p` in roughly `1.2·sqrt(p)` iterations, that reaches a smallest factor of
 about 2^53 at 512 bits, 2^51.7 at 768, and 2^50.5 at 1024; factors up to 32
@@ -616,8 +632,8 @@ on the main thread. Two things follow. The page stays interactive, so the budget
 is bounded by patience rather than by frame time; and each worker walks a disjoint
 range of polynomial constants, so the pool runs that many independent walks and
 the first collision wins — about a `sqrt(T)` speedup for `T` workers. Measured
-under Node against the scalar module, wasm runs the loop at 654k iterations/s on
-a 512-bit modulus and 183k/s at 1024, against 288k/s and 115k/s for the main
+under Node against the scalar module, wasm runs the loop at 992k iterations/s on
+a 512-bit modulus and 298k/s at 1024, against 288k/s and 115k/s for the main
 thread's `BigInt` implementation. With eight workers and a per-worker budget of
 2^25 iterations up to 512 bits, the frontend reaches a smallest factor of roughly
 2^52 there and 2^50 at 1024 — parity with the native CLI, against 2^29 for the
