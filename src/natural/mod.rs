@@ -494,6 +494,13 @@ impl<const P: usize> Natural<P> {
         Some((q, r as u64))
     }
     /// Binary (Stein) GCD: shifts and subtraction only, no division.
+    ///
+    /// Every step works over the operands' *significant* limbs rather than the full capacity, and
+    /// the significant length only shrinks, so the cost follows the values rather than `P`. Written
+    /// over whole `Natural`s this cost the same at 128 bits as at 512 — the batched gcd in
+    /// Pollard-Brent was 23 µs on an eight-limb modulus, several times a subtract-and-shift loop's
+    /// worth of work, because each of roughly a thousand iterations touched all sixteen limbs.
+    /// The tail, where both operands have shrunk into one word, finishes in machine arithmetic.
     #[must_use]
     pub fn gcd(&self, rhs: &Self) -> Self {
         if self.is_zero() {
@@ -502,21 +509,40 @@ impl<const P: usize> Natural<P> {
         if rhs.is_zero() {
             return self.clone();
         }
-        let mut a = self.clone();
-        let mut b = rhs.clone();
-        let shift = a.trailing_zeros().min(b.trailing_zeros());
-        a >>= a.trailing_zeros();
+        let mut a = self.parts;
+        let mut b = rhs.parts;
+        let mut alen = sig_len(&a);
+        let mut blen = sig_len(&b);
+
+        // Powers of two divide the result exactly once, so they come out up front and go back on
+        // at the end.
+        let common = trailing_zero_bits(&a, alen).min(trailing_zero_bits(&b, blen));
+        let odd_shift = trailing_zero_bits(&a, alen);
+        shift_right_prefix(&mut a, &mut alen, odd_shift);
+
         loop {
-            b >>= b.trailing_zeros();
-            if a > b {
+            let odd_shift = trailing_zero_bits(&b, blen);
+            shift_right_prefix(&mut b, &mut blen, odd_shift);
+            if compare_prefix(&a, alen, &b, blen) == Ordering::Greater {
                 core::mem::swap(&mut a, &mut b);
+                core::mem::swap(&mut alen, &mut blen);
             }
-            b -= &a;
-            if b.is_zero() {
+            // `a <= b` after the swap, so this cannot underflow.
+            subtract_prefix(&mut b, blen, &a, alen);
+            blen = sig_len(&b[..blen]);
+            if blen == 0 {
+                break;
+            }
+            if alen == 1 && blen == 1 {
+                a[0] = gcd_word(a[0], b[0]);
+                alen = 1;
                 break;
             }
         }
-        a << shift
+
+        let mut result = Self::ZERO;
+        result.parts[..alen].copy_from_slice(&a[..alen]);
+        result << common
     }
     pub(crate) fn sqrt_rem(&self) -> (Self, Self) {
         if self.is_zero() {
@@ -637,6 +663,89 @@ impl<const P: usize> Natural<P> {
 mod montgomery;
 #[cfg(any(unix, windows, target_arch = "wasm32", test))]
 pub(crate) use montgomery::{LIMB_CAP, Limb, MontgomeryContext};
+
+/// Trailing zero bits of the value held in `limbs[..len]`, which must be nonzero.
+#[inline]
+fn trailing_zero_bits(limbs: &[u64], len: usize) -> usize {
+    for (index, &word) in limbs[..len].iter().enumerate() {
+        if word != 0 {
+            return index * 64 + word.trailing_zeros() as usize;
+        }
+    }
+    0
+}
+
+/// Shifts `limbs[..len]` right by `bits`, updating the significant length.
+#[inline]
+fn shift_right_prefix(limbs: &mut [u64], len: &mut usize, bits: usize) {
+    if bits == 0 {
+        return;
+    }
+    let words = bits / 64;
+    if words > 0 {
+        let remaining = len.saturating_sub(words);
+        limbs.copy_within(words..*len, 0);
+        limbs[remaining..*len].fill(0);
+        *len = remaining;
+    }
+    let rest = bits % 64;
+    if rest > 0 {
+        let mut carry = 0u64;
+        for index in (0..*len).rev() {
+            let word = limbs[index];
+            limbs[index] = (word >> rest) | carry;
+            carry = word << (64 - rest);
+        }
+    }
+    while *len > 0 && limbs[*len - 1] == 0 {
+        *len -= 1;
+    }
+}
+
+/// Compares the values held in two limb prefixes.
+#[inline]
+fn compare_prefix(a: &[u64], alen: usize, b: &[u64], blen: usize) -> Ordering {
+    if alen != blen {
+        return alen.cmp(&blen);
+    }
+    for index in (0..alen).rev() {
+        if a[index] != b[index] {
+            return a[index].cmp(&b[index]);
+        }
+    }
+    Ordering::Equal
+}
+
+/// `b[..blen] -= a[..alen]`, which the caller must know does not underflow.
+#[inline]
+fn subtract_prefix(b: &mut [u64], blen: usize, a: &[u64], alen: usize) {
+    let mut borrow = false;
+    for index in 0..alen {
+        let (difference, first) = b[index].overflowing_sub(a[index]);
+        let (difference, second) = difference.overflowing_sub(u64::from(borrow));
+        b[index] = difference;
+        borrow = first || second;
+    }
+    let mut index = alen;
+    while borrow && index < blen {
+        let (difference, underflow) = b[index].overflowing_sub(1);
+        b[index] = difference;
+        borrow = underflow;
+        index += 1;
+    }
+    debug_assert!(!borrow, "gcd subtraction underflowed");
+}
+
+/// Euclid on machine words, for the tail of [`Natural::gcd`] once both operands fit in one.
+#[inline]
+fn gcd_word(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
+}
 
 /// Number of significant (nonzero through) limbs in a little-endian slice.
 #[inline]
@@ -1540,6 +1649,40 @@ mod difftests {
             let a = rng.natural(la);
             let b = rng.natural(lb);
             assert_eq!(to_big(&a.gcd(&b)), big_gcd(to_big(&a), to_big(&b)));
+        }
+    }
+
+    /// Pollard-Brent's batched gcd, at the widths the rho stage runs on.
+    ///
+    /// One of these lands per batch of iterations, so its cost sets how large that batch has to be
+    /// before the gcd stops mattering; see `BENCHMARKING.md`.
+    #[test]
+    #[ignore = "manual gcd measurement"]
+    fn profile_gcd() {
+        for words in [2usize, 4, 8, 12, 16] {
+            let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+            let modulus = {
+                let mut n = rng.natural(words);
+                n.as_mut_parts()[0] |= 1;
+                n.as_mut_parts()[words - 1] |= 1 << 63;
+                n
+            };
+            let values: Vec<Natural<P>> = (0..256).map(|_| rng.natural(words)).collect();
+            let started = std::time::Instant::now();
+            let mut sink = Natural::<P>::ZERO;
+            for _ in 0..16 {
+                for value in &values {
+                    sink = std::hint::black_box(value.gcd(&modulus));
+                }
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            std::hint::black_box(&sink);
+            eprintln!(
+                "BENCH gcd words={words:2} bits={:5} calls={} elapsed={elapsed:.3}s each={:.0}ns",
+                words * 64,
+                values.len() * 16,
+                elapsed / (values.len() * 16) as f64 * 1e9
+            );
         }
     }
 

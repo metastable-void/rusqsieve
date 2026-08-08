@@ -270,10 +270,10 @@ run. Iteration rates, release build, single-threaded, x86-64 Xeon 8259CL — rep
 
 | composite bits | iterations/s | budget | wall | smallest factor reached (`1.2·√p`) |
 |---:|---:|---:|---:|---:|
-| 400 | 5,102,618 | 6,291,456 (sieve-derived) | 1.2 s | 2^44.6 |
-| 512 | 3,729,081 | 128,000,000 | 34 s | 2^53.0 |
-| 768 | 1,875,651 | 72,000,000 | 38 s | 2^51.7 |
-| 1024 | 1,179,364 | 48,000,000 | 41 s | 2^50.5 |
+| 400 | 6,881,194 | 6,291,456 (sieve-derived) | 0.9 s | 2^44.6 |
+| 512 | 4,842,288 | 128,000,000 | 26 s | 2^53.0 |
+| 768 | 2,203,329 | 72,000,000 | 33 s | 2^51.7 |
+| 1024 | 1,338,216 | 48,000,000 | 36 s | 2^50.5 |
 
 End to end through the release CLI, on inputs built as one small prime times one wide prime. The
 old-budget column is the same binary run with `RUSQSIEVE_RHO_ITERATIONS=6291456`, which is exactly
@@ -335,12 +335,12 @@ disjoint range of polynomial constants. Iteration rates measured under Node 24.1
 
 | composite bits | native | wasm (scalar) | main-thread `BigInt` |
 |---:|---:|---:|---:|
-| 512 | 3,729,081/s | 992,000/s | 288,000/s |
-| 1024 | 1,179,364/s | 298,000/s | 115,000/s |
+| 512 | 4,842,288/s | 1,075,000/s | 288,000/s |
+| 1024 | 1,338,216/s | 315,000/s | 115,000/s |
 
 Per-worker budget is 2^25 iterations up to 512 bits, 24M through 768, 16M above. `T` independent
 walks collide in about `1.2·sqrt(p)/sqrt(T)` iterations, so eight workers reach a smallest factor of
-roughly 2^52 at 512 bits and 2^50 at 1024 — parity with the native CLI — in 34 to 56 s of worker
+roughly 2^52 at 512 bits and 2^50 at 1024 — parity with the native CLI — in 31 to 53 s of worker
 time, with the main thread free throughout.
 
 End to end on a 478-bit product of ten 48-bit primes, driving the real worker protocol on Node
@@ -375,14 +375,39 @@ inherit this assembly. x86-64 Xeon 8259CL, one million iterations each:
 | 4 | 256 | 10,276,357/s | 7,811,153/s | **1.32×** |
 | 5 | 320 | 7,264,293/s | 5,513,344/s | **1.32×** |
 | 7 | 448 | 4,073,624/s | 3,551,447/s | **1.15×** |
-| 8 | 512 | 3,361,918/s | 3,407,755/s | 0.99× |
-| 12 | 768 | 1,548,487/s | 1,663,963/s | 0.93× |
-| 16 | 1024 | 948,259/s | 1,088,155/s | 0.87× |
+| 8 | 512 | 3,497,736/s | 3,407,755/s | **1.03×** |
+| 12 | 768 | 1,515,986/s | 1,663,963/s | 0.91× |
+| 16 | 1024 | 916,415/s | 1,088,155/s | 0.84× |
 
 We are ahead through seven limbs, at parity at eight, and behind by 7–13% at twelve and sixteen,
-where GMP's hand-written `mulx`/`adcx`/`adox` inner loops run two carry chains at once. A probe of
-that technique through Rust intrinsics measured 1.15–1.19× on the multiply, which would close the
-gap, but it is x86-64-only and needs `unsafe`; it is recorded here and not adopted.
+where GMP's hand-written `mulx`/`adcx`/`adox` inner loops run two carry chains at once.
+
+That technique was tried and rejected, and the sequence is worth recording because two plausible
+measurements were both wrong:
+
+1. A first probe using `_mulx_u64` and `_addcarry_u64` measured 1.15–1.19× on the multiply and
+   looked like an ADX win. `objdump` showed **184 `mulx` and zero `adcx`/`adox`** — LLVM had lowered
+   the carry intrinsics to plain `adc`, so the two-chain mechanism never ran. The gain was `mulx`
+   alone, which frees the fixed `rdx:rax` operand pair.
+2. Wiring `mulx` in properly needs care: a `#[target_feature(enable = "bmi2")]` wrapper only
+   recompiles what is *inlined into it*, and the dispatch table is far too large for the inliner to
+   take on a hint, so the first integration emitted no `mulx` at all. With an `#[inline(always)]`
+   entry point the release binary contained 776.
+
+Measured then against an otherwise identical build with selection forced off, six interleaved runs
+each, medians:
+
+| limbs | 2 | 3 | 4 | 5 | 7 | 8 | 12 | 16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| BMI2 vs portable | +2.2% | +8.1% | +8.5% | +4.1% | +5.5% | −0.8% | −1.0% | −4.0% |
+
+It helps from 192 to 448 bits and hurts from 512 to 1024 — not a consistent win even on the machine
+it was measured on, let alone a portable one, so it is not shipped. The dispatch also has to be an
+inlined branch rather than a stored function pointer: selecting through a `fn` pointer blocked
+inlining at the call site and cost 4–11%, more than the feature returned.
+
+Two-chain ADX remains the real remaining gap at twelve and sixteen limbs, and reaching it means
+inline assembly rather than intrinsics.
 
 End to end against YAFU 3.1.9 (GMP 6.3.0, GMP-ECM 7.0.5), ten fixed 512-bit composites each with a
 40-bit factor, `rho(N)` with `-rhomax 40000` against `qs-factor --threads 1`, both verified to
@@ -390,22 +415,22 @@ return the factor:
 
 | | median | note |
 |---|---:|---|
-| rusqsieve | 0.573 s | 0.006 s of that is process startup |
+| rusqsieve | 0.442 s | 0.006 s of that is process startup |
 | YAFU | 1.196 s | 0.227 s of that is process startup |
 
-That is 1.7× on the rho work itself, and rusqsieve won 9 of the 10 inputs. Repeated at 1024 bits
+That is 2.2× on the rho work itself, and rusqsieve won 9 of the 10 inputs. Repeated at 1024 bits
 with a 40-bit factor over eight inputs: 1.834 s against 3.309 s, winning 8 of 8. The walks differ
 between implementations, so single inputs are luck; the medians are the claim.
 
 Where the speed came from, measured as full-stage `profile_wide_rho_throughput` rates before and
 after `src/natural/montgomery.rs` was rewritten:
 
-| bits | before | after | |
-|---:|---:|---:|---:|
-| 128 | 5,812,766/s | 17,776,441/s | 3.06× |
-| 256 | 4,306,730/s | 9,210,792/s | 2.14× |
-| 512 | 2,194,421/s | 3,729,081/s | 1.70× |
-| 1024 | 730,330/s | 1,179,364/s | 1.61× |
+| bits | before | after Montgomery | after gcd + batch | total |
+|---:|---:|---:|---:|---:|
+| 128 | 5,812,766/s | 17,776,441 | 30,272,029 | **5.21×** |
+| 256 | 4,306,730/s | 9,210,792 | 13,367,638 | **3.10×** |
+| 512 | 2,194,421/s | 3,729,081 | 4,842,288 | **2.21×** |
+| 1024 | 730,330/s | 1,179,364 | 1,338,216 | **1.83×** |
 
 Three changes account for it: the arithmetic works in place over the modulus's significant limbs
 instead of copying through a zeroed 33-word scratch buffer (which is why the small widths gain
@@ -428,6 +453,83 @@ wasm therefore uses 32-bit limbs and every other target uses 64-bit ones. The cr
 bits costs nothing the browser's deep rho cares about, since that path exists for composites the
 sieve refuses. Both limb widths are generated from one macro and checked against each other by
 `narrow_and_wide_limbs_agree`, so the host test suite covers the wasm arithmetic.
+
+## The batched gcd
+
+Pollard-Brent accumulates differences and takes one gcd per batch, so the batch size trades gcd cost
+against work done past a collision before the next gcd notices it. The gcd is also the one part of
+the loop that does not get cheaper when the Montgomery arithmetic does, so making the multiply 1.7×
+to 3× faster raised the gcd's share of the stage and made this worth retuning.
+
+`Natural::gcd` was a binary GCD written over whole `Natural`s, so every one of roughly a thousand
+iterations touched all sixteen limbs whatever the operands' width. It now works over the significant
+prefix, which only shrinks, and finishes in machine arithmetic once both operands fit in one word.
+Reproduce with `cargo test --profile release-test --lib -- --ignored profile_gcd --nocapture`:
+
+| bits | 128 | 256 | 512 | 768 | 1024 |
+|---|---:|---:|---:|---:|---:|
+| whole-`Natural` | 6,473 ns | 12,327 | 22,976 | 33,918 | 45,994 |
+| prefix-aware | 1,398 ns | 3,552 | 8,440 | 14,719 | 22,870 |
+| | **4.6×** | **3.5×** | **2.7×** | **2.3×** | **2.0×** |
+
+The old cost is visible in the shape as well as the size: 128-bit gcds were only 7× cheaper than
+1024-bit ones, where the algorithm says 64×, because fixed-width work dominated at the small end.
+
+Full-stage rates at each batch size, before and after that fix:
+
+| bits | 128 (old gcd) | 1024 (old gcd) | 128 (new gcd) | 512 (new gcd) |
+|---|---:|---:|---:|---:|
+| 128 | 20,558,118/s | 29,861,389 | 28,163,988 | 29,394,392 |
+| 512 | 3,766,866/s | 4,780,142 | 4,502,406 | 4,895,467 |
+| 1024 | 1,150,572/s | 1,331,569 | 1,243,044 | 1,331,044 |
+
+The gcd was 16–45% of the stage at batch 128; the rewrite recovers most of that, leaving 5–9% for
+the batch, which is now 512. End to end on the ten 512-bit composites with a 40-bit factor: 0.481 s
+median at batch 128 against 0.443 s at 512, no failures either way. Batch sizes to 2048 were also
+run against 28 short-cycle inputs (16- to 28-bit factors) with no failures, which is structural
+rather than luck: `batch` is `min(r - k, B)`, so `B` only binds once `r` exceeds it and short
+searches never reach that.
+
+## Measurement failures worth not repeating
+
+Every entry here produced a confident, wrong number first. They are recorded because the failure
+modes are the reusable part.
+
+**A benchmark that optimized itself away.** A microbenchmark of the Montgomery multiply reported
+rates of 22–88 M/s *per million iterations* — physically impossible. `black_box` on the operands
+fixed it. Any rate that implies less than a cycle of work is a dead loop, not a fast one.
+
+**A layout probe that could not probe.** Testing whether a timing difference was code alignment, the
+"perturbation" was a trailing comment. Comments do not reach codegen, so the experiment could only
+ever return "no change". A probe has to emit instructions.
+
+**A sweep that was not interleaved.** The first alignment comparison ran all of A then all of B and
+reported the 224-bit case 14% *slower* under alignment. Interleaved with alternating order over five
+runs, the same comparison was 3.1% faster. Drift on a shared host is larger than the effects being
+measured; alternate the order or measure nothing.
+
+**An edit that never applied.** A `sed` retuning the wasm specialization table matched nothing,
+because `cargo fmt` had wrapped the macro invocation across lines. The build was byte-identical, and
+the "no size change, no speed change" result was read as a finding rather than as a no-op. Confirm
+the artifact changed before believing that it did not matter.
+
+**A probe that measured the wrong thing.** 32-bit limbs looked 1.67× faster than 64-bit ones in
+wasm. Both arms of that probe were run-time-width loops, while the shipped code specializes the
+limb count; measured properly on the real artifact the win was 20–41% and negative below 400 bits.
+A probe has to be built the way the thing it stands in for is built.
+
+**An intrinsic that did not do what its name said.** `_addcarry_u64` alongside `_mulx_u64` measured
+1.15–1.19× and was reported as an ADX result. Disassembly: 184 `mulx`, zero `adcx`/`adox`. The
+mechanism named in the conclusion was absent from the binary.
+
+**A feature flag enabled on nothing.** Wiring that same path in behind
+`#[target_feature(enable = "bmi2")]` produced a binary with no `mulx` at all: the wrapper only
+recompiles what is inlined into it, and the dispatch table was far past the inliner's threshold. The
+fix was an `#[inline(always)]` entry point; the check that caught it was `objdump | grep -c mulx`.
+
+**A dispatch that cost more than it dispatched.** Selecting the BMI2 routines through a stored `fn`
+pointer blocked inlining at the call site and cost 4–11%, more than the feature returned, so the
+"BMI2 build" was slower than the portable one for reasons unrelated to BMI2.
 
 ## Basic-block alignment in native builds
 

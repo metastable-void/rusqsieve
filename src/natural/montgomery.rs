@@ -297,6 +297,17 @@ macro_rules! limb_arithmetic {
             /// the wasm artifact, a browser shipping gate, for arithmetic that path never performs.
             #[inline]
             pub(super) fn dispatch_mul(k: usize, a: &[$limb], b: &[$limb], n: &[$limb], n0inv: $limb, out: &mut [$limb]) {
+                dispatch_mul_inline(k, a, b, n, n0inv, out);
+            }
+
+            /// The same table, forced inline.
+            ///
+            /// A `#[target_feature]` wrapper only recompiles what is inlined into it, and the table
+            /// above is far too large for the inliner to take on a hint. Without this the x86-64
+            /// BMI2 wrapper compiled to a plain call into the baseline copy and emitted no `mulx`
+            /// at all — the feature was enabled on a function containing nothing but a call.
+            #[inline(always)]
+            pub(super) fn dispatch_mul_inline(k: usize, a: &[$limb], b: &[$limb], n: &[$limb], n0inv: $limb, out: &mut [$limb]) {
                 match k {
                     $($width => cios::<$width>(a, b, n, n0inv, out),)*
                     _ => cios_dynamic(k, a, b, n, n0inv, out),
@@ -306,6 +317,12 @@ macro_rules! limb_arithmetic {
             /// The squaring counterpart of [`dispatch_mul`].
             #[inline]
             pub(super) fn dispatch_square(k: usize, a: &[$limb], n: &[$limb], n0inv: $limb, out: &mut [$limb]) {
+                dispatch_square_inline(k, a, n, n0inv, out);
+            }
+
+            /// The squaring counterpart of [`dispatch_mul_inline`].
+            #[inline(always)]
+            pub(super) fn dispatch_square_inline(k: usize, a: &[$limb], n: &[$limb], n0inv: $limb, out: &mut [$limb]) {
                 match k {
                     $($width => square::<$width>(a, n, n0inv, out),)*
                     _ => square_dynamic(k, a, n, n0inv, out),

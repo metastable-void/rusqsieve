@@ -122,7 +122,7 @@ length rather than the caller's. Arithmetic operators on `Natural` wrap at
 capacity, while `checked_*` methods report overflow.
 
 Because that composite has nowhere else to go, Pollard–Brent runs a much deeper
-budget above the ceiling than below it — 34 to 41 s of iterations, which
+budget above the ceiling than below it — 26 to 36 s of iterations, which
 reaches a smallest factor near 2^53 at 512 bits and 2^50 at 1024, and covers
 factors up to 32 bits with orders of magnitude to spare. A wide input carrying a
 findable factor is therefore split rather than refused. Set

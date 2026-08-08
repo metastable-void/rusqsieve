@@ -2,6 +2,35 @@
 
 ## 0.4.3 — Unreleased
 
+- Made `Natural::gcd` width-aware. Binary GCD written over whole `Natural`s meant
+  each of roughly a thousand iterations touched all sixteen limbs whatever the
+  operands were worth, which showed in the shape as well as the size: a 128-bit
+  gcd was only 7× cheaper than a 1024-bit one where the algorithm says 64×. It
+  now works over the significant prefix, which only shrinks, and finishes in
+  machine arithmetic once both operands fit in one word: 128-bit 6,473 → 1,398 ns
+  (4.6×), 256-bit 12,327 → 3,552, 512-bit 22,976 → 8,440, 1024-bit 45,994 →
+  22,870 (2.0×). `diff_gcd` checks 2,000 random pairs against `num-bigint`.
+- Retuned Pollard-Brent's gcd batch from 128 to 512 iterations. The gcd is the
+  one part of that loop that does not get cheaper when the modular arithmetic
+  does, so making the multiply faster raised its share: it was 16% to 45% of the
+  stage at batch 128 before the gcd fix and 5% to 9% after. Above 512 the curve
+  flattens. Neither cost of a larger batch — iterations run past a collision, and
+  a wider window for `q` to collect every factor of `n` and force backtracking —
+  reaches short searches, because `batch` is `min(r - k, B)` and only binds once
+  the walk is deep; 28 short-cycle inputs at batch sizes to 2048 split with no
+  failures. End to end on ten 512-bit composites with a 40-bit factor: 0.481 s
+  median at 128 against 0.443 s at 512.
+- Together with the Montgomery work, the rho stage is 5.21× faster at 128 bits,
+  3.10× at 256, 2.21× at 512 and 1.83× at 1024 than at the start of this release.
+  Against YAFU 3.1.9 on ten 512-bit composites with a 40-bit factor, medians are
+  0.442 s against 1.196 s — 2.2× on the rho work after subtracting each binary's
+  startup — winning 9 of the 10.
+- Recorded the measurement failures behind these numbers in `BENCHMARKING.md`: a
+  benchmark that optimized itself away, a layout probe made of a comment, a
+  non-interleaved sweep that inverted a result, an edit that never applied, a
+  probe built differently from the thing it stood in for, an intrinsic whose
+  mechanism was absent from the disassembly, a `#[target_feature]` wrapper
+  enabled on nothing, and a dispatch that cost more than it dispatched.
 - Rewrote the Montgomery arithmetic the rho stage runs on, in
   `src/natural/montgomery.rs`. The old implementation multiplied into a
   double-width product, copied it into a 33-word scratch array that was zeroed on

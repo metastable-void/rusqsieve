@@ -486,8 +486,8 @@ const DEEP_RHO_WORKERS = Math.max(1, Math.min(8, nWorkers));
 const DEEP_RHO_CONSTANTS_PER_WORKER = 4;
 
 // Per-worker iteration budget for a deep search, by composite width. Measured under Node against
-// the scalar wasm module on prime moduli, which is the honest way to time a full budget: 992k
-// iterations/s at 512 bits and 298k/s at 1024. These spend 34 to 56 s per attempt across the range,
+// the scalar wasm module on prime moduli, which is the honest way to time a full budget: 1.08M
+// iterations/s at 512 bits and 315k/s at 1024. These spend 31 to 53 s per attempt across the range,
 // and with eight workers racing they reach a smallest factor of roughly 2^52 at 512 bits and 2^50
 // at 1024 — parity with what the native CLI reaches, and against 2^29 for the 2^15 opening peel,
 // which cannot even guarantee a 32-bit factor.

@@ -354,18 +354,18 @@ const DEEP_RHO_MIN_BITS: usize = 257;
 ///
 /// Per-iteration cost grows with the square of the limb count, so a flat iteration count would cost
 /// three times as much wall clock at the top of the supported range as at the bottom. Measured
-/// single-thread rates (release, x86-64 Xeon 8259CL, `profile_wide_rho_throughput`): 3.73 M/s at 512
-/// bits, 1.88 M/s at 768, 1.18 M/s at 1024. These tiers therefore spend a comparable amount of time
-/// at every width instead — 34 s, 38 s and 41 s.
+/// single-thread rates (release, x86-64 Xeon 8259CL, `profile_wide_rho_throughput`): 4.84 M/s at 512
+/// bits, 2.20 M/s at 768, 1.34 M/s at 1024. These tiers therefore spend a comparable amount of time
+/// at every width instead — 26 s, 33 s and 36 s.
 ///
 /// Brent finds `p` in about `1.2·sqrt(p)` iterations, so that buys a smallest factor of roughly 2^53
 /// at 512 bits, 2^51.7 at 768 and 2^50.5 at 1024. The sieve-derived budget this replaces was 6.29 M
 /// iterations at every width above the ceiling — reach 2^44.6 — which refused a 512-bit input
 /// carrying a 48-bit factor after 2.7 s of work that was nearly deep enough.
 ///
-/// The budgets are stated in iterations, not seconds, so the Montgomery rewrite that made the stage
-/// 1.7× faster bought back wall clock rather than reach: the same tiers cost about 40% less than
-/// when they were chosen. Reach is where the default stops, because each additional factor bit
+/// The budgets are stated in iterations, not seconds, so the arithmetic work that made the stage 1.8×
+/// to 5.2× faster bought back wall clock rather than reach: the same tiers cost half to two-thirds of
+/// what they did when they were chosen. Reach is where the default stops, because each additional factor bit
 /// doubles the cost: 2^56 is minutes and 2^64 is tens of minutes across this width range. That is a
 /// real search, not a default one, and callers who want it ask with `RUSQSIEVE_RHO_ITERATIONS`.
 const fn wide_rho_budget(bits: usize) -> u64 {
@@ -2073,7 +2073,15 @@ pub(crate) fn pollard_brent_natural(
                 }
                 ys.copy_from_slice(&y);
                 montgomery.load(&montgomery.one(), &mut q);
-                let batch = (r - k).min(128);
+                // Iterations per gcd. The gcd is the one part of this loop that does not get
+                // cheaper with the modulus, so the right batch depends on what a gcd costs against
+                // what an iteration costs: at 128 it was 16-45% of the stage before `Natural::gcd`
+                // was made width-aware, and 5-9% after. Above 512 the curve is flat and the two
+                // costs a larger batch carries — the iterations run past a collision before the
+                // next gcd sees it, and the wider window for `q` to collect every factor of `n` and
+                // force backtracking — stop being paid for. Neither risk reaches short searches at
+                // all: `batch` is bounded by `r`, so it only binds once the walk is already deep.
+                let batch = (r - k).min(512);
                 for _ in 0..batch {
                     montgomery.sqr_add_assign(&mut y, &c);
                     montgomery.sub_raw(&x, &y, &mut difference);

@@ -4,7 +4,7 @@
 // and hopeless for a real search: a composite the sieve cannot help with — one above
 // `qs_max_siqs_bits`, or a cofactor an earlier split already proved unbalanced — needs tens of
 // millions of iterations. Measured under Node, BigInt runs that loop at 288k iterations/s on a
-// 512-bit modulus against 992k/s for the same algorithm in wasm over Montgomery-encoded limbs, and
+// 512-bit modulus against 1.08M/s for the same algorithm in wasm over Montgomery-encoded limbs, and
 // on the main thread every one of those iterations is a frame not painted. So the search runs here,
 // in wasm, off the thread that owns the page.
 //

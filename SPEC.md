@@ -316,7 +316,7 @@ and its cost is pure overhead. Above the ceiling that reasoning does not apply:
 the sieve refuses the composite, so rho is the entire attempt and the
 alternative to spending more is `SiqsCompositeTooLarge` on an input whose
 smallest factor was findable. The budget there is a wall-clock decision instead
-— 34 to 41 s per attempt across the supported widths, tiered by width because
+— 26 to 36 s per attempt across the supported widths, tiered by width because
 per-iteration cost grows with the square of the limb count. Since Brent finds
 `p` in roughly `1.2·sqrt(p)` iterations, that reaches a smallest factor of
 about 2^53 at 512 bits, 2^51.7 at 768, and 2^50.5 at 1024; factors up to 32
@@ -632,8 +632,8 @@ on the main thread. Two things follow. The page stays interactive, so the budget
 is bounded by patience rather than by frame time; and each worker walks a disjoint
 range of polynomial constants, so the pool runs that many independent walks and
 the first collision wins — about a `sqrt(T)` speedup for `T` workers. Measured
-under Node against the scalar module, wasm runs the loop at 992k iterations/s on
-a 512-bit modulus and 298k/s at 1024, against 288k/s and 115k/s for the main
+under Node against the scalar module, wasm runs the loop at 1.08M iterations/s
+on a 512-bit modulus and 315k/s at 1024, against 288k/s and 115k/s for the main
 thread's `BigInt` implementation. With eight workers and a per-worker budget of
 2^25 iterations up to 512 bits, the frontend reaches a smallest factor of roughly
 2^52 there and 2^50 at 1024 — parity with the native CLI, against 2^29 for the
