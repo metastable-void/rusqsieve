@@ -39,7 +39,7 @@ typedef int (*rusqsieve_progress_callback)(
     void *context
 );
 
-/* Return the ABI version implemented by this library (currently 2). */
+/* Return the ABI version implemented by this library (currently 3). */
 uint32_t rusqsieve_abi_version(void);
 
 /* Return a process-lifetime static description for a status code. */
@@ -102,6 +102,37 @@ enum rusqsieve_status rusqsieve_factor(
 );
 
 /*
+ * Optional behavior for rusqsieve_factor_ex().
+ *
+ * RUSQSIEVE_FLAG_ENABLE_ECM runs the elliptic curve method on composites the
+ * quadratic sieve would otherwise handle by itself. ECM finds a medium-size
+ * factor -- roughly 20 to 30 digits -- in time governed by the size of that
+ * factor rather than of the input, which is the one shape neither Pollard-Brent
+ * nor the sieve handles well. It is off by default because a curve cannot
+ * succeed on a balanced semiprime and is pure overhead ahead of the sieve.
+ *
+ * The flag governs a narrower range than it looks like. Curves already run
+ * without it on a composite wider than the sieve accepts, where the alternative
+ * is refusing the number, and on one already known to be unbalanced because
+ * trial division peeled a factor or Pollard-Brent split an ancestor. Neither
+ * can happen for a balanced semiprime, which is what this flag is about.
+ */
+#define RUSQSIEVE_FLAG_ENABLE_ECM 1u
+
+/*
+ * Factor with optional behavior selected by a flag word.
+ *
+ * Unknown flag bits are ignored, so a caller built against a later flag set
+ * still runs here. flags == 0 behaves exactly like rusqsieve_factor().
+ */
+enum rusqsieve_status rusqsieve_factor_ex(
+    const char *n,
+    size_t threads,
+    uint32_t flags,
+    rusqsieve_factors *factors
+);
+
+/*
  * Factor with progress and cancellation. callback may be NULL. The callback
  * runs on the calling thread; context is passed through unchanged.
  *
@@ -116,6 +147,21 @@ enum rusqsieve_status rusqsieve_factor(
 enum rusqsieve_status rusqsieve_factor_with_progress(
     const char *n,
     size_t threads,
+    rusqsieve_factors *factors,
+    rusqsieve_progress_callback callback,
+    void *context
+);
+
+/*
+ * Factor with both a flag word and progress reporting. The two are orthogonal,
+ * so a caller never has to choose between selecting optional behavior and being
+ * able to cancel. rusqsieve_factor_with_progress() is this with flags == 0, and
+ * rusqsieve_factor_ex() is this with a NULL callback.
+ */
+enum rusqsieve_status rusqsieve_factor_ex_with_progress(
+    const char *n,
+    size_t threads,
+    uint32_t flags,
     rusqsieve_factors *factors,
     rusqsieve_progress_callback callback,
     void *context

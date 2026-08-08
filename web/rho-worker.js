@@ -31,7 +31,7 @@ self.onmessage = async ({ data }) => {
       if (ex) throw new Error("rho worker is already initialized");
       ex = await instantiate(data.module);
       const abi = ex.qs_abi_version();
-      if (abi !== 4) throw new Error(`unsupported rusqsieve wasm ABI ${abi}`);
+      if (abi !== 5) throw new Error(`unsupported rusqsieve wasm ABI ${abi}`);
       if (typeof ex.qs_rho !== "function") throw new Error("wasm module exports no qs_rho");
       self.postMessage({ type: "ready", gen, abi });
       return;

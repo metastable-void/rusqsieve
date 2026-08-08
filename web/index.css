@@ -289,3 +289,6 @@ footer {
   flex: 1;
   min-width: 220px;
 }
+.exp {
+  font-size: 0;
+}

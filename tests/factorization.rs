@@ -1,7 +1,7 @@
 #![cfg(any(unix, windows))]
 use rusqsieve::{
     FactorConfig, FactorError, Natural, Parallelism, ProgressAction, ProgressPhase, factor,
-    factor_with_progress,
+    factor_with, factor_with_progress,
 };
 use std::str::FromStr;
 
@@ -362,6 +362,53 @@ fn raised_budgets_reach_56_and_64_bit_factors_above_the_ceiling() {
             1
         );
     }
+}
+
+/// Above the sieve's ceiling the elliptic curve method runs whether or not the caller asked for it,
+/// because there is nothing else left: rho gives up around a 2^53 factor and the sieve refuses the
+/// composite outright, so the alternative to curves is reporting "too large" about a number whose
+/// factor is findable.
+///
+/// This input is a 20-digit prime times a 400-bit prime. Before ECM it returned
+/// `SiqsCompositeTooLarge`; it now factors in about half a minute on this host, most of which is
+/// the deep rho that has to fail first.
+#[test]
+#[ignore = "a deep rho and then curves: cargo test --profile release-test"]
+fn wide_composites_reach_ecm_without_opting_in() {
+    let input = Natural::<16>::from_decimal(
+        "117170400339607305866545198586319493644267173899003341029734292653320712518297\
+         824803415376921416783376178913850836305287551459863775852901029",
+    )
+    .unwrap();
+    assert_eq!(input.bit_len(), 466);
+    // The default configuration: ECM is *not* enabled here, and the run still uses it.
+    let factors = factor(input.clone()).unwrap();
+    assert!(factors.verify_product(&input));
+    assert_eq!(factors.total_len(), 2);
+    assert_eq!(
+        factors
+            .multiplicity(&Natural::from_decimal("56580304262996131231").unwrap())
+            .unwrap()
+            .get(),
+        1
+    );
+}
+
+/// Inside the sieve's range the switch is real in both directions: off by default, and honoured
+/// when set. Nothing here asserts a speedup — only that the knob exists, is off, and changes
+/// behavior rather than being decorative.
+#[test]
+fn ecm_is_off_by_default_and_configurable() {
+    assert!(!FactorConfig::default().ecm());
+    assert!(FactorConfig::default().with_ecm(true).ecm());
+    assert!(!FactorConfig::default().with_ecm(true).with_ecm(false).ecm());
+
+    // A composite the sieve handles either way, so the only thing under test is that enabling
+    // curves does not change the answer.
+    let input = Natural::<16>::from_decimal("1000036000099").unwrap();
+    let with_curves = factor_with(input.clone(), FactorConfig::default().with_ecm(true)).unwrap();
+    assert!(with_curves.verify_product(&input));
+    assert_eq!(with_curves.total_len(), 2);
 }
 
 /// The other half of the contract: a composite that genuinely needs the sieve and is too wide for

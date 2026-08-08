@@ -297,7 +297,7 @@ pub(crate) fn validate_worker_packet(bytes: &[u8]) -> bool {
 /// Above [`MAX_SIQS_BITS`] none of that reasoning holds, and [`wide_rho_budget`] takes over.
 ///
 /// Neither does it hold for a cofactor that reached this point *by splitting under rho*, which is
-/// what `after_split` marks. The whole argument for a sieve-fraction budget is that the node is a
+/// what `unbalanced` marks. The whole argument for a sieve-fraction budget is that the node is a
 /// balanced semiprime the sieve will finish cheaply; a node whose parent just split under rho is
 /// provably not that — it has at least three prime factors and at least one of them was small
 /// enough for rho to find. Such a node gets the deep budget from [`DEEP_RHO_MIN_BITS`] upward, which
@@ -310,7 +310,7 @@ pub(crate) fn validate_worker_packet(bytes: &[u8]) -> bool {
 /// finds in seconds. Deepening the cofactor's budget instead peels them.
 ///
 /// `tuning.rho_iterations` overrides every arm outright.
-fn rho_budget(bits: usize, tuning: &FactorTuning, after_split: bool) -> u64 {
+fn rho_budget(bits: usize, tuning: &FactorTuning, unbalanced: bool) -> u64 {
     if let Some(iterations) = tuning.rho_iterations {
         return iterations.max(1);
     }
@@ -320,7 +320,7 @@ fn rho_budget(bits: usize, tuning: &FactorTuning, after_split: bool) -> u64 {
     let p = crate::qs::parameters::engine_params(bits);
     let sieve_fraction =
         (p.factor_base_bound as u64 * p.sieve_half_width as u64 / 500_000).max(1_024);
-    if after_split && bits >= DEEP_RHO_MIN_BITS {
+    if unbalanced && bits >= DEEP_RHO_MIN_BITS {
         return sieve_fraction.max(wide_rho_budget(bits));
     }
     sieve_fraction
@@ -389,6 +389,7 @@ pub(crate) mod stage_counts {
     use std::cell::Cell;
     thread_local! {
         pub(crate) static RHO: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static ECM: Cell<usize> = const { Cell::new(0) };
         pub(crate) static SIQS: Cell<usize> = const { Cell::new(0) };
     }
     pub(crate) fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
@@ -396,10 +397,16 @@ pub(crate) mod stage_counts {
     }
     pub(crate) fn reset() {
         RHO.with(|c| c.set(0));
+        ECM.with(|c| c.set(0));
         SIQS.with(|c| c.set(0));
     }
     pub(crate) fn rho() -> usize {
         RHO.with(Cell::get)
+    }
+    /// Times the ECM stage was entered, not times it split something: this counter exists to pin
+    /// the policy that decides whether curves run at all, where the other two count outcomes.
+    pub(crate) fn ecm() -> usize {
+        ECM.with(Cell::get)
     }
     pub(crate) fn siqs() -> usize {
         SIQS.with(Cell::get)
@@ -741,6 +748,7 @@ pub fn factor(
     mut n: Natural,
     threads: usize,
     tuning: &FactorTuning,
+    ecm: bool,
     witness_seed: Option<[u8; 32]>,
     mut progress: impl FnMut(EngineProgress) -> bool,
 ) -> Result<Vec<Natural>, EngineError> {
@@ -768,12 +776,17 @@ pub fn factor(
     if n.is_one() {
         return Ok(factors);
     }
+    // Trial division finding anything is already proof that the input is not a balanced semiprime,
+    // which is the premise behind both the cheap rho budget and leaving curves switched off. The
+    // cofactor inherits that knowledge rather than starting from the balanced assumption.
+    let unbalanced = !factors.is_empty();
     factor_node(
         n,
         threads.max(1),
         &primality,
         tuning,
-        false,
+        ecm,
+        unbalanced,
         &mut progress,
         &mut factors,
     )?;
@@ -781,7 +794,7 @@ pub fn factor(
     Ok(factors)
 }
 
-/// Factor one node of the recursion. `after_split` records that this value is a cofactor of a
+/// Factor one node of the recursion. `unbalanced` records that this value is a cofactor of a
 /// composite rho already split — the evidence that sizes its own rho budget; see [`rho_budget`].
 #[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
@@ -790,7 +803,8 @@ fn factor_node(
     threads: usize,
     pc: &PrimalityConfig,
     tuning: &FactorTuning,
-    after_split: bool,
+    ecm: bool,
+    unbalanced: bool,
     progress: &mut impl FnMut(EngineProgress) -> bool,
     out: &mut Vec<Natural>,
 ) -> Result<(), EngineError> {
@@ -832,7 +846,9 @@ fn factor_node(
     }
     if let Some((root, k)) = n.perfect_power() {
         let mut fs = Vec::new();
-        factor_node(root, threads, pc, tuning, after_split, progress, &mut fs)?;
+        factor_node(
+            root, threads, pc, tuning, ecm, unbalanced, progress, &mut fs,
+        )?;
         for _ in 0..k {
             out.extend(fs.iter().cloned())
         }
@@ -841,7 +857,7 @@ fn factor_node(
     let mut split_by_rho = false;
     let d = match pollard_brent_natural(
         &n,
-        rho_budget(n.bit_len(), tuning, after_split),
+        rho_budget(n.bit_len(), tuning, unbalanced),
         NATIVE_RHO_CONSTANTS,
         || {
             progress(EngineProgress {
@@ -866,7 +882,53 @@ fn factor_node(
             }
             factor
         }
-        None => find_factor(n.clone(), threads, tuning, progress)?,
+        None => {
+            // ECM goes between rho and the sieve because that is exactly the gap it fills: rho has
+            // just failed, which bounds the smallest factor below by roughly what its budget
+            // reaches, and the sieve either charges by the size of `n` or refuses it outright. A
+            // curve costs by the size of the factor instead. It runs only when asked — on the
+            // balanced semiprimes this engine is built for, every curve is wasted work.
+            //
+            // Two conditions make curves worth running without being asked, and both are the same
+            // argument: nothing is being taken away from a balanced semiprime, because neither can
+            // hold for one. Above the sieve's ceiling there is no sieve to fall through to, so the
+            // alternative to a curve is `SiqsInputTooLarge` on a composite whose factor ECM would
+            // have found. And a value already known to be unbalanced — trial division peeled a
+            // factor, or rho split an ancestor — has forfeited the premise the default rests on:
+            // it has a small factor, so it may well have a medium one, which is exactly what ECM
+            // is for and what the sieve would grind through by the size of `n` instead.
+            //
+            // The caller's opt-in therefore governs only what is left: composites inside the
+            // sieve's range with no evidence either way, which is where a balanced semiprime lives.
+            let mut split = None;
+            if ecm || unbalanced || n.bit_len() > MAX_SIQS_BITS {
+                #[cfg(test)]
+                stage_counts::bump(&stage_counts::ECM);
+                let params = crate::ecm::EcmParams::for_composite(n.bit_len());
+                if tuning.profile {
+                    eprintln!(
+                        "PROFILE ecm input_bits={} b1={} b2={} curves={}",
+                        n.bit_len(),
+                        params.b1,
+                        params.b2,
+                        params.curves
+                    );
+                }
+                split = crate::ecm::factor(&n, params, 0x9e37_79b9, || {
+                    progress(EngineProgress {
+                        phase: EnginePhase::Preprocessing,
+                        polynomials: 0,
+                        relations: 0,
+                        target: 0,
+                        workers: threads,
+                    })
+                })?;
+            }
+            match split {
+                Some(factor) => factor,
+                None => find_factor(n.clone(), threads, tuning, progress)?,
+            }
+        }
     };
     if d.is_one() || d == n {
         return Err(EngineError::NoFactor);
@@ -874,10 +936,28 @@ fn factor_node(
     // A split under rho is what proves this composite unbalanced, so it is what the children
     // inherit. A split under SIQS proves nothing about factor sizes and only passes along whatever
     // this node already knew.
-    let children_after_split = after_split || split_by_rho;
+    let children_unbalanced = unbalanced || split_by_rho;
     let q = n.div_rem(&d).unwrap().0;
-    factor_node(d, threads, pc, tuning, children_after_split, progress, out)?;
-    factor_node(q, threads, pc, tuning, children_after_split, progress, out)
+    factor_node(
+        d,
+        threads,
+        pc,
+        tuning,
+        ecm,
+        children_unbalanced,
+        progress,
+        out,
+    )?;
+    factor_node(
+        q,
+        threads,
+        pc,
+        tuning,
+        ecm,
+        children_unbalanced,
+        progress,
+        out,
+    )
 }
 
 #[cfg(any(unix, windows))]
@@ -2867,7 +2947,10 @@ mod tests {
         let p = Natural::from_u64(18_446_744_073_709_551_557);
         let q = Natural::from_u64(18_446_744_073_709_551_533);
         let n = p.checked_mul(&q).unwrap();
-        let factors = factor(n.clone(), 2, &FactorTuning::default(), None, |_| true).unwrap();
+        let factors = factor(n.clone(), 2, &FactorTuning::default(), false, None, |_| {
+            true
+        })
+        .unwrap();
         assert_eq!(factors, [q, p]);
         assert_eq!(
             factors
@@ -2953,7 +3036,10 @@ mod tests {
         for case in cases {
             let n = Natural::from_str(case).unwrap();
             stage_counts::reset();
-            let factors = factor(n.clone(), 2, &FactorTuning::default(), None, |_| true).unwrap();
+            let factors = factor(n.clone(), 2, &FactorTuning::default(), false, None, |_| {
+                true
+            })
+            .unwrap();
             assert_eq!(
                 factors
                     .iter()
@@ -2986,8 +3072,66 @@ mod tests {
         let q = Natural::from_u64(18_446_744_073_709_551_533);
         let n = p.checked_mul(&q).unwrap();
         stage_counts::reset();
-        factor(n, 2, &FactorTuning::default(), None, |_| true).unwrap();
+        factor(n, 2, &FactorTuning::default(), false, None, |_| true).unwrap();
         assert!(stage_counts::siqs() > 0, "128-bit input skipped SIQS");
+        assert_eq!(
+            stage_counts::ecm(),
+            0,
+            "a balanced semiprime paid for curves it cannot benefit from"
+        );
+    }
+
+    /// Who gets curves without asking.
+    ///
+    /// A balanced semiprime inside the sieve's range is the one case that must not: it is the
+    /// workload this engine is measured on, and no curve can succeed on it. Everything else has
+    /// already given away that it is a different shape — trial division peeled a factor, or rho
+    /// split an ancestor — and for those the sieve is the wrong tool by the size of `n`.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn curves_run_only_where_the_balanced_premise_has_been_disproved() {
+        let balanced = Natural::from_u64(18_446_744_073_709_551_557)
+            .checked_mul(&Natural::from_u64(18_446_744_073_709_551_533))
+            .unwrap();
+
+        stage_counts::reset();
+        factor(
+            balanced.clone(),
+            2,
+            &FactorTuning::default(),
+            false,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(stage_counts::ecm(), 0, "curves ran on a balanced semiprime");
+
+        // The same number with the caller opting in.
+        stage_counts::reset();
+        factor(
+            balanced.clone(),
+            2,
+            &FactorTuning::default(),
+            true,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert!(stage_counts::ecm() > 0, "opting in did not run curves");
+
+        // The same balanced pair with a 7 in front. Trial division peels the 7 — proof the input is
+        // not a balanced semiprime — so its cofactor gets curves with nothing switched on, even
+        // though that cofactor is itself balanced and will end up at the sieve.
+        let unbalanced = balanced.checked_mul(&Natural::from_u64(7)).unwrap();
+        stage_counts::reset();
+        factor(unbalanced, 2, &FactorTuning::default(), false, None, |_| {
+            true
+        })
+        .unwrap();
+        assert!(
+            stage_counts::ecm() > 0,
+            "a known-unbalanced composite did not reach curves"
+        );
     }
 
     /// The budget is the total across every polynomial constant tried, not per constant. It was

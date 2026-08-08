@@ -116,6 +116,7 @@ where
         fast_input,
         workers,
         &config.tuning,
+        config.ecm,
         config.witness_seed,
         |state| {
             if !REPORT_PROGRESS {

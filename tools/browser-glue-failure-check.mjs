@@ -61,7 +61,7 @@ try {
 
   const ready = await request(coordinator, { cmd: "init", module });
   assert.equal(ready.type, "ready");
-  assert.equal(ready.abi, 4);
+  assert.equal(ready.abi, 5);
   // The scheduler's family cap and the UI's width limit are both engine-owned now; a runtime that
   // does not report them would leave the glue silently guessing.
   assert.equal(ready.maxSiqsBits, 400);

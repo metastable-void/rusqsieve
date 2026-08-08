@@ -143,8 +143,8 @@ serve: docs
 # Native + wasm correctness checks. The browser architecture check drives the
 # coordinator-Worker/sieve-Worker protocol on node worker threads; the focused
 # glue check covers malformed packets and invalid command sequences; the wide-rho
-# check covers the frontend's deep Pollard-Brent budget for composites the sieve
-# refuses, which no wasm path ever sees.
+# and ecm checks cover the two stages the frontend runs on composites the sieve
+# refuses, neither of which any sieve path exercises.
 c-api-smoke: native
 	$(CC) -std=c11 -Wall -Wextra -Werror -I. tests/c_api_smoke.c \
 		-Ltarget/release -lrusqsieve -Wl,-rpath,'$$ORIGIN/release' \
@@ -159,6 +159,7 @@ test:
 	node tools/browser-arch-check.mjs
 	node tools/browser-glue-failure-check.mjs
 	node tools/wide-rho-check.mjs
+	node tools/ecm-check.mjs
 
 clean:
 	rm -rf $(DOCS)

@@ -23,12 +23,12 @@ Its performance-critical workload is a balanced, RSA-style semiprime between
   independent Web Workers without shared memory.
 
 The factorization pipeline combines trial division, probable-prime testing,
-perfect-power detection, Pollard–Brent rho, and a self-initializing quadratic
-sieve (SIQS).
+perfect-power detection, Pollard–Brent rho, the elliptic curve method, and a
+self-initializing quadratic sieve (SIQS).
 
 The following are explicitly outside the 0.4 scope:
 
-- ECM and the General Number Field Sieve;
+- the General Number Field Sieve;
 - constant-time or side-channel-resistant arithmetic;
 - factoring hard semiprimes near the `Natural` storage limit;
 - a public Rust API for relations, matrices, scheduler state, or worker
@@ -37,10 +37,11 @@ The following are explicitly outside the 0.4 scope:
 - Rust threads, shared Wasm memory, or `SharedArrayBuffer` on
   `wasm32-unknown-unknown`.
 
-The absence of ECM is intentional for the balanced-semiprime proof-of-work
-artifact. Any future ECM implementation must be opt-in and must not add runtime,
-download, compilation, initialization, or code-cache cost to the default
-balanced-RSA path.
+ECM is present but must never run on a balanced semiprime inside the sieve's
+range unless the caller asks: that input is the proof-of-work artifact's whole
+workload, and no curve can succeed on it. The conditions under which it runs
+without being asked are given in §6.1, and every one of them is evidence that the
+composite is not that shape.
 
 ## 2. Release and compatibility boundaries
 
@@ -106,6 +107,7 @@ src/
 │   ├── wire.rs         private worker-family serialization
 │   ├── root_simd.rs    x86-64 SSE2 root advancement
 │   └── root_wasm.rs    Wasm SIMD128 root advancement
+├── ecm.rs              elliptic curve method (Montgomery curves, PRAC, stage 2)
 ├── qs/mod.rs           factor-base construction and SIQS tier parameters
 ├── f2/mod.rs           sparse filtering and dependency solving
 ├── f2/block_lanczos.rs portable 64-way Montgomery block Lanczos
@@ -210,6 +212,8 @@ controls are:
 
 - `parallelism()` / `with_parallelism(...)`;
 - `progress_interval()` / `with_progress_interval(...)`;
+- `ecm()` / `with_ecm(...)`, default `false`, which admits the elliptic curve
+  method to the one range it does not already run in — see §6.1;
 - `with_witness_seed(...)` for a reproducible ChaCha8 Miller–Rabin witness
   stream.
 
@@ -347,21 +351,57 @@ The optimized blocking engine performs:
    fitting `u64`;
 4. run probable-prime testing on larger cofactors;
 5. detect perfect powers and recursively factor the base;
-6. run SIQS to recover a nontrivial divisor;
-7. recursively factor divisor and cofactor;
-8. sort the complete factor list.
+6. run the elliptic curve method, under the conditions in §6.1;
+7. run SIQS to recover a nontrivial divisor;
+8. recursively factor divisor and cofactor;
+9. sort the complete factor list.
+
+### 6.1 Elliptic curve method
+
+ECM occupies the gap between the other two stages. Pollard–Brent costs
+`O(sqrt p)` in the smallest factor and stops paying around 2^53; SIQS charges by
+the size of `N` and refuses it past 400 bits. ECM's cost is governed by the size
+of the factor rather than of the input, which makes a 20- to 30-digit factor of
+a wide composite ordinary work and impossible for either neighbour.
+
+The implementation uses Montgomery curves in `(X : Z)` coordinates with Suyama's
+`σ` parameterization, which forces the group order divisible by 12. Stage 1
+raises the point to `lcm(1..B1)` one prime power at a time along PRAC addition
+chains — about 1.55 point operations per bit against a binary ladder's 2 — and
+takes one gcd at the end rather than one per prime. Stage 2 is the standard
+continuation: baby steps `[j]Q` for `j` coprime to a 210-wheel, giant steps of
+`[210]Q`, and a single gcd over the accumulated cross differences. Bounds follow
+the usual levels, `B1` of 2k, 11k, 50k or 250k with `B2 = 100·B1`, selected by
+the composite's width.
+
+It runs when **any** of the following holds, and the caller's opt-in is only the
+last of them:
+
+1. the composite is wider than `MAX_SIQS_BITS`, so there is no sieve to fall
+   through to and the alternative is `SiqsCompositeTooLarge` on a number whose
+   factor ECM would have found;
+2. the composite is already known not to be a balanced semiprime, because trial
+   division peeled a factor or Pollard–Brent split an ancestor. Such a value has
+   a small factor and may well have a medium one;
+3. the caller set `FactorConfig::with_ecm(true)`, `RUSQSIEVE_FLAG_ENABLE_ECM`, or
+   `qs-factor --enable-ecm`.
+
+A balanced semiprime inside the sieve's range satisfies none of them and must
+never run a curve by default: it is the workload the crate's performance claim
+rests on, and no curve can succeed on it. `qs_ecm` exposes the same stage to the
+browser, which uses it for case 1.
 
 The high-level API accepts any `Natural<P>` that fits the engine's fixed
 optimized width and converts it without changing the value; a value beyond that
 capacity returns `FactorError::InputTooLarge`. There is no private slow
 fallback.
 
-Step 6 is the only width-limited stage. A composite wider than 400 bits reaching
+Step 7 is the only width-limited stage. A composite wider than 400 bits reaching
 it returns `FactorError::SiqsCompositeTooLarge(bits)`, where `bits` is the
 composite's width, not the caller's input. Steps 1–5 run regardless of input
 width, so a wide input with small factors completes through them — and a
 composite past the ceiling gets the deep Pollard–Brent budget described in §5
-before step 6 is asked at all, so the error means the smallest factor outran a
+before step 7 is asked at all, so the error means the smallest factor outran a
 minute of rho, not that the input was too wide to try.
 
 Sieving that spends its whole polynomial-family budget without reaching the
@@ -680,11 +720,11 @@ qs_coord_extract
 qs_coord_free
 ```
 
-The Wasm ABI version is 4. Version 3 added `qs_max_siqs_bits` and
-`qs_coord_family_budget`, and version 4 adds `qs_rho`; the reference glue
-depends on all three rather than duplicating or working around them, so an older
-module paired with current glue is rejected at initialization instead of
-faulting on a missing export.
+The Wasm ABI version is 5. Version 3 added `qs_max_siqs_bits` and
+`qs_coord_family_budget`, version 4 `qs_rho`, and version 5 `qs_ecm` with its two
+default-bound queries; the reference glue depends on all of them rather than
+duplicating or working around them, so an older module paired with current glue
+is rejected at initialization instead of faulting on a missing export.
 
 `qs_rho(n_pointer, n_length, budget, first_constant, constant_count)` runs a
 bounded Pollard–Brent over the decimal composite `n` and returns a packet of
@@ -893,8 +933,10 @@ The 0.4 release is optimized for balanced semiprimes. Its principal known gaps
 are:
 
 - no ECM for medium factors in unbalanced composites;
-- **a world-class, completely opt-in ECM for non-RSA numbers** is the roadmap
-  answer to every gap above. Pollard–Brent costs `O(sqrt p)` in the smallest
+- ~~a world-class, completely opt-in ECM for non-RSA numbers~~ — **implemented**
+  in 0.4.3; see §6.1. What remains of the original item is stage 2's
+  asymptotics: this is a standard continuation, where GMP-ECM evaluates a
+  polynomial at many points at once. The original entry read: Pollard–Brent costs `O(sqrt p)` in the smallest
   factor, so the deep budget above the sieve's ceiling reaches roughly 2^53 at
   512 bits and 2^50 at 1024 and then stops being payable, while the sieve charges
   by the size of `N`. Stage-1/stage-2 ECM is what covers that range, and the

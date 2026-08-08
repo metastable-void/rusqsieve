@@ -19,8 +19,8 @@
       <header>
         <h1>rusqsieve</h1>
         <p class="tagline">
-          A portable self-initializing quadratic sieve, compiled to WebAssembly and
-          run in parallel across Web Workers.
+          A world-class portable self-initializing quadratic sieve, compiled to WebAssembly and
+          run in parallel across Web Workers. Accepts up to 1024-bit numbers, but SIQS sieving is limited at 400 bits; larger primes, perfect powers, larger composite made solely of small factors, are accepted.
         </p>
       </header>
 
@@ -91,6 +91,18 @@
             data-n="1522605027922533360535618378132637429718068114961380688657908494580122963258952897654000350692006139"
           >
             RSA-100 (330-bit)
+          </button>
+          <button
+            class="ex"
+            data-n="331091484353114496237646182593584599492068831472651009826849622242814019738979922332747983313953042751935370294380278217962744413009384880298331"
+          >
+            Product of 15 32-bit primes (477-bit)
+          </button>
+          <button
+            class="ex"
+            data-n="10398482695553890296742721240049927057976718054981443766101247754264759772524700634135367826407378815404980549248801982041427353268401951563"
+          >
+            72371427508479463747<sup>7</sup> (462-bit)
           </button>
         </div>
       </section>

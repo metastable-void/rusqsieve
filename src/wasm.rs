@@ -13,7 +13,11 @@ use std::cell::RefCell;
 // BigInt implementation when it is absent, for the same reason: a silent eightfold slowdown in the
 // one stage that decides whether a wide multi-factor composite finishes is not a degradation worth
 // shipping quietly.
-const ABI_VERSION: u32 = 4;
+//
+// 5 adds `qs_ecm` and its two default-bound queries. The frontend runs curves on any composite the
+// sieve refuses, so a module without them would silently lose the only stage that can factor a wide
+// number with a 25-digit factor.
+const ABI_VERSION: u32 = 5;
 const MAX_PACKET: usize = 16 * 1024 * 1024;
 type WasmNatural = Natural;
 struct Slot<T> {
@@ -316,6 +320,67 @@ pub extern "C" fn qs_coord_free(session: u32) {
 // and returns. That is also why the budget is a parameter rather than a policy baked in here — the
 // glue sizes it per width, exactly as `engine::rho_budget` does natively.
 // ---------------------------------------------------------------------------
+
+/// Search for a factor of the decimal composite `n` with the elliptic curve method.
+///
+/// ECM is the tool for a medium-size factor — 20 to 30 digits — which is the shape Pollard-Brent
+/// cannot reach and the sieve either pays for by the size of `n` or refuses outright. The engine
+/// runs it by itself on a composite the sieve refuses or one already known to be unbalanced; this
+/// export exists so the browser can do the same from a worker. Its cost
+/// depends on the size of the factor rather than of the input, so a wide composite with a 25-digit
+/// factor is ordinary work here and impossible for the other two.
+///
+/// `b1`/`b2` are the stage bounds and `curves` the number of curves to try; `seed` selects the
+/// `σ` sequence, so the same arguments reproduce the same run. Zero bounds take the defaults for
+/// the composite's width.
+///
+/// Returns a packet (kind 13) whose payload is the factor as `PARTS * 8` little-endian bytes, or a
+/// packet with an empty payload when every curve was exhausted. Returns 0 only for a modulus that
+/// cannot be parsed or is below 3. Cancellation is the worker's `terminate()`, as for `qs_rho`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qs_ecm(
+    n_pointer: u32,
+    n_length: u32,
+    b1: u32,
+    b2: u32,
+    curves: u32,
+    seed: u32,
+) -> u32 {
+    let Some(n) = parse_decimal(n_pointer, n_length) else {
+        return 0;
+    };
+    if n < WasmNatural::from_u64(3) {
+        return 0;
+    }
+    let defaults = crate::ecm::EcmParams::for_composite(n.bit_len());
+    let params = crate::ecm::EcmParams {
+        b1: if b1 == 0 { defaults.b1 } else { u64::from(b1) },
+        b2: if b2 == 0 { defaults.b2 } else { u64::from(b2) },
+        curves: if curves == 0 { defaults.curves } else { curves },
+    };
+    let found = crate::ecm::factor(&n, params, u64::from(seed), || true);
+    let mut payload = Vec::new();
+    if let Ok(Some(factor)) = found {
+        payload.reserve(PARTS * 8);
+        for limb in factor.as_parts() {
+            payload.extend_from_slice(&limb.to_le_bytes());
+        }
+    }
+    packet(13, &payload)
+}
+
+/// Report the default ECM bounds for a composite of `bits` bits, so the glue can size a run and
+/// report it without duplicating the schedule.
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_ecm_default_b1(bits: u32) -> u32 {
+    u32::try_from(crate::ecm::EcmParams::for_composite(bits as usize).b1).unwrap_or(u32::MAX)
+}
+
+/// Companion to [`qs_ecm_default_b1`].
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_ecm_default_curves(bits: u32) -> u32 {
+    crate::ecm::EcmParams::for_composite(bits as usize).curves
+}
 
 /// Search for a factor of the decimal composite `n` with a bounded Pollard-Brent.
 ///

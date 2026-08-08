@@ -70,7 +70,7 @@ function search(module, request) {
 
 const module = await WebAssembly.compile(await readFile(WASM));
 const exports = (await WebAssembly.instantiate(module, {})).exports;
-assert.equal(exports.qs_abi_version(), 4, "the rho worker requires wasm ABI 4");
+assert.equal(exports.qs_abi_version(), 5, "the rho worker requires wasm ABI 5");
 assert.equal(typeof exports.qs_rho, "function", "wasm module exports no qs_rho");
 
 // The wrapper must keep behaving exactly as it did before it was expressed in terms of the sliced
@@ -134,4 +134,4 @@ await assert.rejects(
   /positive|decimal|rejected/,
   "the worker accepted an unusable modulus",
 );
-console.log("ok: rho worker rejects an unusable modulus and reports ABI 4");
+console.log("ok: rho worker rejects an unusable modulus and reports ABI 5");

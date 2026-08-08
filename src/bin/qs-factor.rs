@@ -17,6 +17,7 @@ enum ProgressMode {
 struct Options {
     progress: ProgressMode,
     threads: Option<usize>,
+    ecm: bool,
 }
 
 fn main() {
@@ -68,6 +69,9 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "thread count must be nonzero".to_string())?;
     let config = FactorConfig::default()
         .with_parallelism(parallelism)
+        // Above the sieve ceiling the engine runs curves regardless; this switch is about the
+        // range where SIQS would otherwise handle the composite on its own.
+        .with_ecm(options.ecm)
         .with_tuning_overrides(
             env_parse("RUSQSIEVE_REL_PERCENT"),
             env_parse("RUSQSIEVE_SMALL_SKIP"),
@@ -174,6 +178,7 @@ fn env_parse<T: core::str::FromStr>(name: &str) -> Option<T> {
 fn parse_options() -> Result<Options, String> {
     let mut progress = ProgressMode::Auto;
     let mut threads = None;
+    let mut ecm = false;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -201,6 +206,7 @@ fn parse_options() -> Result<Options, String> {
                     Some(count)
                 };
             }
+            "--enable-ecm" => ecm = true,
             "-h" | "--help" => {
                 println!(
                     "Usage: qs-factor [OPTIONS]\n\
@@ -208,6 +214,7 @@ fn parse_options() -> Result<Options, String> {
                      Options:\n  \
                        --progress auto|always|never\n  \
                        --threads auto|N\n  \
+                       --enable-ecm\n  \
                        -h, --help"
                 );
                 std::process::exit(0)
@@ -215,5 +222,9 @@ fn parse_options() -> Result<Options, String> {
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
-    Ok(Options { progress, threads })
+    Ok(Options {
+        progress,
+        threads,
+        ecm,
+    })
 }

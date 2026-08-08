@@ -2,6 +2,49 @@
 
 ## 0.4.3 — Unreleased
 
+- Added the elliptic curve method, in `src/ecm.rs`. Montgomery curves in
+  `(X : Z)` coordinates with Suyama's `σ` parameterization; stage 1 raises the
+  point to `lcm(1..B1)` along PRAC addition chains, about 1.55 point operations
+  per bit against a binary ladder's 2; stage 2 is the standard continuation over
+  a 210-wheel with one gcd for the whole stage rather than one per prime. Bounds
+  follow the usual levels — `B1` of 2k, 11k, 50k or 250k with `B2 = 100·B1` —
+  chosen by the composite's width. This is stronger than a textbook
+  implementation (FLINT's uses a binary ladder and a gcd per prime) and short of
+  GMP-ECM, whose stage 2 evaluates a polynomial at many points at once.
+- ECM fills the gap the other two stages leave: Pollard–Brent costs `O(sqrt p)`
+  in the smallest factor and stops paying around 2^53, and SIQS charges by the
+  size of `N` and refuses it past 400 bits, while ECM's cost is governed by the
+  size of the factor. Measured single-threaded on an x86-64 Xeon 8259CL: a
+  20-digit (66-bit) factor at `B1 = 50,000` in 8.9 s. End to end, a 466-bit
+  composite with a 20-digit factor now factors in 29.8 s where it previously
+  returned `SiqsCompositeTooLarge`.
+- Curves run without being asked exactly where the balanced-semiprime premise has
+  already been disproved, and nowhere else: a composite wider than the sieve
+  accepts, or one whose small factor trial division peeled, or whose ancestor
+  Pollard–Brent split. A balanced semiprime inside the sieve's range satisfies
+  none of those and never pays for a curve unless the caller opts in, which is
+  pinned by `curves_run_only_where_the_balanced_premise_has_been_disproved`. A
+  256-bit balanced semiprime measured 6.72 s by default against 6.55 s with
+  curves enabled — the reason to keep them off is that none can succeed, not that
+  they are expensive.
+- Exposed the switch on every surface: `FactorConfig::with_ecm(bool)` and
+  `ecm()` in the Rust API; `RUSQSIEVE_FLAG_ENABLE_ECM` with the new
+  `rusqsieve_factor_ex` and `rusqsieve_factor_ex_with_progress` in the C ABI,
+  which takes it to version 3 while leaving both original entry points
+  byte-identical in behavior; `qs_ecm` plus `qs_ecm_default_b1` and
+  `qs_ecm_default_curves` in the Wasm ABI, which takes it to version 5; and
+  `qs-factor --enable-ecm`.
+- The browser runs curves for the same reason the engine does. A composite the
+  coordinator refuses now goes to a pool of `ecm-worker.js` workers walking
+  disjoint stretches of the `σ` sequence before the frontend reports that the
+  number is too large. `tools/ecm-check.mjs` drives that worker protocol on Node
+  worker threads and runs in `make test` and CI.
+- Split the Montgomery dispatch table into an outlined and an inlined entry
+  point. ECM has some thirty multiply sites, and the `#[inline(always)]` table
+  they inherited from the rho loop added 649 KiB to the wasm artifact for no
+  gain, since each of those calls is a full multiply whose cost dwarfs the
+  dispatch. The rho loop keeps the inlined one, which is worth 8-10% to it; the
+  artifact is 368 KiB against 281 KiB before ECM.
 - Made `Natural::gcd` width-aware. Binary GCD written over whole `Natural`s meant
   each of roughly a thousand iterations touched all sixteen limbs whatever the
   operands were worth, which showed in the shape as well as the size: a 128-bit

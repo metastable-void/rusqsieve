@@ -56,6 +56,7 @@ pub struct FactorConfig {
     pub(crate) parallelism: Parallelism,
     pub(crate) witness_seed: Option<[u8; 32]>,
     pub(crate) tuning: FactorTuning,
+    pub(crate) ecm: bool,
     pub(crate) progress_reporting: ProgressReportingConfig,
 }
 
@@ -86,6 +87,36 @@ impl FactorConfig {
     #[must_use]
     pub fn with_progress_interval(mut self, interval: Duration) -> Self {
         self.progress_reporting.minimum_interval = interval;
+        self
+    }
+
+    /// Whether the elliptic curve method may run on composites the sieve can handle.
+    #[must_use]
+    pub const fn ecm(&self) -> bool {
+        self.ecm
+    }
+
+    /// Enables the elliptic curve method for composites within the sieve's range.
+    ///
+    /// ECM finds a medium-size factor — 20 to 30 digits — in time governed by the size of that
+    /// factor rather than of the input, which is the one shape neither Pollard–Brent nor the
+    /// quadratic sieve handles well. It is off by default because this crate's workload is balanced
+    /// semiprimes, where a curve cannot succeed and is pure overhead ahead of the sieve.
+    ///
+    /// This switch governs a narrower range than it looks like. Curves already run without it in
+    /// two cases, and neither can arise for a balanced semiprime:
+    ///
+    /// - a composite wider than the sieve accepts, where there is no fallback and the alternative
+    ///   is [`FactorError::SiqsCompositeTooLarge`] on a number whose factor ECM would have found;
+    /// - a composite already known to be unbalanced, because trial division peeled a factor or
+    ///   Pollard–Brent split an ancestor. Such a number has a small factor, so it may well have a
+    ///   medium one, and the sieve would charge for the size of the input instead.
+    ///
+    /// What is left — inside the sieve's range with no evidence either way — is where a balanced
+    /// semiprime lives, and that is what this switch turns on.
+    #[must_use]
+    pub fn with_ecm(mut self, enabled: bool) -> Self {
+        self.ecm = enabled;
         self
     }
 
@@ -143,6 +174,7 @@ impl Default for FactorConfig {
             parallelism: Parallelism::Auto,
             witness_seed: None,
             tuning: FactorTuning::default(),
+            ecm: false,
             progress_reporting: ProgressReportingConfig::default(),
         }
     }

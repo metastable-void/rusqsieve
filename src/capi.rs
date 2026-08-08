@@ -32,7 +32,16 @@ pub enum RusqsieveStatus {
 
 const AUTO_THREAD_CAP: usize = 48;
 const EXPLICIT_THREAD_CAP: usize = 256;
-const C_ABI_VERSION: u32 = 2;
+/// 3 adds `rusqsieve_factor_ex` and the flag word it takes. The two original entry points keep
+/// their signatures and their behavior exactly, so a caller built against 2 needs no change.
+const C_ABI_VERSION: u32 = 3;
+
+/// Run the elliptic curve method on composites the sieve would otherwise handle alone.
+///
+/// Off by default: it is the right tool only when the input may have a medium-size factor, and on
+/// the balanced semiprimes this library targets it is pure overhead. Composites wider than the
+/// sieve's range run curves regardless of this flag, since for them the alternative is a refusal.
+pub const RUSQSIEVE_FLAG_ENABLE_ECM: u32 = 1;
 
 /// Return the native C ABI version.
 #[unsafe(no_mangle)]
@@ -191,7 +200,45 @@ pub unsafe extern "C" fn rusqsieve_factor(
 
     let mut observer = continue_progress;
     match catch_unwind(AssertUnwindSafe(|| {
-        factor_impl(&input, threads, &mut observer)
+        factor_impl(&input, threads, 0, &mut observer)
+    })) {
+        Ok(Ok(allocation)) => {
+            factors.allocation = allocation;
+            RusqsieveStatus::Ok
+        }
+        Ok(Err(status)) => status,
+        Err(_) => RusqsieveStatus::InternalError,
+    }
+}
+
+/// Factor with optional behavior selected by a flag word.
+///
+/// `flags` accepts [`RUSQSIEVE_FLAG_ENABLE_ECM`]; unknown bits are ignored so that a caller built
+/// against a later flag set still runs here. `flags == 0` is exactly [`rusqsieve_factor`].
+///
+/// # Safety
+///
+/// The pointer requirements of [`rusqsieve_factor`] apply unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rusqsieve_factor_ex(
+    n: *const c_char,
+    threads: usize,
+    flags: u32,
+    factors: *mut RusqsieveFactors,
+) -> RusqsieveStatus {
+    if n.is_null() || factors.is_null() {
+        return RusqsieveStatus::InvalidArgument;
+    }
+    // SAFETY: the caller supplies a readable NUL-terminated C string.
+    let input = unsafe { CStr::from_ptr(n) }.to_bytes().to_vec();
+    // SAFETY: the caller supplies a live constructor-returned object with no concurrent readers,
+    // mutation, or destruction during this call.
+    let factors = unsafe { &mut *factors };
+    factors.allocation = None;
+
+    let mut observer = continue_progress;
+    match catch_unwind(AssertUnwindSafe(|| {
+        factor_impl(&input, threads, flags, &mut observer)
     })) {
         Ok(Ok(allocation)) => {
             factors.allocation = allocation;
@@ -220,6 +267,29 @@ pub unsafe extern "C" fn rusqsieve_factor_with_progress(
     callback: Option<RusqsieveProgressCallback>,
     context: *mut c_void,
 ) -> RusqsieveStatus {
+    // SAFETY: every pointer requirement is inherited unchanged from this function's contract.
+    unsafe { rusqsieve_factor_ex_with_progress(n, threads, 0, factors, callback, context) }
+}
+
+/// Factor with both a flag word and progress reporting.
+///
+/// The two are orthogonal, so this exists rather than making a caller choose between selecting
+/// optional behavior and being able to cancel. [`rusqsieve_factor_with_progress`] is this function
+/// with `flags == 0`, and [`rusqsieve_factor_ex`] is it with no callback.
+///
+/// # Safety
+///
+/// The pointer requirements of [`rusqsieve_factor`] apply, and `context` must remain valid
+/// according to the callback's own contract for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rusqsieve_factor_ex_with_progress(
+    n: *const c_char,
+    threads: usize,
+    flags: u32,
+    factors: *mut RusqsieveFactors,
+    callback: Option<RusqsieveProgressCallback>,
+    context: *mut c_void,
+) -> RusqsieveStatus {
     if n.is_null() || factors.is_null() {
         return RusqsieveStatus::InvalidArgument;
     }
@@ -242,7 +312,7 @@ pub unsafe extern "C" fn rusqsieve_factor_with_progress(
         }
     };
     match catch_unwind(AssertUnwindSafe(|| {
-        factor_impl(&input, threads, &mut observer)
+        factor_impl(&input, threads, flags, &mut observer)
     })) {
         Ok(Ok(allocation)) => {
             factors.allocation = allocation;
@@ -256,6 +326,7 @@ pub unsafe extern "C" fn rusqsieve_factor_with_progress(
 fn factor_impl(
     input: &[u8],
     threads: usize,
+    flags: u32,
     observer: &mut dyn FnMut(&ProgressSnapshot) -> ProgressAction,
 ) -> Result<Option<Box<FactorAllocation>>, RusqsieveStatus> {
     let text = core::str::from_utf8(input).map_err(|_| RusqsieveStatus::InvalidDecimal)?;
@@ -279,7 +350,9 @@ fn factor_impl(
         threads.min(EXPLICIT_THREAD_CAP)
     };
     let parallelism = Parallelism::threads(workers).ok_or(RusqsieveStatus::InvalidArgument)?;
-    let config = FactorConfig::default().with_parallelism(parallelism);
+    let config = FactorConfig::default()
+        .with_parallelism(parallelism)
+        .with_ecm(flags & RUSQSIEVE_FLAG_ENABLE_ECM != 0);
     let result = factor_with_progress(n, config, observer).map_err(|error| match error {
         FactorError::Cancelled => RusqsieveStatus::Cancelled,
         FactorError::SiqsCompositeTooLarge(_)

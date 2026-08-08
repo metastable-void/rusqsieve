@@ -17,7 +17,7 @@ static int cancel_immediately(
 int main(void) {
     rusqsieve_factors *factors = rusqsieve_factors_new();
     assert(factors != NULL);
-    assert(rusqsieve_abi_version() == 2);
+    assert(rusqsieve_abi_version() == 3);
     assert(strcmp(rusqsieve_strerror(RUSQSIEVE_OK), "success") == 0);
 
     assert(rusqsieve_factor("360", 1, factors) == RUSQSIEVE_OK);
@@ -38,6 +38,31 @@ int main(void) {
     assert(rusqsieve_factor("invalid", 1, factors) ==
            RUSQSIEVE_INVALID_DECIMAL);
     assert(rusqsieve_factors_len(factors) == 0);
+
+    /* The flag word is the only difference between the two entry points, and an unknown bit must
+       not change the answer. */
+    assert(rusqsieve_factor_ex("1000036000099", 1, 0, factors) == RUSQSIEVE_OK);
+    assert(rusqsieve_factors_len(factors) == 2);
+    assert(rusqsieve_factor_ex("1000036000099", 1, RUSQSIEVE_FLAG_ENABLE_ECM,
+                               factors) == RUSQSIEVE_OK);
+    assert(rusqsieve_factors_len(factors) == 2);
+    assert(rusqsieve_factor_ex("1000036000099", 1, 0x8000u, factors) ==
+           RUSQSIEVE_OK);
+    assert(rusqsieve_factors_len(factors) == 2);
+    assert(rusqsieve_factor_ex(NULL, 1, 0, factors) ==
+           RUSQSIEVE_INVALID_ARGUMENT);
+
+    /* Flags and progress are orthogonal, so the combined entry point must honour both. */
+    unsigned ex_calls = 0;
+    assert(rusqsieve_factor_ex_with_progress("1000036000099", 1,
+                                             RUSQSIEVE_FLAG_ENABLE_ECM, factors,
+                                             cancel_immediately, &ex_calls) ==
+           RUSQSIEVE_CANCELLED);
+    assert(ex_calls == 1);
+    assert(rusqsieve_factors_len(factors) == 0);
+    assert(rusqsieve_factor_ex_with_progress("1000036000099", 1, 0, factors,
+                                             NULL, NULL) == RUSQSIEVE_OK);
+    assert(rusqsieve_factors_len(factors) == 2);
 
     unsigned calls = 0;
     assert(rusqsieve_factor_with_progress(

@@ -35,8 +35,8 @@ high-digit tuning measured:
 Together with independent comparisons against online factorizers on multiple
 mobile devices, these results establish rusqsieve as the **world's fastest
 browser-Wasm SIQS for realistic balanced 192–256-bit semiprimes**. This is a
-specific SIQS and balanced-semiprime claim, not a claim that the ECM-free
-artifact is the fastest general-purpose factorizer for every composite shape.
+specific SIQS and balanced-semiprime claim, not a claim to be the fastest
+general-purpose factorizer for every composite shape.
 
 [BENCHMARKING.md](BENCHMARKING.md) contains the inputs, factors, commands,
 measurement scope, and competitor protocol. The crate is not constant-time and
@@ -146,8 +146,8 @@ in [CHANGELOG.md](CHANGELOG.md).
 
 The native driver validates and converts the public const-generic `Natural`
 into the engine’s fixed working width. The engine performs trial division,
-primality and perfect-power checks, bounded Pollard–Brent, then schedules SIQS
-polynomial families. Native collection consumes completed unique families
+primality and perfect-power checks, bounded Pollard–Brent, the elliptic curve
+method where its conditions are met, then schedules SIQS polynomial families. Native collection consumes completed unique families
 immediately to avoid head-of-line stalls; the portable coordinator merges
 serialized families deterministically for browser/distributed use. Both flow
 through the same large-prime graph, sparse matrix filtering, verified
@@ -281,31 +281,38 @@ with its cofactor.
 Proof-of-work is resource pricing, not authentication. Retain the normal
 authentication mechanism, and never use a modulus belonging to a real RSA key.
 
-ECM is not part of the 0.4 default path. If added later, it must be opt-in
-behind a non-default feature and shipped in a separate general-purpose Wasm
-artifact. The balanced-RSA artifact must contain no ECM code or initialization;
-the fixed 192/224/256-bit corpus remains an A/B gate for runtime, download size,
-compilation, startup, and code-cache footprint.
+ECM never runs on a balanced semiprime inside the sieve's range unless the
+caller asks for it, so proof-of-work pricing is unchanged by its presence: the
+conditions that admit it without asking are all evidence that the composite is
+some other shape. The fixed 192/224/256-bit corpus remains an A/B gate for
+runtime, download size, compilation, startup, and code-cache footprint.
 
 ## Scope and limitations
 
 The current pipeline combines trial division, Pollard–Brent rho, primality and
-perfect-power checks, and SIQS. It is strongest on balanced semiprimes.
-Unbalanced 192–256-bit composites with medium-size factors remain the main
-general-factorization gap because ECM is absent.
+perfect-power checks, the elliptic curve method, and SIQS. It is strongest on
+balanced semiprimes.
 
-The roadmap answer to that gap is a **world-class, completely opt-in ECM for
-non-RSA numbers**: a stage-1/stage-2 elliptic-curve method built to compete with
-GMP-ECM and YAFU on the factor sizes rho cannot reach — roughly 2^50 upward,
-where Pollard–Brent's `O(sqrt p)` cost stops being payable and the sieve charges
-by the size of `N` instead. It is for composites with medium-size factors:
-multi-factor numbers, unbalanced ones, and anything past the sieve's 400-bit
-ceiling. Opt-in is a hard requirement rather than a preference. ECM must sit
-behind a non-default feature and ship as a separate general-purpose Wasm
-artifact; the balanced-RSA artifact must contain no ECM code and no ECM
-initialization, and the fixed 192/224/256-bit corpus stays an A/B gate for
-runtime, download size, compilation, startup, and code-cache footprint. Balanced
-semiprimes — RSA challenge work — must not pay a byte or a cycle for it.
+**That gap is now filled by ECM.** Montgomery curves with Suyama's `σ`, stage 1
+along PRAC addition chains, and a standard-continuation stage 2 over a 210-wheel,
+with one gcd per stage. Its cost is governed by the size of the *factor* rather
+than of the input, which is what makes it the right tool where the other two are
+wrong: it recovered a 20-digit factor of a 466-bit composite in 30 s, an input
+that previously returned `SiqsCompositeTooLarge`.
+
+Balanced semiprimes still never pay for it. Curves run without being asked only
+where the balanced premise has already been disproved — a composite wider than
+the sieve accepts, or one whose small factor trial division peeled or whose
+ancestor Pollard–Brent split — and a balanced semiprime inside the sieve's range
+satisfies neither. For that range it is opt-in: `FactorConfig::with_ecm(true)`,
+`RUSQSIEVE_FLAG_ENABLE_ECM`, or `qs-factor --enable-ecm`. A default run of a
+256-bit balanced semiprime measured 6.72 s against 6.55 s with curves enabled,
+which is noise; the reason to keep it off is that no curve can succeed there, not
+that it is expensive.
+
+What remains of the original roadmap item is stage 2's asymptotics: GMP-ECM
+evaluates a polynomial at many points at once where this evaluates point by
+point. The gap is throughput, not reach.
 
 Below 272 bits, linear algebra uses structured sparse elimination followed by
 compact scalar/M4RI row-echelon solving. At 272 bits and above, native and Wasm

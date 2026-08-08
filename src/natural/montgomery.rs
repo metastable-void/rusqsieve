@@ -295,17 +295,20 @@ macro_rules! limb_arithmetic {
             /// only caller of the narrow backend is the browser's deep rho, which runs on
             /// composites from 257 bits up — specializing the four narrower widths added 7 KiB to
             /// the wasm artifact, a browser shipping gate, for arithmetic that path never performs.
-            #[inline]
+            /// Outlined, so that the table exists once in the binary. Everything except the rho
+            /// inner loop calls this.
             pub(super) fn dispatch_mul(k: usize, a: &[$limb], b: &[$limb], n: &[$limb], n0inv: $limb, out: &mut [$limb]) {
                 dispatch_mul_inline(k, a, b, n, n0inv, out);
             }
 
-            /// The same table, forced inline.
+            /// The same table, inlined into its caller.
             ///
-            /// A `#[target_feature]` wrapper only recompiles what is inlined into it, and the table
-            /// above is far too large for the inliner to take on a hint. Without this the x86-64
-            /// BMI2 wrapper compiled to a plain call into the baseline copy and emitted no `mulx`
-            /// at all — the feature was enabled on a function containing nothing but a call.
+            /// Worth about 8-10% to the rho loop, which calls it twice per iteration and benefits
+            /// from the limb count being constant-folded through the whole body — and worth using
+            /// nowhere else. ECM alone has some thirty call sites, and inlining a sixteen-arm table
+            /// of unrolled schoolbook multiplies into each of them added 649 KiB to the wasm
+            /// artifact for no measurable gain, since every one of those calls is a full multiply
+            /// whose cost dwarfs the dispatch.
             #[inline(always)]
             pub(super) fn dispatch_mul_inline(k: usize, a: &[$limb], b: &[$limb], n: &[$limb], n0inv: $limb, out: &mut [$limb]) {
                 match k {
@@ -315,7 +318,6 @@ macro_rules! limb_arithmetic {
             }
 
             /// The squaring counterpart of [`dispatch_mul`].
-            #[inline]
             pub(super) fn dispatch_square(k: usize, a: &[$limb], n: &[$limb], n0inv: $limb, out: &mut [$limb]) {
                 dispatch_square_inline(k, a, n, n0inv, out);
             }
@@ -446,7 +448,6 @@ impl<const P: usize> MontgomeryContext<P> {
         self.multiply(value, &self.r2)
     }
 
-    #[cfg(test)]
     pub(crate) fn decode(&self, value: &Natural<P>) -> Natural<P> {
         self.multiply(value, &Natural::ONE)
     }
@@ -530,14 +531,27 @@ impl<const P: usize> MontgomeryContext<P> {
     /// `value = value² + addend (mod n)`, the rho iteration itself.
     pub(crate) fn sqr_add_assign(&self, value: &mut [Limb], addend: &[Limb]) {
         let mut product = [0 as Limb; LIMB_CAP];
-        self.sqr_raw(value, &mut product);
+        backend::dispatch_square_inline(
+            self.limbs,
+            value,
+            &self.modulus_limbs,
+            self.negative_inverse,
+            &mut product,
+        );
         self.add_raw(&product, addend, value);
     }
 
     /// `lhs = lhs · rhs · R^-1 mod n`.
     pub(crate) fn mul_assign(&self, lhs: &mut [Limb], rhs: &[Limb]) {
         let mut product = [0 as Limb; LIMB_CAP];
-        self.mul_raw(lhs, rhs, &mut product);
+        backend::dispatch_mul_inline(
+            self.limbs,
+            lhs,
+            rhs,
+            &self.modulus_limbs,
+            self.negative_inverse,
+            &mut product,
+        );
         lhs[..self.limbs].copy_from_slice(&product[..self.limbs]);
     }
 

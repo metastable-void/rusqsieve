@@ -149,7 +149,7 @@ function waitForWorkerReady(worker, module, requireAbi, signal) {
       if (data?.type === "error") {
         finish(new Error(data.error || "worker initialization failed"));
       } else if (data?.type === "ready") {
-        if (requireAbi && data.abi !== 4) {
+        if (requireAbi && data.abi !== 5) {
           finish(new Error(`unsupported rusqsieve wasm ABI ${String(data.abi)}`));
         } else {
           finish(null, data);
@@ -562,6 +562,75 @@ async function deepPollard(c, bits, report) {
   }
 }
 
+// Curves per worker for a composite the sieve has refused. The engine's own schedule is the source
+// of the bounds — `qs_ecm` takes zero for "use the default for this width" — so only the split
+// across workers is decided here.
+const ECM_WORKERS = Math.max(1, Math.min(8, nWorkers));
+const ECM_CURVES_PER_WORKER = 64;
+
+// The elliptic curve method across a pool of workers, for a composite nothing else can take.
+// Resolves to a factor or null; cancellation is termination.
+async function ecmSearch(c, bits, report) {
+  if (!wasmModule) return null;
+  let pool;
+  try {
+    pool = Array.from(
+      { length: ECM_WORKERS },
+      () => new Worker(new URL("./ecm-worker.js", import.meta.url), { type: "module" }),
+    );
+  } catch {
+    return null;
+  }
+  const started = performance.now();
+  const tickReport = () =>
+    report({
+      phase: "ecm",
+      n: c,
+      elapsedSeconds: (performance.now() - started) / 1000,
+      workers: pool.length,
+      curves: pool.length * ECM_CURVES_PER_WORKER,
+    });
+  tickReport();
+  const ticker = setInterval(tickReport, 500);
+  try {
+    return await new Promise((resolve) => {
+      let outstanding = pool.length;
+      const retire = () => {
+        outstanding -= 1;
+        if (outstanding <= 0) resolve(null);
+      };
+      pool.forEach((worker, index) => {
+        worker.onmessage = ({ data }) => {
+          if (data?.type === "ready") {
+            worker.postMessage({
+              cmd: "search",
+              gen: 1,
+              n: c.toString(),
+              b1: 0,
+              b2: 0,
+              curves: ECM_CURVES_PER_WORKER,
+              // Disjoint σ stretches, so no two workers walk the same curve.
+              seed: 1 + index * ECM_CURVES_PER_WORKER,
+            });
+            return;
+          }
+          if (data?.type === "done") {
+            if (typeof data.factor === "string") resolve(BigInt(data.factor));
+            else retire();
+            return;
+          }
+          retire();
+        };
+        worker.onerror = retire;
+        worker.postMessage({ cmd: "init", module: wasmModule });
+      });
+    });
+  } finally {
+    clearInterval(ticker);
+    for (const worker of pool) worker.terminate();
+  }
+}
+
 async function deepPollardOnMainThread(c, bits, report) {
   const budget = mainThreadRhoBudget(bits);
   const run = pollardBrentSliced(c, budget);
@@ -634,6 +703,14 @@ async function factorize(N, report) {
         continue;
       }
       if (refused) {
+        // Nothing else is left. Rho gives up at a factor size ECM starts at, and the coordinator
+        // will not take this composite at all, so curves run here regardless of anything the user
+        // selected: the alternative is refusing a number whose factor is findable.
+        const curved = await ecmSearch(c, compositeBits, report);
+        if (curved && curved > 1n && curved < c) {
+          stack.push([curved, true], [c / curved, true]);
+          continue;
+        }
         throw new Error(
           `this number needs the quadratic sieve on a ${compositeBits}-bit composite, ` +
             `above the ${maxSiqsBits}-bit limit — numbers of any size still factor when ` +
@@ -651,13 +728,15 @@ async function factorize(N, report) {
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
-const SUP = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹" };
-const sup = (n) => String(n).replace(/\d/g, (d) => SUP[d]);
+
 
 const PHASE_TEXT = {
   trial: (s) => `Trial division on a ${digits(s.n)}-digit number…`,
   primality: (s) => `Miller–Rabin primality test (${digits(s.n)} digits)…`,
   pollard: (s) => `Pollard's rho on a ${digits(s.n)}-digit number…`,
+  ecm: (s) =>
+    `Elliptic curve method on a ${digits(s.n)}-digit composite — ${s.curves} curves across ` +
+    `${s.workers} wasm worker${s.workers === 1 ? "" : "s"}, ${formatDuration(s.elapsedSeconds)} elapsed…`,
   deepPollard: (s) =>
     s.workers
       ? `Deep Pollard's rho on a ${digits(s.n)}-digit composite across ${s.workers} ` +
@@ -716,7 +795,15 @@ function render(grouped, original, seconds) {
       factor.className = "factor";
       const value = document.createElement("span");
       value.className = "value";
-      value.textContent = exponent === 1 ? `${prime}` : `${prime}${sup(exponent)}`;
+      value.textContent =  `${prime}`;
+      if (exponent > 1) {
+        const exp = document.createElement('span');
+        exp.textContent = '^';
+        exp.classList.add('exp');
+        const expNumber = document.createElement('sup');
+        expNumber.textContent = `${exponent}`;
+        value.append(exp, expNumber);
+      }
       const bits = document.createElement("span");
       bits.className = "bits";
       bits.textContent = `${bitLength(prime)} bits`;

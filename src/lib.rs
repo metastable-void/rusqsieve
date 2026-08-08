@@ -14,6 +14,8 @@ mod progress;
 #[allow(dead_code)]
 mod qs;
 
+mod ecm;
+
 #[allow(dead_code)]
 mod engine;
 #[allow(dead_code)]

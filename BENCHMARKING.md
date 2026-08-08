@@ -454,6 +454,52 @@ bits costs nothing the browser's deep rho cares about, since that path exists fo
 sieve refuses. Both limb widths are generated from one macro and checked against each other by
 `narrow_and_wide_limbs_agree`, so the host test suite covers the wasm arithmetic.
 
+## Elliptic curve method
+
+ECM's cost is governed by the size of the factor it is looking for, not the size of the input,
+which is what makes it the right stage between Pollard–Brent and the sieve. Reproduce the reach
+measurement with
+`cargo test --profile release-test --lib -- --ignored ecm --nocapture`.
+
+Single-threaded on an x86-64 Xeon 8259CL:
+
+| factor | composite | bounds | result |
+|---|---|---|---:|
+| 10 digits (2^32) | 161-bit | `B1 = 2,000`, 64 curves | 0.11 s (debug build) |
+| 20 digits (2^66) | 260-bit | `B1 = 50,000`, 300 curves | 8.9 s |
+
+End to end through the release CLI, on a 466-bit composite that is a 20-digit prime times a 400-bit
+prime — the shape that has no other stage:
+
+| | before | after |
+|---|---|---|
+| 466-bit, 20-digit factor | `SiqsCompositeTooLarge` | 29.8 s |
+
+Most of that 29.8 s is the deep rho that has to fail first; rho's budget at this width reaches about
+2^53 and the factor is 2^66.
+
+For scale against the neighbours: Pollard–Brent needs roughly `1.2·sqrt(p)` iterations, so a 2^66
+factor is about 10^10 iterations — hours at the measured 4.8 M/s — and the sieve does not accept a
+466-bit composite at all.
+
+The browser runs the same stage through `qs_ecm` across a pool of workers. `tools/ecm-check.mjs`
+splits a 161-bit composite in about 60 ms under Node 24.15.
+
+### What enabling it costs
+
+Curves run unasked only where a balanced semiprime cannot be: above the sieve's ceiling, or on a
+composite trial division or rho has already shown to be unbalanced. Inside the sieve's range with no
+such evidence the switch is the caller's, and the measured cost of flipping it is nil — a 256-bit
+balanced semiprime, 32 threads, median of three:
+
+| | default | `--enable-ecm` |
+|---|---:|---:|
+| 256-bit balanced semiprime | 6.72 s | 6.55 s |
+
+The difference is noise: at that width the schedule is `B1 = 2,000` over 16 curves against a
+6.7-second sieve run. The reason to keep it off by default is that no curve can succeed on a
+balanced semiprime, not that the curves are expensive.
+
 ## The batched gcd
 
 Pollard-Brent accumulates differences and takes one gcd per batch, so the batch size trades gcd cost
